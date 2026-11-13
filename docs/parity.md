@@ -9,8 +9,8 @@ Last updated: 2026-11-13. This file is ticked as features land; `nix flake check
 | Feature | Status | Evidence / gap |
 |---|---|---|
 | `kmshaunt-vt@.service` as autovt@, getty fallback | ✅ | M1.7/M1.8; T4 m1-login green |
-| Multi-seat `kmshaunt.service` (sd-login) | 🟡 | M6.2 daemon; skips seats without a fake VT worker; T4 m6-seats in flight (S1 timeout being fixed) |
-| PAM service, locale1 xkb | ✅ | M1.7, M6.5 |
+| Multi-seat `kmshaunt.service` (sd-login) | 🟡 | M6.2 daemon; fake-VT worker wiring in flight; T4 m6-seats S1/S2 green, S3/S4 in flight |
+| PAM service, locale1 xkb | ✅ | M1.7, M6.5; startup layout now applied |
 | `session-max`, `session-control` | ✅ | M6.3 manager; real-VT gate added |
 | `libseat` backend | ✅ | Startup crash fixed: `setCallbacks` no longer fires queued enable, `activate()` delivers it; T1 real-ops regression + T3 m6-libseat-startup green on tensor (unit active, no segfault, logind greeter seat, autologin shell) |
 
@@ -34,9 +34,9 @@ Last updated: 2026-11-13. This file is ticked as features land; `nix flake check
 | libinput keyboard, xkbcommon, key encoder | ✅ | M1.6 |
 | mouse selection/copy/paste/reporting, natural-scrolling, soft cursor | ✅ | M2.3 (545 tests) |
 | xkb-model/layout/variant/options/keymap/compose-file/repeat-* | ✅ | M6.5 |
-| locale1 live keymap follow + startup current layout | ✅ | M6.5; startup readCurrent/overlay wired in main.zig (cfg wins, locale1 fills unset), read-vs-subscribe race closed; T4 m6-seats S1 |
+| locale1 live keymap follow + startup current layout | ✅ | M6.5; startup readCurrent/overlay wired in main.zig (cfg wins, locale1 fills unset), read-vs-subscribe race closed; startup layout applied; T4 m6-seats S1 |
 | compose | ✅ | T4 m6-seats S2 |
-| graceful shutdown (SIGTERM teardown) | ✅ | libinput stores `struct libinput_interface` by pointer: `Real.udevCreateContext` now passes the static `interface` through instead of a stack copy that dangled until `libinput_unref` → `evdev_device_remove` → `close_restricted` jumped through the reused stack slot (segfault on `systemctl stop/restart`, SIGKILL "worked"); `Input.deinit` idempotent; T1 interface-lifetime/refcount/idempotency tests + T3 stop/start/restart VM repro (before: segfault, after: clean) |
+| graceful shutdown (SIGTERM teardown) | ✅ | FIXED: libinput stores `struct libinput_interface` by pointer: `Real.udevCreateContext` now passes the static `interface` through instead of a stack copy that dangled until `libinput_unref` → `evdev_device_remove` → `close_restricted` jumped through the reused stack slot (segfault on `systemctl stop/restart`, SIGKILL "worked"); `Input.deinit` idempotent; T1 interface-lifetime/refcount/idempotency tests + T3 stop/start/restart VM repro (before: segfault, after: clean) |
 | absolute-pointer transform (tablets) | ⬜ | libinput _transformed getters (M5.7 note) |
 
 ## Grabs
@@ -50,12 +50,12 @@ Last updated: 2026-11-13. This file is ticked as features land; `nix flake check
 | Feature | Status | Evidence / gap |
 |---|---|---|
 | drm2d modeset + dumb buffers + flip | ✅ | M1.3 |
-| drm3d GBM+EGL+GLES2, hwaccel | ✅ | M5.1; hwaccel now selects drm3d; GBM/EGL/GLESv2 linked |
+| drm3d GBM+EGL+GLES2, hwaccel | ✅ | M5.1; hwaccel now selects drm3d; GBM/EGL/GLESv2 linked; damage-only render done |
 | fbdev (no-drm) | ✅ | M5.2 |
 | gpus/use-original-mode/mode= | ✅ | backend + VideoWiring main.zig |
-| multi-monitor clone/largest/scaled, screen= | 🟡 | multi-card done; same-card multi-connector backend done, main.zig scanout wiring in flight; T4 m5-video written, run pending |
+| multi-monitor clone/largest/scaled, screen= | ✅ | multi-card done; same-card multi-connector backend done and scanout wired in main.zig; T4 m5-video 🟡 (written, run pending dpms fix) |
 | udev hotplug | ✅ | event source + VideoWiring wired |
-| dpms-timeout | 🟡 | all-connector idle/wake backend done; per-card wiring in flight |
+| dpms-timeout | ✅ | per-card wiring done; all-connector idle/wake; T4 m5-video 🟡 (dpms fix verification in flight) |
 | hardware cursor plane + soft-cursor force | ✅ | backend + gate wiring |
 
 ## Font / text (R1)
@@ -70,20 +70,20 @@ Last updated: 2026-11-13. This file is ticked as features land; `nix flake check
 | decorations + cursor styles | ✅ | M3.7 |
 | atlas LRU, font-size auto, grab-zoom | ✅ | M3.8 |
 | psf/unifont/8x16 engines | ✅ | M3.9 |
-| T2 goldens + T3 VM golden | 🟡 | T2 ✅ 20 goldens byte-exact; T3 VM golden in flight (run pending) |
+| T2 goldens + T3 VM golden | 🟡 | T2 ✅ 20 goldens byte-exact; T3 text fixtures pass, kitten icat hang being fixed |
 
 ## Kitty graphics (R2)
 | Feature | Status | Evidence / gap |
 |---|---|---|
 | libspng decoder, image cache, CPU compositor | ✅ | M4.1-M4.3 |
 | animation, storage-limit, R3 root media off | ✅ | M4.4/M4.5 (551+16 tests) |
-| T2 kitty goldens + T3 kitten icat | 🟡 | T2 ✅ kitty goldens byte-exact; T3 kitten icat in flight |
+| T2 kitty goldens + T3 kitten icat | 🟡 | T2 ✅ kitty goldens byte-exact; T3 kitten icat in flight (hang being fixed) |
 
 ## Performance (M8)
 | Feature | Status | Evidence / gap |
 |---|---|---|
-| vtebench throughput vs kmscon | 🟡 | M8.1; 33x gap CLOSED (debug libghostty + loop pacing): seq parity 1.06s, suite completes, scrolling ≥ parity; cell/unicode render-efficiency gaps remain (docs/perf.md) |
-| damage-only presentation | 🟡 | M8.2; drm2d DirtyFB done, drm3d partial-redraw in flight |
-| memory @10k scrollback | 🟡 | M8.3; sb-size byte budget fixed, re-measure pending |
+| vtebench throughput vs kmscon | 🟡 | M8.1; 33x gap CLOSED (debug libghostty + loop pacing): seq at parity 34.83s → 1.06s, suite completes (~120s), scrolling equal-or-better; cell/unicode render-efficiency gaps in flight (docs/perf.md) |
+| damage-only presentation | ✅ | M8.2; drm2d + drm3d damage-only done |
+| memory @10k scrollback | ✅ | M8.3; measured 38.8MB vs kmscon 59MB; sb-size byte budget fixed |
 | T5 real-hardware checklist | ❌ | M8.4 HARDWARE-BLOCKED: host has only Intel i915, needs ≥2 GPU vendors |
 | docs/perf.md | ✅ | M8.5; docs/perf.md written |
