@@ -1,0 +1,579 @@
+.Dd November 13, 2026
+.Dt KMSHAUNT 1
+.Os
+.Sh NAME
+.Nm kmshaunt
+.Nd KMS/DRM console on top of libghostty-vt
+.Sh SYNOPSIS
+.Nm
+.Op Ar options
+.Nm
+.Fl h
+.Nm
+.Fl V
+.Nm
+.Fl l
+.Op Ar options
+.Cm --
+.Ar /bin/login
+.Op Ar login-arguments
+.Sh DESCRIPTION
+.Nm
+is a system console for Linux.
+It drives displays through the Kernel Mode Setting (KMS) and Direct
+Rendering Manager (DRM) interfaces, or through fbdev when
+.Fl -no-drm
+is given, and renders terminal output with libghostty-vt.
+One process owns a seat and provides one or more sessions, each with its own
+pseudo-terminal and terminal emulator.
+.Pp
+The command line and configuration file follow
+.Xr kmscon 1
+version 10.1.0: option names, defaults, grab syntax and parsing rules are
+compatible.
+Two defaults differ: the
+.Ev TERM
+value is
+.Cm xterm-ghostty ,
+and the configuration directory is
+.Pa /etc/kmshaunt .
+.Pp
+.Nm
+normally needs root, or a seat obtained through seatd or systemd-logind with
+.Fl -libseat ,
+to open the virtual terminal and the display devices.
+It is usually started on a free virtual terminal by the service manager rather
+than from a graphical session.
+.Pp
+Options may be written as
+.Fl -name Ns = Ns Ar value
+or
+.Fl -name Ar value .
+Boolean options take no value and may be negated by prefixing the long name
+with
+.Cm no- ,
+for example
+.Fl -no-switchvt .
+If an option is given more than once, the last occurrence wins, except
+.Fl -mode
+and
+.Fl -screen ,
+which accumulate.
+Command-line options are locked: the configuration file cannot override
+them.
+An unparsable command-line option is ignored with a warning; the same error in
+a configuration file aborts loading that file.
+.Sh OPTIONS
+.Ss Global Options
+.Bl -tag -width "-palette-light-magenta"
+.It Fl h , Fl -help
+Boolean, default off.
+Print usage information to standard output and exit.
+.It Fl V , Fl -version
+Boolean, default off.
+Print the version; with
+.Fl -verbose
+also print compile-time information and enabled backends.
+.It Fl v , Fl -verbose
+Boolean, default off.
+Raise the log level to INFO.
+.It Fl -debug
+Boolean, default off.
+Raise the log level to DEBUG; implies
+.Fl -verbose .
+.It Fl -silent
+Boolean, default off.
+Only log warnings and errors.
+.It Fl c Ar dir , Fl -configdir Ar dir
+String, default
+.Pa /etc/kmshaunt .
+Use
+.Ar dir
+as the configuration directory containing
+.Pa kmshaunt.conf
+and the per-seat
+.Pa <seat>.seat.conf
+files.
+.El
+.Ss Seat Options
+.Bl -tag -width "-palette-light-magenta"
+.It Fl -vt Ar vt
+Virtual terminal specification (string), default auto-detect.
+A number
+.Ar N
+selects
+.Pa /dev/ttyN ;
+a value beginning with a period or a slash is used verbatim as the device
+path;
+every other value is prefixed with
+.Pa /dev/ ,
+so
+.Cm tty2
+also selects
+.Pa /dev/tty2 .
+When unset, the controlling terminal is used if it is a VT, otherwise a free
+VT is allocated.
+.It Fl -switchvt
+Boolean, default on.
+Activate the VT at startup and restore the previously active VT on exit.
+.It Fl -libseat
+Boolean, default off.
+Acquire the seat and its devices through libseat (seatd or systemd-logind)
+instead of opening the VT and DRM devices directly.
+.El
+.Ss Session Options
+.Bl -tag -width "-palette-light-magenta"
+.It Fl -session-max Ar num
+Unsigned integer, default 50.
+Maximum number of sessions; 0 means no limit.
+.It Fl -session-control
+Boolean, default off.
+Enable the session grabs that create, cycle and close sessions.
+It is disabled automatically on real virtual terminals.
+.El
+.Ss Terminal Options
+.Bl -tag -width "-palette-light-magenta"
+.It Fl -issue
+Boolean, default on.
+Write the issue text collected from
+.Fl -issue-path
+to each new session before the login process starts.
+.It Fl -issue-path Ar path
+String, default
+.Cm /etc/issue ,
+.Cm /etc/issue.d ,
+.Cm /run/issue ,
+.Cm /run/issue.d ,
+.Cm /usr/lib/issue
+and
+.Cm /usr/lib/issue.d ,
+colon-separated.
+Files are read in order, directories are scanned for
+.Pa *.issue
+files in lexicographic order, and the total is capped at 256 KiB.
+.It Fl -asciicast Ar file
+String, unset by default.
+Play the asciicast v2 or v3 recording
+.Ar file
+into a new session.
+Playback stops on the first key press.
+.It Fl -asciicast-loop
+Boolean, default off.
+Restart asciicast playback when the recording ends.
+.It Fl l , Fl -login Ar argv
+Login argv (argument list); the default is
+.Cm /bin/login -p
+(or
+.Cm /bin/login
+with
+.Fl -no-reset-env ) .
+On the command line, everything after the first
+.Cm --
+argument becomes the login argv.
+In a configuration file the value is split into argv with shell-like quoting.
+.It Fl -oneshot
+Boolean, default off.
+Close the session when the login process exits, and exit
+.Nm
+if it was the last session.
+Intended for setup scripts and prompts such as disk-encryption unlock.
+.It Fl t Ar TERM , Fl -term Ar TERM
+String, default
+.Cm xterm-ghostty .
+Set
+.Ev TERM
+to
+.Ar TERM
+in every session.
+.It Fl -reset-env
+Boolean, default on.
+Start children with an empty environment, then set only
+.Ev TERM ,
+.Ev COLORTERM ,
+.Ev XDG_SEAT ,
+.Ev XDG_VTNR ,
+.Ev TERM_SESSION_TYPE
+and
+.Ev KMS_START_SCRIPT .
+When disabled, the parent environment is inherited and the default login argv
+is
+.Cm /bin/login
+without the
+.Fl p
+argument.
+.It Fl -backspace-delete
+Boolean, default on.
+Make the Backspace key send DEL (0x7f) to applications.
+.It Fl -sb-size Ar num
+Unsigned integer, default 1000.
+Scrollback buffer size in lines; 0 disables scrollback.
+.It Fl -bell
+Boolean, default off.
+Forward the terminal bell from applications to the virtual terminal.
+.It Fl -blink
+Boolean, default on.
+Enable cursor and text blinking.
+.El
+.Ss Input Options
+.Bl -tag -width "-palette-light-magenta"
+.It Fl -xkb-model Ar model
+String, unset by default (uses the XKB default).
+XKB keyboard model.
+.It Fl -xkb-layout Ar layout
+String, unset by default.
+XKB layout, for example
+.Cm de .
+.It Fl -xkb-variant Ar variant
+String, unset by default.
+XKB layout variant.
+.It Fl -xkb-options Ar options
+String, unset by default.
+Comma-separated XKB options.
+.It Fl -xkb-keymap Ar file
+String, unset by default.
+Load the precompiled keymap
+.Ar file .
+It takes precedence over the model, layout, variant and options settings; an
+empty value disables the keymap file.
+.It Fl -xkb-compose-file Ar file
+String, unset by default.
+Use
+.Ar file
+as the compose file.
+When unset or empty, the default compose file for the current locale is used.
+.It Fl -xkb-repeat-delay Ar msecs
+Unsigned integer, default 250.
+Delay in milliseconds before key repeat starts.
+.It Fl -xkb-repeat-rate Ar msecs
+Unsigned integer, default 50.
+Interval in milliseconds between repeated keys.
+.It Fl -mouse
+Boolean, default on.
+Capture the pointer, enable text selection with copy and paste, and scroll the
+scrollback with the wheel.
+.It Fl -natural-scrolling
+Boolean, default off.
+Invert the wheel direction.
+.It Fl -soft-cursor
+Boolean, default off.
+Always draw a software cursor instead of a hardware cursor plane.
+.It Fl -dpms-timeout Ar secs
+Unsigned integer, default 600.
+Blank the display after
+.Ar secs
+seconds without input; 0 disables the timeout.
+Any input unblanks the display and restarts the timer.
+.El
+.Ss Grabs
+Each grab option takes a grab specification and is disabled when the value is
+empty.
+The syntax is described in
+.Xr kmshaunt.conf 5 ;
+an event matches only when its modifier set is exactly the configured set.
+.Bl -tag -width "-palette-light-magenta"
+.It Fl -grab-scroll-up Ar grab
+Grab, default
+.Cm <Shift>Up .
+Scroll the scrollback back one line.
+.It Fl -grab-scroll-down Ar grab
+Grab, default
+.Cm <Shift>Down .
+Scroll the scrollback forward one line.
+.It Fl -grab-page-up Ar grab
+Grab, default
+.Cm <Shift>Prior .
+Scroll the scrollback back one page.
+.It Fl -grab-page-down Ar grab
+Grab, default
+.Cm <Shift>Next .
+Scroll the scrollback forward one page.
+.It Fl -grab-zoom-in Ar grab
+Grab, default
+.Cm <Ctrl>plus
+or
+.Cm <Ctrl>equal .
+Increase the font size.
+.It Fl -grab-zoom-out Ar grab
+Grab, default
+.Cm <Ctrl>minus .
+Decrease the font size.
+.It Fl -grab-session-next Ar grab
+Grab, default
+.Cm <Ctrl><Logo>Right .
+Switch to the next session; requires
+.Fl -session-control .
+.It Fl -grab-session-prev Ar grab
+Grab, default
+.Cm <Ctrl><Logo>Left .
+Switch to the previous session; requires
+.Fl -session-control .
+.It Fl -grab-session-close Ar grab
+Grab, default
+.Cm <Ctrl><Logo>BackSpace .
+Close the current session; requires
+.Fl -session-control .
+.It Fl -grab-terminal-new Ar grab
+Grab, default
+.Cm <Ctrl><Logo>Return .
+Create a new session; requires
+.Fl -session-control .
+.It Fl -grab-rotate-cw Ar grab
+Grab, default
+.Cm <Logo>plus
+or
+.Cm <Logo>equal .
+Rotate all displays clockwise.
+.It Fl -grab-rotate-ccw Ar grab
+Grab, default
+.Cm <Logo>minus .
+Rotate all displays counter-clockwise.
+.It Fl -grab-reboot Ar grab
+Grab, disabled by default.
+Reboot the system.
+A soft or hard reboot is chosen according to
+.Pa /proc/sys/kernel/ctrl-alt-del .
+.El
+.Ss Video Options
+.Bl -tag -width "-palette-light-magenta"
+.It Fl -drm
+Boolean, default on.
+Use DRM devices and ignore fbdev devices.
+When disabled, only fbdev devices are used.
+.It Fl -hwaccel
+Boolean, default off.
+Use the DRM 3D (OpenGL ES) backend.
+If it cannot be initialized,
+.Nm
+falls back to the DRM 2D backend.
+.It Fl -gpus Ar list
+GPU selection (enumeration), default
+.Cm all .
+One of
+.Cm all ,
+.Cm aux
+(primary and auxiliary GPUs) or
+.Cm primary .
+.Cm auxiliary
+and
+.Cm single
+are accepted as aliases for
+.Cm aux
+and
+.Cm primary .
+.It Fl -use-original-mode
+Boolean, default off.
+Do not change the display mode; keep the mode already set by the firmware or a
+previous owner.
+This option cannot be combined with
+.Fl -mode :
+if both are given,
+.Fl -use-original-mode
+is cleared with a warning.
+.It Fl -mode Ar spec
+Mode list, empty by default, repeatable.
+Set the mode for matching displays.
+The form is
+.Bd -literal -offset indent
+[gpu][connector]WIDTHxHEIGHT[@RATE]
+.Ed
+for example
+.Cm card0[HDMI-A-1]1920x1080@60
+or
+.Cm 1920x1080@60 .
+Only the DRM backends use modes; the first match wins, in the order
+GPU and connector, connector only, then global entries.
+.It Fl -multi-monitor Ar policy
+String, default
+.Cm scaled .
+Combine multiple monitors with
+.Cm largest
+(only the largest monitor is used),
+.Cm scaled
+(the smallest monitor sets the text grid and larger monitors scale the font),
+or
+.Cm clone
+(all monitors show the same size).
+Any other value behaves like
+.Cm clone .
+.It Fl -screen Ar spec
+Screen list, empty by default, repeatable.
+Set the orientation of matching displays, or disable them.
+The form is
+.Bd -literal -offset indent
+[gpu][connector]normal|left|right|upside-down|disabled
+.Ed
+for example
+.Cm card0[DP-1]right ,
+.Cm [HDMI-A-1]left
+or
+.Cm disabled .
+Matching uses the same precedence as
+.Fl -mode .
+A disabled display is not used unless it is the only available display.
+.El
+.Ss Font Options
+.Bl -tag -width "-palette-light-magenta"
+.It Fl -font-engine Ar engine
+String, unset by default.
+Select a font backend by name:
+.Cm freetype ,
+.Cm pango ,
+.Cm unifont ,
+.Cm psf
+or
+.Cm 8x16 .
+When unset or unavailable, the first working backend of the chain
+freetype, pango, unifont, psf, 8x16 is used.
+.It Fl -font-size Ar pixels
+Unsigned integer, default 0.
+Font size in pixels; 0 selects a size from the physical display size.
+.It Fl -font-name Ar name
+String, default
+.Cm monospace .
+Fontconfig family or pattern for the freetype and pango backends, or a font
+file path for the psf backend.
+.El
+.Ss Palette Options
+Colors are specified as
+.Ar r , Ns Ar g , Ns Ar b
+with components from 0 to 255.
+They are used only when
+.Fl -palette
+is set to
+.Cm custom .
+.Bl -tag -width "-palette-light-magenta"
+.It Fl -palette Ar name
+String, unset by default (legacy palette).
+Select a palette preset:
+.Cm custom ,
+.Cm nord ,
+.Cm solarized ,
+.Cm solarized-black ,
+.Cm solarized-white ,
+.Cm soft-black ,
+.Cm base16-dark ,
+.Cm base16-light ,
+.Cm vga
+or
+.Cm legacy .
+Unknown names select the legacy palette.
+.It Fl -palette-black Ar r,g,b
+Color, default 0,0,0.
+ANSI color 0 (black).
+.It Fl -palette-red Ar r,g,b
+Color, default 205,0,0.
+ANSI color 1 (red).
+.It Fl -palette-green Ar r,g,b
+Color, default 0,205,0.
+ANSI color 2 (green).
+.It Fl -palette-yellow Ar r,g,b
+Color, default 205,205,0.
+ANSI color 3 (yellow).
+.It Fl -palette-blue Ar r,g,b
+Color, default 0,0,238.
+ANSI color 4 (blue).
+.It Fl -palette-magenta Ar r,g,b
+Color, default 205,0,205.
+ANSI color 5 (magenta).
+.It Fl -palette-cyan Ar r,g,b
+Color, default 0,205,205.
+ANSI color 6 (cyan).
+.It Fl -palette-light-grey Ar r,g,b
+Color, default 229,229,229.
+ANSI color 7 (light grey).
+.It Fl -palette-dark-grey Ar r,g,b
+Color, default 127,127,127.
+ANSI color 8 (dark grey).
+.It Fl -palette-light-red Ar r,g,b
+Color, default 255,0,0.
+ANSI color 9 (light red).
+.It Fl -palette-light-green Ar r,g,b
+Color, default 0,255,0.
+ANSI color 10 (light green).
+.It Fl -palette-light-yellow Ar r,g,b
+Color, default 255,255,0.
+ANSI color 11 (light yellow).
+.It Fl -palette-light-blue Ar r,g,b
+Color, default 92,92,255.
+ANSI color 12 (light blue).
+.It Fl -palette-light-magenta Ar r,g,b
+Color, default 255,0,255.
+ANSI color 13 (light magenta).
+.It Fl -palette-light-cyan Ar r,g,b
+Color, default 0,255,255.
+ANSI color 14 (light cyan).
+.It Fl -palette-white Ar r,g,b
+Color, default 255,255,255.
+ANSI color 15 (white).
+.It Fl -palette-foreground Ar r,g,b
+Color, default 229,229,229.
+Default foreground color.
+.It Fl -palette-background Ar r,g,b
+Color, default 0,0,0.
+Default background color.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev TERM
+Set in every session to the value of
+.Fl -term
+(default
+.Cm xterm-ghostty ) .
+.It Ev COLORTERM
+Set to
+.Cm truecolor .
+.It Ev XDG_SEAT
+Name of the seat that owns the session.
+.It Ev XDG_VTNR
+Number of the virtual terminal used by the seat.
+.It Ev TERM_SESSION_TYPE
+Set to
+.Cm kms
+on DRM seats and to
+.Cm fb
+on fbdev seats.
+.It Ev KMS_START_SCRIPT
+Name of the
+.Cm kmshaunt-launch-gui
+helper, which releases DRM master and then runs a graphical program; set on
+DRM seats only.
+.It Ev LC_ALL , Ev LC_CTYPE , Ev LANG
+Select the locale used to find the default compose file when
+.Fl -xkb-compose-file
+is unset.
+.Cm C
+is used when none of them is set.
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa /etc/kmshaunt/kmshaunt.conf
+Main configuration file.
+Its location follows
+.Fl -configdir .
+.It Pa /etc/kmshaunt/<seat>.seat.conf
+Per-seat configuration file, normally
+.Pa /etc/kmshaunt/seat0.seat.conf .
+It is layered over the main file and cannot override command-line options.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh EXAMPLES
+Start
+.Nm
+on the first free virtual terminal with the default settings:
+.Bd -literal -offset indent
+kmshaunt
+.Ed
+.Pp
+Run a one-shot command on virtual terminal 3 and exit when it finishes:
+.Bd -literal -offset indent
+kmshaunt --vt=3 --oneshot -l -- /bin/sh -c 'echo hello'
+.Ed
+.Pp
+Use a custom font and a larger scrollback:
+.Bd -literal -offset indent
+kmshaunt --font-name='Source Code Pro' --font-size=16 --sb-size=10000
+.Ed
+.Sh SEE ALSO
+.Xr kmscon 1 ,
+.Xr kmshaunt.conf 5

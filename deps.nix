@@ -12,14 +12,15 @@
 #   packages (aro, highway, translate_c, uucode, wuffs — exactly the list in
 #   the tarball's deps/libghostty-vt.txt) already unpacked, filtered by
 #   `.paths` and named by their Zig hashes.
-# - libghostty-vt itself is added with `zig fetch`, which applies the same
-#   `.paths` filtering and produces the hash directory that build.zig.zon
-#   pins. `zig fetch` on a local file needs no network.
+# - libghostty-vt itself is added with `zig fetch` on the unpacked source,
+#   which applies the same `.paths` filtering and produces the hash directory
+#   that build.zig.zon pins. `zig fetch` on a local path needs no network.
 #
 # The sandbox build copies this directory into `zig-pkg/` before building,
 # so Zig finds every package locally and never touches the network.
 {
   fetchurl,
+  fetchzip,
   runCommand,
   zig_0_17,
 }:
@@ -31,9 +32,12 @@ let
   # release tarball's; LIB_VERSION in the tarball is 1.0.1.
   ghosttyHash = "ghostty-1.4.1-dev-5UdBC7mPUgFIzAVXNJOixiryPYogwYwnmN0zZWud4iSr";
 
-  src = fetchurl {
+  # Unpacked source directory (fetchzip strips the tarball root). `zig fetch`
+  # must be given this directory, not the raw tarball: on a tarball it keeps
+  # the archive's root dir inside the hash dir, double-nesting the package.
+  src = fetchzip {
     url = "https://release.files.ghostty.org/libghostty-vt/${version}/libghostty-vt-${version}.tar.gz";
-    hash = "sha256-Mz386XZB75tTa7ngiQethquqraUOj3QXtw2ShK3vN6o=";
+    hash = "sha256-zGuLawiLRplgXoWllDefbR+QYoEiS0MhHG+EKWFFMjI=";
   };
 
   deps = fetchurl {

@@ -5,7 +5,7 @@
 //! `xkb_keysym_from_name()` semantics without linking xkbcommon:
 //!
 //!   * case-sensitive name lookup (binary search over `entries`),
-//!   * `U+XXXX` Unicode notation (direct encoding above U+00FF, Latin-1
+//!   * `UXXXX` Unicode notation (direct encoding above U+00FF, Latin-1
 //!     normalization at or below it, exactly like xkbcommon),
 //!   * `0x…` raw hexadecimal notation (no normalization),
 //!   * the `XF86_` → `XF86` underscore-strip fallback.
@@ -2908,6 +2908,7 @@ fn special(name: []const u8, icase: bool) ?u32 {
     if (name[0] == 'U' or (icase and name[0] == 'u')) {
         const val = parseHex(name[1..]) orelse return null;
         if (val > 0xff and val <= 0x10ffff) return nonzero(0x01000000 + val);
+        if (val > 0x10ffff) return null; // xkb_utf32_to_keysym: NoSymbol
         return nonzero(latin1(val));
     }
     if (name.len >= 2 and name[0] == '0' and
@@ -2953,7 +2954,7 @@ fn parseHex(s: []const u8) ?u32 {
 }
 
 /// xkb_utf32_to_keysym restricted to code points <= 0xff (the only range
-/// the U+ notation routes through it; keysymtab has no entries < 0x100).
+/// the U-notation routes through it; keysymtab has no entries < 0x100).
 fn latin1(v: u32) u32 {
     if ((v >= 0x20 and v <= 0x7e) or (v >= 0xa0 and v <= 0xff)) return v;
     if ((v >= 0x08 and v <= 0x0b) or v == 0x0d or v == 0x1b) return v | 0xff00;
@@ -3007,18 +3008,23 @@ test "keysym names are case-sensitive" {
 }
 
 test "unicode and hex notations match xkbcommon" {
-    // U+ notation: direct encoding above 0xff, Latin-1 below.
-    try std.testing.expectEqual(@as(?u32, 0x41), fromName("U+0041"));
-    try std.testing.expectEqual(@as(?u32, 0xe9), fromName("U+00E9"));
-    try std.testing.expectEqual(@as(?u32, 0x010020ac), fromName("U+20AC"));
-    try std.testing.expectEqual(@as(?u32, 0x0101f600), fromName("U+1F600"));
-    try std.testing.expectEqual(@as(?u32, 0xff08), fromName("U+0008"));
-    try std.testing.expectEqual(@as(?u32, 0xff0d), fromName("U+000D"));
-    try std.testing.expectEqual(@as(?u32, 0xffff), fromName("U+007F"));
-    try std.testing.expectEqual(@as(?u32, null), fromName("U+0000"));
-    try std.testing.expectEqual(@as(?u32, null), fromName("U+110000"));
-    try std.testing.expectEqual(@as(?u32, null), fromName("U+"));
-    try std.testing.expectEqual(@as(?u32, null), fromName("U+123456789"));
+    // U-notation (xkbcommon: "U<codepoint>", e.g. UA1B2 — NO plus sign):
+    // direct encoding above 0xff, Latin-1 normalization at/below it.
+    try std.testing.expectEqual(@as(?u32, 0x41), fromName("U0041"));
+    try std.testing.expectEqual(@as(?u32, 0xe9), fromName("U00E9"));
+    try std.testing.expectEqual(@as(?u32, 0x010020ac), fromName("U20AC"));
+    try std.testing.expectEqual(@as(?u32, 0x0101f600), fromName("U1F600"));
+    try std.testing.expectEqual(@as(?u32, 0xff08), fromName("U0008"));
+    try std.testing.expectEqual(@as(?u32, 0xff0d), fromName("U000D"));
+    try std.testing.expectEqual(@as(?u32, 0xffff), fromName("U007F"));
+    try std.testing.expectEqual(@as(?u32, null), fromName("U0000"));
+    try std.testing.expectEqual(@as(?u32, null), fromName("U110000"));
+    // A bare "U" is the letter-U keysym (exact table match beats U-notation).
+    try std.testing.expectEqual(@as(?u32, 0x55), fromName("U"));
+    try std.testing.expectEqual(@as(?u32, null), fromName("U0"));
+    try std.testing.expectEqual(@as(?u32, null), fromName("U123456789"));
+    // "U+0041" is NOT valid xkbcommon notation (the '+' is not a hex digit).
+    try std.testing.expectEqual(@as(?u32, null), fromName("U+0041"));
     // Raw hex notation, capped at XKB_KEYSYM_MAX.
     try std.testing.expectEqual(@as(?u32, 0xff52), fromName("0xff52"));
     try std.testing.expectEqual(@as(?u32, 0x1fffffff), fromName("0x1fffffff"));

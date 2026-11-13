@@ -1,0 +1,1336 @@
+//! src/session/terminal.zig -- the terminal session (ROADMAP M1.4 pty+login,
+//! M2.1 effects). Implements the src/session.zig Session vtable on top of
+//! pty.Pty + vt.Vt + vt.Effects.
+//!
+//! Integration contract for main.zig
+//! ---------------------------------
+//! * `var ts = try TerminalSession.init(alloc, &cfg, cols, rows);`
+//!   `const s = ts.session();` -- the Session handle. The struct must NOT be
+//!   moved after init: the Effects table is registered lazily at the final
+//!   address (see `ensureBound`), because init returns by value and the C
+//!   userdata pointer must stay stable.
+//! * `ts.setRenderer(r)` -- inject the render.Renderer (CpuRenderer). render()
+//!   errors with NoRenderer until one is injected.
+//! * `s.start()` opens the pty, builds the environment (below) and spawns
+//!   cfg.login_argv. Then register `ts.masterFd()` with the epoll loop for
+//!   EPOLLIN **edge-triggered** (kmscon misc/pty.c:448-466 does the same:
+//!   /bin/login vhangup()s the tty, so HUP/EIO is NOT a reliable child-exit
+//!   signal and level-triggered HUP would spin). On readiness call
+//!   `ts.onPtyReadable()`, which drains the master into vt.write; every
+//!   effect fires inline there.
+//! * Child exit is tracked by PID, not by the tty: wire SIGCHLD (signalfd)
+//!   to `ts.reapChild()`. It reaps non-blocking, fires hooks.child_exit and,
+//!   when cfg.oneshot, stops the session. The pump also attempts a reap on
+//!   EIO/EOF. Without oneshot the session stays up after child exit; the
+//!   session manager decides whether to stop()/start() again (kmscon
+//!   respawns login with retry throttling -- that policy lives above this
+//!   module, in the hook owner).
+//! * `ts.hooks` (set before start):
+//!     - bell: BEL, gated by cfg.bell. main.zig wires this to KDMKTONE on
+//!       the console fd (kmscon terminal.c:507-510 forwards BEL to the VT).
+//!     - set_background / set_foreground: kmscon's private OSCs (bare
+//!       identifiers, BEL or ST, NO reply -- docs/reference/kmscon-private-
+//!       osc.md). main.zig wires set_background to terminal deactivate +
+//!       DRM master release + input sleep (§3.2) and set_foreground to VT
+//!       restore + DRM master retake + wake + full redraw (§3.3). Both are
+//!       idempotent no-ops when already in the requested state; the retake
+//!       may need the 50ms EBUSY retry timer (§3.3).
+//!     - grab: grab-* InputEvents, forwarded verbatim to the session
+//!       manager (kmscon grab resolution is not a session concern).
+//!     - child_exit: terminal child status after reap, fired before the
+//!       oneshot stop.
+//! * `ts.blink_phase` -- main.zig's blink timer toggles this; render() uses
+//!   it only while the cursor requests blinking and cfg.blink is on.
+//! * `ts.seat_name` / `ts.vt_nr` / `ts.drm` -- set before start; they feed
+//!   XDG_SEAT / XDG_VTNR / TERM_SESSION_TYPE / KMS_START_SCRIPT below.
+//!
+//! Environment construction (kmscon misc/pty.c:204-249,
+//! docs/reference/kmscon-options.md "Environ interactions")
+//! --------------------------------------------------------
+//! * cfg.reset_env (default on): the child starts from a COMPLETELY EMPTY
+//!   environment. kmshaunt then adds a minimal PATH (default_path, same
+//!   fallback as misc/pty.zig) and HOME (parent's HOME, else "/") so a
+//!   non-login cfg.login_argv still works; /bin/login -p overrides both
+//!   from login.defs/passwd. kmscon itself sets neither and relies on
+//!   login(1) -- this is the one deliberate addition.
+//! * cfg.reset_env off: the parent's full environment is inherited.
+//! * On top of either base, in order: TERM=cfg.term (empty -> the
+//!   xterm-ghostty default, ROADMAP D6), COLORTERM=truecolor
+//!   (terminal.c:1492), XDG_SEAT/XDG_VTNR when seat info is set, and
+//!   TERM_SESSION_TYPE=kms + KMS_START_SCRIPT=kmscon-launch-gui for DRM
+//!   (TERM_SESSION_TYPE=fb otherwise).
+//!
+//! Effects routing (M2.1)
+//! ----------------------
+//!   write_pty        -> pty.write (every library reply: DA, DSR, size,
+//!                       OSC 52 read replies, paste, ...). Bounded
+//!                       poll-backed retry on a full non-blocking master.
+//!   bell             -> hooks.bell when cfg.bell.
+//!   title/pwd        -> stored in-process (title()/pwd()); RIS clears them.
+//!   clipboard_write  -> in-process buffer per location (OSC 52 stays
+//!                       in-process per ROADMAP); replies before return.
+//!   clipboard_read   -> serves the buffer as text/plain; replies before
+//!                       return.
+//!   unknown_sequence -> exact, case-sensitive "setBackground" /
+//!                       "setForeground" (kmscon-private-osc.md §1.4) fire
+//!                       the hooks; NO reply. Everything else is ignored.
+//!   size             -> current grid + cell pixels (XTWINOPS, mode 2048).
+//!   color_scheme     -> dark (the console default).
+//!   device_attributes-> VT220 conformance 62, features 22 (ANSI color) +
+//!                       52 (clipboard); secondary VT220.
+//!   render_hold      -> mode 2026: render() defers presentation while held.
+//!   reset            -> clears stored title/pwd.
+//!   resize_window    -> not installed: kmscon/libtsm does not honor
+//!                       CSI 8;rows;cols t either.
+//!   enquiry/xtversion/desktop_notification/progress_report/program_status/
+//!   semantic_prompt  -> not installed (ignored), matching kmscon.
+//!
+//! backspace-delete: the ghostty key encoder's BACKARROW_KEY_MODE option is
+//! not exposed by vt.zig; its default (backspace emits 0x7f) already matches
+//! cfg.backspace_delete = on. For off, handleKey intercepts unmodified
+//! Backspace on the legacy path (kitty protocol active -> encoder decides).
+//!
+//! Tests: src/test_terminal.zig (needs vt-c + libghostty-vt; the exact
+//! command is in that file's header and the completion report).
+
+const std = @import("std");
+const sess = @import("../session.zig");
+const vt = @import("../vt.zig");
+const render = @import("../render.zig");
+const config = @import("../config/config.zig");
+const pty_mod = @import("../misc/pty.zig");
+
+pub const Pty = pty_mod.Pty;
+
+/// Minimal PATH for reset-env children; same fallback as misc/pty.zig.
+pub const default_path = "/usr/local/bin:/usr/bin:/bin";
+
+const reap_flags: u32 = std.posix.W.NOHANG | std.posix.W.UNTRACED;
+
+/// Host hooks, all optional. `userdata` is passed to every callback.
+/// Set before start(); see the module header for the wiring contract.
+pub const Hooks = struct {
+    userdata: ?*anyopaque = null,
+    /// BEL (gated by cfg.bell). main.zig: KDMKTONE.
+    bell: ?*const fn (userdata: ?*anyopaque) void = null,
+    /// Private OSC setBackground. main.zig: deactivate + DRM master
+    /// release + input sleep (kmscon-private-osc.md §3.2).
+    set_background: ?*const fn (userdata: ?*anyopaque) void = null,
+    /// Private OSC setForeground. main.zig: VT restore + DRM master
+    /// retake + wake + redraw (kmscon-private-osc.md §3.3).
+    set_foreground: ?*const fn (userdata: ?*anyopaque) void = null,
+    /// grab-* event; the session manager resolves the id.
+    grab: ?*const fn (userdata: ?*anyopaque, id: u16) void = null,
+    /// Child exited (terminal status, after reap). Fired before the
+    /// oneshot stop.
+    child_exit: ?*const fn (userdata: ?*anyopaque, status: Pty.ReapStatus) void = null,
+};
+
+pub const TerminalSession = struct {
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+
+    vt: vt.Vt,
+    effects: vt.Effects,
+    render_state: vt.RenderState,
+    key_encoder: vt.KeyEncoder,
+    mouse_encoder: vt.MouseEncoder,
+    pty: Pty = .{},
+    active: bool = false,
+
+    /// Injected by main.zig (CpuRenderer). Borrowed; not deinit'd here.
+    renderer: ?render.Renderer = null,
+    hooks: Hooks = .{},
+
+    // Geometry. cell_w/cell_h are 0 until the first render/resize carries
+    // real metrics; size reports and the mouse encoder use them.
+    cols: u16,
+    rows: u16,
+    cell_w: u16 = 0,
+    cell_h: u16 = 0,
+
+    // Seat info for the child environment (set before start).
+    seat_name: ?[]const u8 = null,
+    vt_nr: ?u32 = null,
+    /// DRM video backend: TERM_SESSION_TYPE=kms + KMS_START_SCRIPT.
+    drm: bool = true,
+
+    /// Blink phase driven by main.zig's blink timer (M2.4).
+    blink_phase: bool = true,
+
+    // Effect state.
+    title_buf: std.ArrayListUnmanaged(u8) = .empty,
+    pwd_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// In-process OSC 52 clipboard, one buffer per location.
+    clipboard: [3]std.ArrayListUnmanaged(u8) = .{ .empty, .empty, .empty },
+    render_held: bool = false,
+    palette18: [18]u32 = @splat(0),
+    last_pointer: struct { x: f32 = 0, y: f32 = 0 } = .{},
+
+    /// Create the terminal, encoders, render state and the Effects table.
+    /// The table is registered with the terminal lazily (ensureBound) at
+    /// the struct's final address: init returns by value, and both the C
+    /// userdata pointer and effects.userdata must point at stable storage.
+    /// Do not move the struct after init.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        cfg: *const config.Config,
+        cols: u16,
+        rows: u16,
+    ) !TerminalSession {
+        var v = try vt.Vt.init(cols, rows);
+        errdefer v.deinit();
+        var rs = try vt.RenderState.new();
+        errdefer rs.deinit();
+        var ke = try vt.KeyEncoder.new();
+        errdefer ke.free();
+        var me = try vt.MouseEncoder.new();
+        errdefer me.free();
+
+        var self: TerminalSession = .{
+            .allocator = allocator,
+            .cfg = cfg,
+            .vt = v,
+            .effects = .{
+                .userdata = null, // bound by ensureBound
+                .write_pty = effWritePty,
+                .bell = effBell,
+                .title_changed = effTitle,
+                .pwd_changed = effPwd,
+                .size = effSize,
+                .color_scheme = effColorScheme,
+                .device_attributes = effDeviceAttributes,
+                .clipboard_write = effClipboardWrite,
+                .clipboard_read = effClipboardRead,
+                .render_hold = effRenderHold,
+                .reset = effReset,
+                .unknown_sequence = effUnknown,
+            },
+            .render_state = rs,
+            .key_encoder = ke,
+            .mouse_encoder = me,
+            .cols = cols,
+            .rows = rows,
+        };
+        try self.vt.setScrollbackMaxLines(cfg.sb_size);
+        try self.vt.setOption(.default_cursor_blink, &cfg.blink);
+        return self;
+    }
+
+    /// Stop the child and release everything. Safe after a failed start.
+    pub fn deinit(self: *TerminalSession) void {
+        self.stopImpl() catch {};
+        self.render_state.deinit();
+        self.key_encoder.free();
+        self.mouse_encoder.free();
+        self.vt.deinit();
+        self.title_buf.deinit(self.allocator);
+        self.pwd_buf.deinit(self.allocator);
+        for (&self.clipboard) |*buf| buf.deinit(self.allocator);
+    }
+
+    /// The Session vtable handle. `self` must be at its final address.
+    pub fn session(self: *TerminalSession) sess.Session {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn setRenderer(self: *TerminalSession, r: render.Renderer) void {
+        self.renderer = r;
+    }
+
+    /// The pty master fd for epoll registration; -1 before start / after
+    /// stop. Register EPOLLIN edge-triggered (module header).
+    pub fn masterFd(self: *const TerminalSession) std.posix.fd_t {
+        return self.pty.master_fd;
+    }
+
+    /// Current title (OSC 0/2), stored in-process.
+    pub fn title(self: *const TerminalSession) []const u8 {
+        return self.title_buf.items;
+    }
+
+    /// Current pwd (OSC 7 URI, unparsed), stored in-process.
+    pub fn pwd(self: *const TerminalSession) []const u8 {
+        return self.pwd_buf.items;
+    }
+
+    /// In-process clipboard contents for a location (text/plain).
+    pub fn clipboardText(self: *const TerminalSession, location: vt.ClipboardLocation) []const u8 {
+        return self.clipboard[@intFromEnum(location)].items;
+    }
+
+    /// epoll pump: drain the pty master into the terminal. Effects fire
+    /// inline (vt.write). EIO/EOF means every slave fd closed -- NOT
+    /// necessarily child exit (login vhangup); a non-blocking reap is
+    /// attempted. Breaks on EAGAIN; register the fd edge-triggered.
+    pub fn onPtyReadable(self: *TerminalSession) anyerror!void {
+        try self.ensureBound();
+        if (!self.active) return;
+        var buf: [16384]u8 = undefined;
+        while (true) {
+            const n = self.pty.read(&buf) catch |err| switch (err) {
+                error.WouldBlock => break,
+                error.InputOutput => {
+                    try self.reapChild();
+                    break;
+                },
+                else => return err,
+            };
+            if (n == 0) {
+                try self.reapChild();
+                break;
+            }
+            self.vt.write(buf[0..n]);
+        }
+    }
+
+    /// SIGCHLD path (and the pump's EIO path): reap non-blocking. On a
+    /// terminal status fire hooks.child_exit, then stop when cfg.oneshot.
+    /// Without oneshot the session stays active; the hook owner decides
+    /// whether to restart (module header).
+    pub fn reapChild(self: *TerminalSession) anyerror!void {
+        const result = try self.pty.reap(reap_flags) orelse return;
+        switch (result.status) {
+            .exited, .signaled => {},
+            .stopped, .continued => return,
+        }
+        if (self.hooks.child_exit) |f| f(self.hooks.userdata, result.status);
+        if (self.cfg.oneshot) try self.stopImpl();
+    }
+
+    // -- internals ---------------------------------------------------------
+
+    /// Register the Effects table at the struct's stable address. Every
+    /// entry point that can fire effects calls this first; after the first
+    /// bind it is a single pointer compare.
+    fn ensureBound(self: *TerminalSession) !void {
+        if (self.effects.userdata != null) return;
+        self.effects.userdata = self;
+        try self.vt.setEffects(&self.effects);
+    }
+
+    fn startImpl(self: *TerminalSession) anyerror!void {
+        if (self.active) return;
+        try self.ensureBound();
+
+        var p = try Pty.open(self.cols, self.rows);
+        errdefer p.deinit();
+        try p.setNonBlocking(true);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const env = try self.buildEnv(arena.allocator());
+
+        try p.spawn(.{
+            .argv = self.cfg.login_argv,
+            .env = env,
+            .winsize = .{ .cols = self.cols, .rows = self.rows },
+            .allocator = self.allocator,
+        });
+        self.pty = p;
+        self.active = true;
+    }
+
+    fn stopImpl(self: *TerminalSession) anyerror!void {
+        if (!self.active) return;
+        self.active = false;
+        if (self.pty.child_pid > 0) {
+            // SIGHUP, a short grace period, then SIGKILL; reap either way.
+            self.pty.kill(.HUP) catch {};
+            var waited_ms: u32 = 0;
+            while (waited_ms < 200 and self.pty.child_pid > 0) : (waited_ms += 10) {
+                if ((try self.pty.reap(reap_flags)) != null) break;
+                sleepMs(10);
+            }
+            if (self.pty.child_pid > 0) {
+                self.pty.kill(.KILL) catch {};
+                while (self.pty.child_pid > 0) {
+                    _ = self.pty.reap(0) catch |err| switch (err) {
+                        error.Interrupted => continue,
+                        else => break,
+                    };
+                }
+            }
+        }
+        self.pty.deinit();
+    }
+
+    fn resizeImpl(self: *TerminalSession, cols: u16, rows: u16) anyerror!void {
+        try self.ensureBound();
+        try self.applyGeometry(cols, rows, self.cell_w, self.cell_h);
+    }
+
+    /// vt.resize (reflow) + TIOCSWINSZ + renderer reconfigure + mouse
+    /// encoder geometry. Used by resize() and by render() when the context
+    /// geometry changed (mode change / font size change).
+    fn applyGeometry(self: *TerminalSession, cols: u16, rows: u16, cell_w: u16, cell_h: u16) !void {
+        self.cols = cols;
+        self.rows = rows;
+        self.cell_w = cell_w;
+        self.cell_h = cell_h;
+        try self.vt.resize(cols, rows, cell_w, cell_h);
+        if (self.active) try self.pty.resize(cols, rows);
+        if (self.renderer) |r| try r.resize(cols, rows, cell_w, cell_h);
+        try self.updateMouseSize();
+    }
+
+    fn updateMouseSize(self: *TerminalSession) !void {
+        if (self.cell_w == 0 or self.cell_h == 0) return;
+        try self.mouse_encoder.setSize(.{
+            .screen_width = @as(u32, self.cols) * self.cell_w,
+            .screen_height = @as(u32, self.rows) * self.cell_h,
+            .cell_width = self.cell_w,
+            .cell_height = self.cell_h,
+        });
+    }
+
+    fn renderImpl(self: *TerminalSession, ctx: *const sess.RenderContext) anyerror!void {
+        try self.ensureBound();
+        if (ctx.cols != self.cols or ctx.rows != self.rows or
+            ctx.cell_w != self.cell_w or ctx.cell_h != self.cell_h)
+        {
+            try self.applyGeometry(ctx.cols, ctx.rows, ctx.cell_w, ctx.cell_h);
+        }
+        // Synchronized output (mode 2026): defer presentation while held.
+        if (self.render_held) return;
+        const r = self.renderer orelse return error.NoRenderer;
+
+        try self.render_state.update(&self.vt);
+        const colors = try self.render_state.colors();
+        for (0..16) |i| self.palette18[i] = packRgb(colors.palette[i]);
+        self.palette18[16] = packRgb(colors.foreground);
+        self.palette18[17] = packRgb(colors.background);
+        const cursor = try self.render_state.cursor();
+        const opts: render.RenderOpts = .{
+            .cursor_visible = cursor.visible,
+            .cursor_style = switch (cursor.style) {
+                .bar => .bar,
+                .underline => .underline,
+                // block_hollow has no renderer counterpart; draw block.
+                .block, .block_hollow => .block,
+            },
+            .cursor_blink_on = if (cursor.blinking and self.cfg.blink) self.blink_phase else null,
+            .palette = &self.palette18,
+            .default_fg = self.palette18[16],
+            .default_bg = self.palette18[17],
+            .bg_opacity = 255,
+        };
+        try r.renderFrame(&self.render_state, ctx.fb, ctx.damage, opts);
+        try self.render_state.clean();
+    }
+
+    fn onInputImpl(self: *TerminalSession, event: sess.InputEvent) anyerror!void {
+        try self.ensureBound();
+        switch (event) {
+            .key => |k| try self.handleKey(k),
+            .pointer_motion => |m| {
+                self.last_pointer = .{ .x = @floatCast(m.x), .y = @floatCast(m.y) };
+                try self.handleMouse(.motion, null, m.x, m.y);
+            },
+            .pointer_button => |b| {
+                self.last_pointer = .{ .x = @floatCast(b.x), .y = @floatCast(b.y) };
+                try self.handleMouse(if (b.pressed) .press else .release, mapButton(b.button), b.x, b.y);
+            },
+            .pointer_axis => |a| try self.handleAxis(a),
+            .grab => |g| {
+                if (self.hooks.grab) |f| f(self.hooks.userdata, g.id);
+            },
+        }
+    }
+
+    fn handleKey(self: *TerminalSession, k: sess.InputEvent.Key) !void {
+        if (!self.active) return;
+        const key = std.enums.fromInt(vt.Key, k.ghostty_key) orelse return;
+        const action = std.enums.fromInt(vt.KeyAction, k.action) orelse return;
+
+        // backspace-delete off: unmodified Backspace sends 0x08 on the
+        // legacy path (kmscon terminal.c:1464). The encoder default is
+        // 0x7f (= on); with the kitty protocol active the encoder decides.
+        if (!self.cfg.backspace_delete and key == .backspace and k.mods == 0 and
+            (try self.vt.kittyKeyboardFlags()) == 0)
+        {
+            try self.writeToPty("\x08");
+            return;
+        }
+
+        try self.key_encoder.setFromTerminal(&self.vt);
+        const ev: vt.KeyEvent = .{
+            .action = action,
+            .key = key,
+            .mods = k.mods,
+            .utf8 = k.utf8 orelse "",
+            .unshifted_codepoint = k.unshifted_codepoint orelse 0,
+        };
+        var buf: [64]u8 = undefined;
+        const bytes = self.key_encoder.encode(ev, &buf) catch |err| switch (err) {
+            error.OutOfSpace => blk: {
+                var big: [256]u8 = undefined;
+                break :blk try self.key_encoder.encode(ev, &big);
+            },
+            else => return err,
+        };
+        if (bytes.len > 0) try self.writeToPty(bytes);
+    }
+
+    fn handleMouse(self: *TerminalSession, action: vt.MouseAction, button: ?vt.MouseButton, x: f64, y: f64) !void {
+        if (!self.active) return;
+        // M2.3: route to the encoder while the program tracks the mouse.
+        // Selection gestures when tracking is off are a follow-up.
+        if (!(try self.vt.mouseTracking())) return;
+        try self.mouse_encoder.setFromTerminal(&self.vt);
+        try self.updateMouseSize();
+        var buf: [64]u8 = undefined;
+        const bytes = try self.mouse_encoder.encode(.{
+            .action = action,
+            .button = button,
+            .x = @floatCast(x),
+            .y = @floatCast(y),
+        }, &buf);
+        if (bytes.len > 0) try self.writeToPty(bytes);
+    }
+
+    fn handleAxis(self: *TerminalSession, axis: sess.InputEvent.PointerAxis) !void {
+        // Wheel events are button 4/5 (vertical) and 6/7 (horizontal)
+        // press+release pairs at the last pointer position.
+        if (axis.dy != 0) {
+            const btn: vt.MouseButton = if (axis.dy > 0) .five else .four;
+            try self.handleMouse(.press, btn, self.last_pointer.x, self.last_pointer.y);
+            try self.handleMouse(.release, btn, self.last_pointer.x, self.last_pointer.y);
+        }
+        if (axis.dx != 0) {
+            const btn: vt.MouseButton = if (axis.dx > 0) .seven else .six;
+            try self.handleMouse(.press, btn, self.last_pointer.x, self.last_pointer.y);
+            try self.handleMouse(.release, btn, self.last_pointer.x, self.last_pointer.y);
+        }
+    }
+
+    /// Write to the pty master, retrying a full non-blocking master with
+    /// bounded POLLOUT polls (~1s total). Errors propagate to the input
+    /// path; the effect sink (effWritePty) is best-effort by contract.
+    fn writeToPty(self: *TerminalSession, bytes: []const u8) !void {
+        if (!self.active or self.pty.master_fd < 0) return;
+        var off: usize = 0;
+        var polls: u32 = 0;
+        while (off < bytes.len) {
+            const n = self.pty.write(bytes[off..]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    if (polls >= 100) return error.WouldBlock;
+                    polls += 1;
+                    var pfd = [_]std.posix.pollfd{.{
+                        .fd = self.pty.master_fd,
+                        .events = std.posix.POLL.OUT,
+                        .revents = 0,
+                    }};
+                    _ = try std.posix.poll(&pfd, 10);
+                    continue;
+                },
+                else => return err,
+            };
+            off += n;
+        }
+    }
+
+    // -- environment -------------------------------------------------------
+
+    fn buildEnv(self: *TerminalSession, aa: std.mem.Allocator) ![]const []const u8 {
+        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+        const cfg = self.cfg;
+        if (cfg.reset_env) {
+            // kmscon misc/pty.c:213-219: completely empty environment.
+            // kmshaunt adds minimal PATH/HOME for non-login login_argv;
+            // /bin/login -p overrides both (module header).
+            try list.append(aa, "PATH=" ++ default_path);
+            try list.append(aa, try std.fmt.allocPrint(aa, "HOME={s}", .{parentEnv("HOME") orelse "/"}));
+        } else {
+            var i: usize = 0;
+            while (std.c.environ[i]) |entry_z| : (i += 1) {
+                try list.append(aa, try aa.dupe(u8, std.mem.span(entry_z)));
+            }
+        }
+        const term = if (cfg.term.len > 0) cfg.term else config.default_term;
+        try putEnv(aa, &list, "TERM", term);
+        try putEnv(aa, &list, "COLORTERM", "truecolor");
+        if (self.seat_name) |seat| try putEnv(aa, &list, "XDG_SEAT", seat);
+        if (self.vt_nr) |nr| try putEnv(aa, &list, "XDG_VTNR", try std.fmt.allocPrint(aa, "{d}", .{nr}));
+        if (self.drm) {
+            try putEnv(aa, &list, "KMS_START_SCRIPT", "kmscon-launch-gui");
+            try putEnv(aa, &list, "TERM_SESSION_TYPE", "kms");
+        } else {
+            try putEnv(aa, &list, "TERM_SESSION_TYPE", "fb");
+        }
+        return list.items;
+    }
+
+    fn putEnv(
+        aa: std.mem.Allocator,
+        list: *std.ArrayListUnmanaged([]const u8),
+        name: []const u8,
+        value: []const u8,
+    ) !void {
+        const entry = try std.fmt.allocPrint(aa, "{s}={s}", .{ name, value });
+        for (list.items) |*item| {
+            if (item.len > name.len and std.mem.startsWith(u8, item.*, name) and item.*[name.len] == '=') {
+                item.* = entry;
+                return;
+            }
+        }
+        try list.append(aa, entry);
+    }
+
+    fn parentEnv(name: []const u8) ?[]const u8 {
+        var i: usize = 0;
+        while (std.c.environ[i]) |entry_z| : (i += 1) {
+            const entry = std.mem.span(entry_z);
+            if (entry.len > name.len and std.mem.startsWith(u8, entry, name) and entry[name.len] == '=')
+                return entry[name.len + 1 ..];
+        }
+        return null;
+    }
+
+    // -- effect callbacks (userdata = *TerminalSession) ---------------------
+    // REENTRANCY: these fire inside vt.write/resize and must not mutate the
+    // terminal (vt.zig Effects docs). pty writes and hook calls are safe.
+
+    fn fromUserdata(userdata: ?*anyopaque) *TerminalSession {
+        return @ptrCast(@alignCast(userdata.?));
+    }
+
+    fn effWritePty(userdata: ?*anyopaque, data: []const u8) void {
+        const self = fromUserdata(userdata);
+        // Best-effort: a dead or persistently full master drops the reply
+        // (the callback cannot return an error). Input writes propagate.
+        self.writeToPty(data) catch {};
+    }
+
+    fn effBell(userdata: ?*anyopaque) void {
+        const self = fromUserdata(userdata);
+        if (!self.cfg.bell) return;
+        if (self.hooks.bell) |f| f(self.hooks.userdata);
+    }
+
+    fn effTitle(userdata: ?*anyopaque, t: []const u8) void {
+        const self = fromUserdata(userdata);
+        self.title_buf.clearRetainingCapacity();
+        self.title_buf.appendSlice(self.allocator, t) catch {};
+    }
+
+    fn effPwd(userdata: ?*anyopaque, p: []const u8) void {
+        const self = fromUserdata(userdata);
+        self.pwd_buf.clearRetainingCapacity();
+        self.pwd_buf.appendSlice(self.allocator, p) catch {};
+    }
+
+    fn effSize(userdata: ?*anyopaque, out: *vt.SizeReport) bool {
+        const self = fromUserdata(userdata);
+        out.* = .{
+            .rows = self.rows,
+            .columns = self.cols,
+            .cell_width = self.cell_w,
+            .cell_height = self.cell_h,
+        };
+        return true;
+    }
+
+    fn effColorScheme(userdata: ?*anyopaque, out: *vt.ColorScheme) bool {
+        _ = userdata;
+        out.* = .dark;
+        return true;
+    }
+
+    fn effDeviceAttributes(userdata: ?*anyopaque, out: *vt.DeviceAttributes) bool {
+        _ = userdata;
+        out.primary = .{
+            .conformance_level = vt.da_conformance_vt220,
+            .features = @splat(0),
+            .num_features = 2,
+        };
+        out.primary.features[0] = vt.da_feature_ansi_color;
+        out.primary.features[1] = vt.da_feature_clipboard;
+        out.secondary = .{
+            .device_type = vt.da_device_type_vt220,
+            .firmware_version = 0,
+            .rom_cartridge = 0,
+        };
+        out.tertiary = .{ .unit_id = 0 };
+        return true;
+    }
+
+    fn effClipboardWrite(userdata: ?*anyopaque, req: *const vt.ClipboardWriteRequest) void {
+        const self = fromUserdata(userdata);
+        const buf = &self.clipboard[@intFromEnum(req.location)];
+        buf.clearRetainingCapacity();
+        if (req.contents.len > 0) {
+            // Prefer text/plain; fall back to the first representation.
+            var chosen = req.contents[0];
+            for (req.contents) |content| {
+                if (std.mem.eql(u8, content.mime, "text/plain")) {
+                    chosen = content;
+                    break;
+                }
+            }
+            buf.appendSlice(self.allocator, chosen.data) catch {
+                req.reply(.io_error, false);
+                return;
+            };
+        }
+        req.reply(.success, false);
+    }
+
+    fn effClipboardRead(userdata: ?*anyopaque, req: *const vt.ClipboardReadRequest) void {
+        const self = fromUserdata(userdata);
+        const buf = &self.clipboard[@intFromEnum(req.location)];
+        // Only text/plain is stored. A list-only request (no mimes) is
+        // served without a prompt.
+        var wants_text = req.mimes.len == 0;
+        for (req.mimes) |mime| {
+            if (std.mem.eql(u8, mime, "text/plain")) {
+                wants_text = true;
+                break;
+            }
+        }
+        const text_mime = "text/plain";
+        const available = [_][]const u8{text_mime};
+        const avail: []const []const u8 = if (req.list) &available else &.{};
+        if (!wants_text) {
+            req.reply(.unsupported, &.{}, &.{}, false);
+            return;
+        }
+        if (buf.items.len == 0) {
+            req.reply(.success, &.{}, avail, false);
+            return;
+        }
+        const contents = [_]vt.ClipboardContent{.{ .mime = text_mime, .data = buf.items }};
+        req.reply(.success, &contents, avail, false);
+    }
+
+    fn effRenderHold(userdata: ?*anyopaque, held: bool) void {
+        fromUserdata(userdata).render_held = held;
+    }
+
+    fn effReset(userdata: ?*anyopaque) void {
+        const self = fromUserdata(userdata);
+        // RIS: the library clears its own title/pwd without firing the
+        // change callbacks; mirror that here.
+        self.title_buf.clearRetainingCapacity();
+        self.pwd_buf.clearRetainingCapacity();
+    }
+
+    fn effUnknown(userdata: ?*anyopaque, seq: vt.UnknownSequence) void {
+        const self = fromUserdata(userdata);
+        if (seq.tag != .osc or seq.truncated) return;
+        // Exact, case-sensitive match on the bare identifier; both BEL and
+        // ST terminators arrive here; NO reply (kmscon-private-osc.md
+        // §1.4, §3.5).
+        if (std.mem.eql(u8, seq.content, "setBackground")) {
+            if (self.hooks.set_background) |f| f(self.hooks.userdata);
+        } else if (std.mem.eql(u8, seq.content, "setForeground")) {
+            if (self.hooks.set_foreground) |f| f(self.hooks.userdata);
+        }
+    }
+
+    // -- Session vtable -----------------------------------------------------
+
+    const vtable = sess.Session.VTable{
+        .deinit = vtDeinit,
+        .start = vtStart,
+        .stop = vtStop,
+        .isActive = vtIsActive,
+        .resize = vtResize,
+        .render = vtRender,
+        .onInput = vtOnInput,
+        .name = vtName,
+    };
+
+    fn cast(ptr: *anyopaque) *TerminalSession {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn vtDeinit(ptr: *anyopaque) void {
+        cast(ptr).deinit();
+    }
+    fn vtStart(ptr: *anyopaque) anyerror!void {
+        return cast(ptr).startImpl();
+    }
+    fn vtStop(ptr: *anyopaque) anyerror!void {
+        return cast(ptr).stopImpl();
+    }
+    fn vtIsActive(ptr: *anyopaque) bool {
+        return cast(ptr).active;
+    }
+    fn vtResize(ptr: *anyopaque, cols: u16, rows: u16) anyerror!void {
+        return cast(ptr).resizeImpl(cols, rows);
+    }
+    fn vtRender(ptr: *anyopaque, ctx: *const sess.RenderContext) anyerror!void {
+        return cast(ptr).renderImpl(ctx);
+    }
+    fn vtOnInput(ptr: *anyopaque, event: sess.InputEvent) anyerror!void {
+        return cast(ptr).onInputImpl(event);
+    }
+    fn vtName(ptr: *anyopaque) []const u8 {
+        _ = ptr;
+        return "terminal";
+    }
+};
+
+fn packRgb(c: vt.Rgb) u32 {
+    return (@as(u32, c.r) << 16) | (@as(u32, c.g) << 8) | c.b;
+}
+
+fn mapButton(code: u32) ?vt.MouseButton {
+    return switch (code) {
+        0x110 => .left, // BTN_LEFT
+        0x111 => .right, // BTN_RIGHT
+        0x112 => .middle, // BTN_MIDDLE
+        0x113 => .four, // BTN_SIDE
+        0x114 => .five, // BTN_EXTRA
+        else => null,
+    };
+}
+
+fn sleepMs(ms: u64) void {
+    const req = std.os.linux.timespec{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.os.linux.nanosleep(&req, null);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: real vt + hermetic /bin/sh children (never /bin/login). Run via
+// src/test_terminal.zig; the command is in that file's header.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+fn testCfg(argv: []const []const u8) config.Config {
+    var cfg = config.Config.init(testing.allocator);
+    cfg.login_argv = argv;
+    return cfg;
+}
+
+/// Capture the whole screen as text. Forces a full-dirty capture (a resize
+/// round-trip) so every row is iterable regardless of prior update/clean
+/// calls; vt.zig's Rows only exposes nextDirty.
+fn screenText(ts: *TerminalSession, buf: []u8) ![]const u8 {
+    try ts.vt.resize(ts.cols, ts.rows + 1, 0, 0);
+    try ts.vt.resize(ts.cols, ts.rows, 0, 0);
+    try ts.render_state.update(&ts.vt);
+    var rows = try ts.render_state.rowsIter();
+    var total: usize = 0;
+    while (try rows.nextDirty()) |row| {
+        var cells = try row.cells();
+        while (try cells.next()) |cell| {
+            if (total + cell.text.len >= buf.len) return error.OutOfSpace;
+            @memcpy(buf[total..][0..cell.text.len], cell.text);
+            total += cell.text.len;
+        }
+        buf[total] = '\n';
+        total += 1;
+    }
+    return buf[0..total];
+}
+
+fn nowMs() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
+fn pumpUntil(
+    ts: *TerminalSession,
+    ctx: anytype,
+    comptime pred: fn (@TypeOf(ctx), *TerminalSession) bool,
+    timeout_ms: i64,
+) !void {
+    const start = nowMs();
+    var pfd = [_]std.posix.pollfd{.{
+        .fd = ts.masterFd(),
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    while (!pred(ctx, ts)) {
+        if (nowMs() - start > timeout_ms) return error.TestTimeout;
+        const ready = try std.posix.poll(&pfd, 10);
+        if (ready > 0) try ts.onPtyReadable();
+    }
+}
+
+const TextWatch = struct {
+    needle: []const u8,
+    buf: [8192]u8 = undefined,
+    len: usize = 0,
+
+    fn pred(w: *TextWatch, ts: *TerminalSession) bool {
+        const text = screenText(ts, &w.buf) catch return false;
+        w.len = text.len;
+        return std.mem.indexOf(u8, text, w.needle) != null;
+    }
+};
+
+fn pumpUntilText(ts: *TerminalSession, needle: []const u8, timeout_ms: i64) ![]const u8 {
+    var w = TextWatch{ .needle = needle };
+    try pumpUntil(ts, &w, TextWatch.pred, timeout_ms);
+    return w.buf[0..w.len];
+}
+
+fn inactivePred(_: void, ts: *TerminalSession) bool {
+    return !ts.active;
+}
+
+const HookLog = struct {
+    bells: u32 = 0,
+    backgrounds: u32 = 0,
+    foregrounds: u32 = 0,
+    grabs: u32 = 0,
+    last_grab: u16 = 0,
+    exits: u32 = 0,
+    last_exit: ?Pty.ReapStatus = null,
+
+    fn hooks(self: *HookLog) Hooks {
+        return .{
+            .userdata = self,
+            .bell = bellCb,
+            .set_background = bgCb,
+            .set_foreground = fgCb,
+            .grab = grabCb,
+            .child_exit = exitCb,
+        };
+    }
+    fn log(ud: ?*anyopaque) *HookLog {
+        return @ptrCast(@alignCast(ud.?));
+    }
+    fn bellCb(ud: ?*anyopaque) void {
+        log(ud).bells += 1;
+    }
+    fn bgCb(ud: ?*anyopaque) void {
+        log(ud).backgrounds += 1;
+    }
+    fn fgCb(ud: ?*anyopaque) void {
+        log(ud).foregrounds += 1;
+    }
+    fn grabCb(ud: ?*anyopaque, id: u16) void {
+        const l = log(ud);
+        l.grabs += 1;
+        l.last_grab = id;
+    }
+    fn exitCb(ud: ?*anyopaque, status: Pty.ReapStatus) void {
+        const l = log(ud);
+        l.exits += 1;
+        l.last_exit = status;
+    }
+};
+
+/// Type one character through the Session vtable (key encoder -> pty).
+fn sendChar(s: sess.Session, key: vt.Key, ch: ?u8) !void {
+    var buf: [1]u8 = undefined;
+    const utf8: ?[]const u8 = if (ch) |c| blk: {
+        buf[0] = c;
+        break :blk &buf;
+    } else null;
+    try s.onInput(.{ .key = .{
+        .ghostty_key = @intFromEnum(key),
+        .mods = 0,
+        .action = 1,
+        .utf8 = utf8,
+        .unshifted_codepoint = if (ch) |c| c else null,
+    } });
+}
+
+test "terminal: start spawns child, output renders, env constructed" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'hello terminal'; printf ' T=%s C=%s S=%s' \"$TERM\" \"$COLORTERM\" \"$TERM_SESSION_TYPE\"" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    const s = ts.session();
+
+    try testing.expectEqualStrings("terminal", s.name());
+    try testing.expect(!s.isActive());
+    try testing.expectEqual(@as(std.posix.fd_t, -1), ts.masterFd());
+    try s.start();
+    try testing.expect(s.isActive());
+    try testing.expect(ts.masterFd() >= 0);
+    // start is a no-op when already active.
+    try s.start();
+
+    const text = try pumpUntilText(&ts, "T=xterm-ghostty", 5000);
+    try testing.expect(std.mem.indexOf(u8, text, "hello terminal") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "C=truecolor") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "S=kms") != null);
+}
+
+test "terminal: echo round-trip via onInput key encoding" {
+    var cfg = testCfg(&.{"/bin/sh"});
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var log = HookLog{};
+    ts.hooks = log.hooks();
+    const s = ts.session();
+    try s.start();
+
+    // "echo roundtrip<Enter>" -- the tty/readline echo and the command
+    // output both come back through the pump into the vt.
+    const keys = [_]struct { k: vt.Key, c: ?u8 }{
+        .{ .k = .e, .c = 'e' }, .{ .k = .c, .c = 'c' }, .{ .k = .h, .c = 'h' },
+        .{ .k = .o, .c = 'o' }, .{ .k = .space, .c = ' ' }, .{ .k = .r, .c = 'r' },
+        .{ .k = .o, .c = 'o' }, .{ .k = .u, .c = 'u' }, .{ .k = .n, .c = 'n' },
+        .{ .k = .d, .c = 'd' }, .{ .k = .t, .c = 't' }, .{ .k = .r, .c = 'r' },
+        .{ .k = .i, .c = 'i' }, .{ .k = .p, .c = 'p' }, .{ .k = .enter, .c = null },
+    };
+    for (keys) |key| try sendChar(s, key.k, key.c);
+    _ = try pumpUntilText(&ts, "roundtrip", 5000);
+
+    // "exit<Enter>": child exits; without oneshot the session stays up and
+    // the child_exit hook fires with status 0.
+    try sendChar(s, .e, 'e');
+    try sendChar(s, .x, 'x');
+    try sendChar(s, .i, 'i');
+    try sendChar(s, .t, 't');
+    try sendChar(s, .enter, null);
+    try pumpUntil(&ts, {}, struct {
+        fn p(_: void, t: *TerminalSession) bool {
+            return t.hooks.exits > 0;
+        }
+    }.p, 5000);
+    try testing.expectEqual(@as(u32, 1), log.exits);
+    try testing.expectEqual(Pty.ReapStatus{ .exited = 0 }, log.last_exit.?);
+    try testing.expect(s.isActive());
+}
+
+test "terminal: resize propagates to vt and pty winsize" {
+    var cfg = testCfg(&.{"/bin/sh"});
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    const s = ts.session();
+    try s.start();
+
+    try s.resize(100, 30);
+    const ws = try ts.pty.getWinsize();
+    try testing.expectEqual(@as(u16, 100), ws.cols);
+    try testing.expectEqual(@as(u16, 30), ws.rows);
+    try testing.expectEqual(@as(u16, 100), try ts.vt.cols());
+    try testing.expectEqual(@as(u16, 30), try ts.vt.rows());
+}
+
+test "terminal: DA and size reports reply through write_pty" {
+    // The replies go to the child's input; the default tty ECHOCTL echoes
+    // them back to the master as "^["-prefixed text, which the vt renders.
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033[c\\033[18t'" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    const s = ts.session();
+    try s.start();
+
+    const text = try pumpUntilText(&ts, "?62;22;52c", 5000);
+    try testing.expect(std.mem.indexOf(u8, text, "8;24;80t") != null);
+}
+
+test "terminal: OSC52 clipboard set/get/clear in-process" {
+    // set "hello" (base64 aGVsbG8=), read it back (reply echoed), clear.
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033]52;c;aGVsbG8=\\007\\033]52;c;?\\007\\033]52;c;\\007'" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    const s = ts.session();
+    try s.start();
+
+    const text = try pumpUntilText(&ts, "aGVsbG8=", 5000);
+    try testing.expect(std.mem.indexOf(u8, text, "52;c;aGVsbG8=") != null);
+    try testing.expectEqualStrings("hello", ts.clipboardText(.standard));
+    try testing.expectEqual(@as(usize, 0), ts.clipboardText(.primary).len);
+
+    try pumpUntil(&ts, {}, struct {
+        fn p(_: void, t: *TerminalSession) bool {
+            return t.clipboardText(.standard).len == 0;
+        }
+    }.p, 5000);
+}
+
+test "terminal: private OSC setBackground/setForeground hooks, no reply" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033]setBackground\\a\\033]setForeground\\033\\\\\\033]setBackground;\\a\\033]setbackground\\a'" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var log = HookLog{};
+    ts.hooks = log.hooks();
+    const s = ts.session();
+    try s.start();
+
+    try pumpUntil(&ts, &log, struct {
+        fn p(l: *HookLog, _: *TerminalSession) bool {
+            return l.backgrounds == 1 and l.foregrounds == 1;
+        }
+    }.p, 5000);
+    // Let any (wrong) reply or the non-matching variants arrive.
+    sleepMs(100);
+    try ts.onPtyReadable();
+    try testing.expectEqual(@as(u32, 1), log.backgrounds);
+    try testing.expectEqual(@as(u32, 1), log.foregrounds);
+    // No reply and no visible output: the screen stays blank.
+    var buf: [8192]u8 = undefined;
+    const text = try screenText(&ts, &buf);
+    try testing.expectEqual(@as(usize, 0), std.mem.trim(u8, text, "\n").len);
+}
+
+test "terminal: oneshot stops the session when the child exits" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "exit 3" });
+    cfg.oneshot = true;
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var log = HookLog{};
+    ts.hooks = log.hooks();
+    const s = ts.session();
+    try s.start();
+
+    try pumpUntil(&ts, {}, inactivePred, 5000);
+    try testing.expect(!s.isActive());
+    try testing.expectEqual(@as(u32, 1), log.exits);
+    try testing.expectEqual(Pty.ReapStatus{ .exited = 3 }, log.last_exit.?);
+    try testing.expectEqual(@as(std.posix.fd_t, -1), ts.masterFd());
+    // stop is a no-op when already inactive.
+    try s.stop();
+}
+
+test "terminal: reset-env clears the parent environment" {
+    try testing.expectEqual(@as(c_int, 0), setenv("KMSHAUNT_ENV_PROBE", "parent", 1));
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '[%s] %s:%s' \"${KMSHAUNT_ENV_PROBE:-UNSET}\" \"$XDG_SEAT\" \"$XDG_VTNR\"" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    ts.seat_name = "seat0";
+    ts.vt_nr = 2;
+    const s = ts.session();
+    try s.start();
+
+    const text = try pumpUntilText(&ts, "[UNSET]", 5000);
+    try testing.expect(std.mem.indexOf(u8, text, "seat0:2") != null);
+}
+
+test "terminal: no-reset-env inherits the parent environment" {
+    try testing.expectEqual(@as(c_int, 0), setenv("KMSHAUNT_ENV_PROBE", "parent", 1));
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '[%s]' \"${KMSHAUNT_ENV_PROBE:-UNSET}\"" });
+    cfg.reset_env = false;
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    const s = ts.session();
+    try s.start();
+
+    _ = try pumpUntilText(&ts, "[parent]", 5000);
+}
+
+test "terminal: title, pwd, bell hook and RIS clear" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033]0;My Title\\a\\033]7;file://h/tmp\\a\\a\\033c'" });
+    cfg.bell = true;
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var log = HookLog{};
+    ts.hooks = log.hooks();
+    const s = ts.session();
+    try s.start();
+
+    try pumpUntil(&ts, &log, struct {
+        fn p(l: *HookLog, _: *TerminalSession) bool {
+            return l.bells == 1;
+        }
+    }.p, 5000);
+    // RIS (ESC c) follows the bell in the same stream; wait for the clear.
+    try pumpUntil(&ts, {}, struct {
+        fn p(_: void, t: *TerminalSession) bool {
+            return t.title().len == 0;
+        }
+    }.p, 5000);
+    try testing.expectEqual(@as(usize, 0), ts.pwd().len);
+}
+
+test "terminal: bell gated off by cfg.bell" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'x\\ay'" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var log = HookLog{};
+    ts.hooks = log.hooks();
+    const s = ts.session();
+    try s.start();
+
+    _ = try pumpUntilText(&ts, "xy", 5000);
+    try testing.expectEqual(@as(u32, 0), log.bells);
+}
+
+test "terminal: grab events reach the hook" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "exit 0" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var log = HookLog{};
+    ts.hooks = log.hooks();
+    const s = ts.session();
+    try s.start();
+
+    try s.onInput(.{ .grab = .{ .id = 7 } });
+    try testing.expectEqual(@as(u32, 1), log.grabs);
+    try testing.expectEqual(@as(u16, 7), log.last_grab);
+}
+
+/// Mock renderer: records calls/opts, paints one pixel, appends one rect.
+const MockRenderer = struct {
+    allocator: std.mem.Allocator,
+    rendered: u32 = 0,
+    resizes: u32 = 0,
+    grid: ?struct { cols: u16, rows: u16, cell_w: u16, cell_h: u16 } = null,
+    last_opts: ?render.RenderOpts = null,
+
+    fn renderer(self: *MockRenderer) render.Renderer {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable = render.Renderer.VTable{
+        .deinit = vtDeinit,
+        .resize = vtResize,
+        .renderFrame = vtRenderFrame,
+    };
+    fn cast(ptr: *anyopaque) *MockRenderer {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn vtDeinit(_: *anyopaque) void {}
+    fn vtResize(ptr: *anyopaque, cols: u16, rows: u16, cw: u16, ch: u16) anyerror!void {
+        const m = cast(ptr);
+        m.resizes += 1;
+        m.grid = .{ .cols = cols, .rows = rows, .cell_w = cw, .cell_h = ch };
+    }
+    fn vtRenderFrame(
+        ptr: *anyopaque,
+        state: *const anyopaque,
+        fb: *render.Framebuffer,
+        damage: *render.DamageList,
+        opts: render.RenderOpts,
+    ) anyerror!void {
+        const m = cast(ptr);
+        m.rendered += 1;
+        m.last_opts = opts;
+        // The opaque state must be the session's RenderState.
+        const rs: *vt.RenderState = @ptrCast(@alignCast(@constCast(state)));
+        try testing.expect((rs.cols() catch 0) != 0);
+        fb.set(0, 0, opts.default_fg);
+        try damage.append(m.allocator, .{ .x = 0, .y = 0, .w = opts.palette[0], .h = 1 });
+    }
+};
+
+test "terminal: render delegates to the injected renderer with damage" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'x'" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    ts.setRenderer(mock.renderer());
+    const s = ts.session();
+    try s.start();
+    _ = try pumpUntilText(&ts, "x", 5000);
+
+    var fb = try render.Framebuffer.create(testing.allocator, 640, 384, .xrgb8888, null);
+    defer fb.destroy(testing.allocator);
+    var damage: render.DamageList = .empty;
+    defer damage.deinit(testing.allocator);
+    const ctx = sess.RenderContext{
+        .fb = &fb,
+        .damage = &damage,
+        .cell_w = 8,
+        .cell_h = 16,
+        .cols = 80,
+        .rows = 24,
+    };
+    try s.render(&ctx);
+    try testing.expectEqual(@as(u32, 1), mock.rendered);
+    try testing.expectEqual(@as(u32, 1), mock.resizes);
+    try testing.expectEqual(@as(u16, 8), mock.grid.?.cell_w);
+    try testing.expectEqual(@as(usize, 1), damage.items.len);
+    try testing.expectEqual(mock.last_opts.?.default_fg, fb.get(0, 0));
+    try testing.expectEqual(@as(u8, 255), mock.last_opts.?.bg_opacity);
+    try testing.expect(mock.last_opts.?.cursor_visible);
+
+    // Second frame: renderer still called, damage accumulates.
+    try s.render(&ctx);
+    try testing.expectEqual(@as(u32, 2), mock.rendered);
+    try testing.expectEqual(@as(usize, 2), damage.items.len);
+
+    // Synchronized output (mode 2026) defers presentation.
+    ts.vt.write("\x1b[?2026h");
+    try testing.expect(ts.render_held);
+    try s.render(&ctx);
+    try testing.expectEqual(@as(u32, 2), mock.rendered);
+    ts.vt.write("\x1b[?2026l");
+    try testing.expect(!ts.render_held);
+    try s.render(&ctx);
+    try testing.expectEqual(@as(u32, 3), mock.rendered);
+}
+
+test "terminal: render without a renderer is an error" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "exit 0" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    const s = ts.session();
+    try s.start();
+
+    var fb = try render.Framebuffer.create(testing.allocator, 64, 48, .xrgb8888, null);
+    defer fb.destroy(testing.allocator);
+    var damage: render.DamageList = .empty;
+    defer damage.deinit(testing.allocator);
+    const ctx = sess.RenderContext{
+        .fb = &fb,
+        .damage = &damage,
+        .cell_w = 8,
+        .cell_h = 16,
+        .cols = 80,
+        .rows = 24,
+    };
+    try testing.expectError(error.NoRenderer, s.render(&ctx));
+}
+
+test "terminal: mouse reporting routes button events to the encoder" {
+    // bash builtin read -N 6 consumes exactly one X10 press report
+    // (ESC [ M b x y); the trailing Enter completes the canonical line.
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033[?1000h'; read -r -N 6 x; printf 'MOUSE_OK'" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    ts.setRenderer(mock.renderer());
+    const s = ts.session();
+    try s.start();
+
+    // Establish cell geometry the way main.zig does (first render).
+    var fb = try render.Framebuffer.create(testing.allocator, 640, 384, .xrgb8888, null);
+    defer fb.destroy(testing.allocator);
+    var damage: render.DamageList = .empty;
+    defer damage.deinit(testing.allocator);
+    const ctx = sess.RenderContext{
+        .fb = &fb,
+        .damage = &damage,
+        .cell_w = 8,
+        .cell_h = 16,
+        .cols = 80,
+        .rows = 24,
+    };
+    try s.render(&ctx);
+
+    try pumpUntil(&ts, {}, struct {
+        fn p(_: void, t: *TerminalSession) bool {
+            return t.vt.mouseTracking() catch false;
+        }
+    }.p, 5000);
+    try s.onInput(.{ .pointer_button = .{
+        .button = 0x110,
+        .pressed = true,
+        .x = 4,
+        .y = 8,
+        .click_count = 1,
+    } });
+    try sendChar(s, .enter, null);
+    _ = try pumpUntilText(&ts, "MOUSE_OK", 5000);
+}

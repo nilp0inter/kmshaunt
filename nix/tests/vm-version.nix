@@ -2,7 +2,6 @@
 # installed and check that the binary runs and reports its version.
 # Style follows nixos/tests/kmscon.nix.
 {
-  lib,
   testers,
   kmshaunt,
 }:

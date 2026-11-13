@@ -1,0 +1,565 @@
+.Dd November 13, 2026
+.Dt KMSHAUNT.CONF 5
+.Os
+.Sh NAME
+.Nm kmshaunt.conf
+.Nd configuration file for kmshaunt
+.Sh DESCRIPTION
+.Nm kmshaunt
+reads its main configuration from
+.Pa /etc/kmshaunt/kmshaunt.conf
+and a per-seat configuration from
+.Pa /etc/kmshaunt/<seat>.seat.conf ,
+normally
+.Pa /etc/kmshaunt/seat0.seat.conf .
+The directory is taken from
+.Fl -configdir
+(short form
+.Fl c )
+and defaults to
+.Pa /etc/kmshaunt .
+Both files are optional.
+.Pp
+The file contains the same options as the command line, written without the
+leading dashes.
+Only long option names are keys; the short command-line letters are not
+recognized in the file.
+Attributes that are lists on the command line, such as
+.Cm mode
+and
+.Cm screen ,
+are repeatable lines in the file.
+.Ss File Syntax
+.Bl -bullet
+.It
+The file is read line by line.
+Each non-empty line is either
+.Cm key
+or
+.Cm key Ns = Ns Ar value .
+.It
+A
+.Cm #
+starts a comment that runs to the end of the line, both in a key and in a
+value.
+.It
+Leading and trailing spaces, tabs and carriage returns are removed from the
+key and from the value, so blanks around the equals sign are insignificant.
+Whitespace inside a value is preserved, except after a comma in a color.
+.It
+Boolean keys take no value.
+Write
+.Cm mouse
+to enable an option and
+.Cm no-mouse
+to disable it;
+.Cm mouse Ns = Ns Cm 1
+is an error.
+The
+.Cm no-
+prefix is recognized for every key, but only boolean options act on it.
+.It
+An empty value after the equals sign is passed to the option as an empty
+string; boolean keys still reject any value.
+.It
+A key that runs to end of file without a newline, a
+.Cm #
+or an equals sign is an error.
+.It
+Unknown keys are reported and skipped.
+A missing file is not an error; a file that exists but cannot be read is.
+.It
+A value that cannot be parsed makes loading the whole file fail, and
+.Nm kmshaunt
+reports that it cannot load its configuration.
+.It
+If a key appears more than once, the last value wins, except
+.Cm mode
+and
+.Cm screen ,
+which accumulate.
+.El
+.Ss Precedence
+Configuration is applied in this order, later layers overriding earlier ones:
+.Bl -enum
+.It
+Built-in defaults.
+.It
+The command line.
+Every option set on the command line is locked and cannot be changed by any
+configuration file.
+.It
+.Pa <configdir>/kmshaunt.conf .
+.It
+.Pa <configdir>/<seat>.seat.conf .
+The seat file starts from the configuration produced by the previous step,
+so it overrides the main file but not the command line.
+.El
+.Ss Value Syntax
+.Bl -tag -width Ds
+.It Boolean
+No value.
+.Cm key
+enables the option,
+.Cm no-key
+disables it.
+.It Integer
+An unsigned integer, normally decimal.
+Color components additionally accept a
+.Cm 0x
+hexadecimal prefix and a leading
+.Cm 0
+for octal.
+.It String
+The rest of the line, with surrounding whitespace removed.
+Values such as colon-separated paths and comma-separated XKB options are
+passed on as one string.
+.It Color
+Three components
+.Ar r , Ns Ar g , Ns Ar b ,
+each from 0 to 255, separated by commas.
+Spaces after the commas are allowed.
+Colors apply when
+.Cm palette Ns = Ns Cm custom .
+.It Login
+The value is split into an argument vector with shell-like quoting, so single
+or double quotes and backslash escapes preserve spaces:
+.Cm login Ns = Ns \&"/bin/bash -i\&" .
+.It Mode
+An optional GPU and connector, the size and an optional refresh rate, for
+example
+.Cm card0[HDMI-A-1]1920x1080@60 ,
+.Cm [DP-1]2560x1440
+or
+.Cm 1920x1080@60 .
+The first matching entry wins, in the order GPU and connector, connector
+only, then entries without either.
+.It Screen
+An optional GPU and connector followed by
+.Cm normal ,
+.Cm left ,
+.Cm right ,
+.Cm upside-down
+or
+.Cm disabled ,
+for example
+.Cm card0[DP-1]left
+or
+.Cm disabled .
+The same matching precedence as
+.Cm mode
+applies.
+.It Grab
+See
+.Sx Grab Syntax .
+.El
+.Sh OPTIONS
+.Ss Global Options
+.Bl -tag -width "-palette-light-magenta=r,g,b"
+.It Cm help
+Print usage information and exit (boolean, default off).
+.It Cm version
+Print the version and exit (boolean, default off).
+.It Cm verbose
+Raise the log level to INFO (boolean, default off).
+.It Cm debug
+Raise the log level to DEBUG and imply
+.Cm verbose
+(boolean, default off).
+.It Cm silent
+Only log warnings and errors (boolean, default off).
+.It Cm configdir Ns = Ns Ar dir
+Configuration directory used to find the seat files (string, default
+.Pa /etc/kmshaunt ) .
+The main file has already been located when this value is read.
+.El
+.Ss Seat Options
+.Bl -tag -width "-palette-light-magenta=r,g,b"
+.It Cm vt Ns = Ns Ar vt
+Virtual terminal: a number
+.Ar N
+selects
+.Pa /dev/ttyN ,
+a value beginning with a period or a slash is a device path, and every other
+value is prefixed with
+.Pa /dev/
+(string, default auto-detect).
+.It Cm switchvt
+Activate the VT at startup and restore the previous VT on exit (boolean,
+default on).
+.It Cm libseat
+Acquire the seat through libseat, seatd or systemd-logind, instead of opening
+the VT and DRM devices directly (boolean, default off).
+.El
+.Ss Session Options
+.Bl -tag -width "-palette-light-magenta=r,g,b"
+.It Cm session-max Ns = Ns Ar num
+Maximum number of sessions, 0 for no limit (unsigned integer, default 50).
+.It Cm session-control
+Enable the session grabs; disabled automatically on real virtual terminals
+(boolean, default off).
+.El
+.Ss Terminal Options
+.Bl -tag -width "-palette-light-magenta=r,g,b"
+.It Cm issue
+Write the issue text to new sessions before login (boolean, default on).
+.It Cm issue-path Ns = Ns Ar path
+Colon-separated issue files and directories scanned for
+.Pa *.issue
+(string, default
+.Cm /etc/issue ,
+.Cm /etc/issue.d ,
+.Cm /run/issue ,
+.Cm /run/issue.d ,
+.Cm /usr/lib/issue
+and
+.Cm /usr/lib/issue.d ) .
+.It Cm asciicast Ns = Ns Ar file
+Play the asciicast v2 or v3 recording
+.Ar file
+and stop at the first key press (string, unset by default).
+.It Cm asciicast-loop
+Restart asciicast playback when it ends (boolean, default off).
+.It Cm login Ns = Ns Ar argv
+Login argv (argument list), split with shell-like quoting (default
+.Cm /bin/login -p ,
+or
+.Cm /bin/login
+when
+.Cm no-reset-env
+is set).
+.It Cm oneshot
+Close the session when the login process exits and exit if it was the last
+session (boolean, default off).
+.It Cm term Ns = Ns Ar TERM
+Value of
+.Ev TERM
+in every session (string, default
+.Cm xterm-ghostty ) .
+.It Cm reset-env
+Start children with an empty environment and set only the session variables;
+otherwise inherit the parent environment (boolean, default on).
+.It Cm backspace-delete
+Make the Backspace key send DEL (boolean, default on).
+.It Cm sb-size Ns = Ns Ar num
+Scrollback buffer size in lines (unsigned integer, default 1000).
+.It Cm bell
+Forward the terminal bell to the VT (boolean, default off).
+.It Cm blink
+Enable cursor and text blinking (boolean, default on).
+.El
+.Ss Input Options
+.Bl -tag -width "-palette-light-magenta=r,g,b"
+.It Cm xkb-model Ns = Ns Ar model
+XKB keyboard model (string, unset by default).
+.It Cm xkb-layout Ns = Ns Ar layout
+XKB layout, for example
+.Cm de
+(string, unset by default).
+.It Cm xkb-variant Ns = Ns Ar variant
+XKB layout variant (string, unset by default).
+.It Cm xkb-options Ns = Ns Ar options
+Comma-separated XKB options (string, unset by default).
+.It Cm xkb-keymap Ns = Ns Ar file
+Precompiled keymap file, which overrides model, layout, variant and options;
+an empty value disables it (string, unset by default).
+.It Cm xkb-compose-file Ns = Ns Ar file
+Compose file; unset or empty selects the default for the current locale
+(string, unset by default).
+.It Cm xkb-repeat-delay Ns = Ns Ar msecs
+Delay before key repeat starts (unsigned integer, default 250).
+.It Cm xkb-repeat-rate Ns = Ns Ar msecs
+Interval between repeated keys (unsigned integer, default 50).
+.It Cm mouse
+Capture the pointer, enable selection with copy and paste, and scroll the
+scrollback with the wheel (boolean, default on).
+.It Cm natural-scrolling
+Invert the wheel direction (boolean, default off).
+.It Cm soft-cursor
+Always draw a software cursor (boolean, default off).
+.It Cm dpms-timeout Ns = Ns Ar secs
+Blank the display after
+.Ar secs
+seconds without input, 0 to disable (unsigned integer, default 600).
+.El
+.Ss Grabs
+A grab value is a comma-separated list of shortcuts.
+Each shortcut is a sequence of modifier tokens followed by a case-sensitive
+XKB keysym name, for example
+.Cm <Ctrl><Alt>F1 .
+Shortcuts and the matching rules are described in
+.Sx Grab Syntax .
+.Bl -tag -width "-palette-light-magenta=r,g,b"
+.It Cm grab-scroll-up Ns = Ns Ar grab
+Scroll the scrollback back one line (default
+.Cm <Shift>Up ) .
+.It Cm grab-scroll-down Ns = Ns Ar grab
+Scroll the scrollback forward one line (default
+.Cm <Shift>Down ) .
+.It Cm grab-page-up Ns = Ns Ar grab
+Scroll the scrollback back one page (default
+.Cm <Shift>Prior ) .
+.It Cm grab-page-down Ns = Ns Ar grab
+Scroll the scrollback forward one page (default
+.Cm <Shift>Next ) .
+.It Cm grab-zoom-in Ns = Ns Ar grab
+Increase the font size (default
+.Cm <Ctrl>plus
+or
+.Cm <Ctrl>equal ) .
+.It Cm grab-zoom-out Ns = Ns Ar grab
+Decrease the font size (default
+.Cm <Ctrl>minus ) .
+.It Cm grab-session-next Ns = Ns Ar grab
+Switch to the next session; requires
+.Cm session-control
+(default
+.Cm <Ctrl><Logo>Right ) .
+.It Cm grab-session-prev Ns = Ns Ar grab
+Switch to the previous session; requires
+.Cm session-control
+(default
+.Cm <Ctrl><Logo>Left ) .
+.It Cm grab-session-close Ns = Ns Ar grab
+Close the current session; requires
+.Cm session-control
+(default
+.Cm <Ctrl><Logo>BackSpace ) .
+.It Cm grab-terminal-new Ns = Ns Ar grab
+Create a new session; requires
+.Cm session-control
+(default
+.Cm <Ctrl><Logo>Return ) .
+.It Cm grab-rotate-cw Ns = Ns Ar grab
+Rotate all displays clockwise (default
+.Cm <Logo>plus
+or
+.Cm <Logo>equal ) .
+.It Cm grab-rotate-ccw Ns = Ns Ar grab
+Rotate all displays counter-clockwise (default
+.Cm <Logo>minus ) .
+.It Cm grab-reboot Ns = Ns Ar grab
+Reboot the system, following
+.Pa /proc/sys/kernel/ctrl-alt-del
+(grab, disabled by default).
+.El
+.Ss Video Options
+.Bl -tag -width "-palette-light-magenta=r,g,b"
+.It Cm drm
+Use DRM devices and ignore fbdev devices; when disabled, use fbdev (boolean,
+default on).
+.It Cm hwaccel
+Use the DRM 3D backend and fall back to DRM 2D if it cannot be initialized
+(boolean, default off).
+.It Cm gpus Ns = Ns Ar list
+GPU selection:
+.Cm all ,
+.Cm aux
+(primary and auxiliary) or
+.Cm primary ;
+.Cm auxiliary
+and
+.Cm single
+are aliases (enumeration, default
+.Cm all ) .
+.It Cm use-original-mode
+Keep the current display mode instead of setting one (boolean, default off).
+Cannot be combined with
+.Cm mode .
+.It Cm mode Ns = Ns Ar spec
+Set a display mode; repeatable (mode list, empty by default).
+.It Cm multi-monitor Ns = Ns Ar policy
+Combine monitors with
+.Cm largest ,
+.Cm scaled
+or
+.Cm clone ;
+unknown values behave like
+.Cm clone
+(string, default
+.Cm scaled ) .
+.It Cm screen Ns = Ns Ar spec
+Set a display orientation or disable a display; repeatable (screen list,
+empty by default).
+.El
+.Ss Font Options
+.Bl -tag -width "-palette-light-magenta=r,g,b"
+.It Cm font-engine Ns = Ns Ar engine
+Font backend:
+.Cm freetype ,
+.Cm pango ,
+.Cm unifont ,
+.Cm psf
+or
+.Cm 8x16 ;
+unset tries that chain in order (string, unset by default).
+.It Cm font-size Ns = Ns Ar pixels
+Font size in pixels, 0 to derive it from the display (unsigned integer,
+default 0).
+.It Cm font-name Ns = Ns Ar name
+Fontconfig pattern, or a font file for the psf backend (string, default
+.Cm monospace ) .
+.El
+.Ss Palette Options
+Color values are
+.Ar r , Ns Ar g , Ns Ar b
+with components from 0 to 255 and are used when
+.Cm palette Ns = Ns Cm custom .
+.Bl -tag -width "-palette-light-magenta=r,g,b"
+.It Cm palette Ns = Ns Ar name
+Preset:
+.Cm custom ,
+.Cm nord ,
+.Cm solarized ,
+.Cm solarized-black ,
+.Cm solarized-white ,
+.Cm soft-black ,
+.Cm base16-dark ,
+.Cm base16-light ,
+.Cm vga
+or
+.Cm legacy ;
+unknown names select the legacy palette (string, unset by default).
+.It Cm palette-black Ns = Ns Ar r,g,b
+ANSI color 0 (black); color value, default 0,0,0.
+.It Cm palette-red Ns = Ns Ar r,g,b
+ANSI color 1 (red); color value, default 205,0,0.
+.It Cm palette-green Ns = Ns Ar r,g,b
+ANSI color 2 (green); color value, default 0,205,0.
+.It Cm palette-yellow Ns = Ns Ar r,g,b
+ANSI color 3 (yellow); color value, default 205,205,0.
+.It Cm palette-blue Ns = Ns Ar r,g,b
+ANSI color 4 (blue); color value, default 0,0,238.
+.It Cm palette-magenta Ns = Ns Ar r,g,b
+ANSI color 5 (magenta); color value, default 205,0,205.
+.It Cm palette-cyan Ns = Ns Ar r,g,b
+ANSI color 6 (cyan); color value, default 0,205,205.
+.It Cm palette-light-grey Ns = Ns Ar r,g,b
+ANSI color 7 (light grey); color value, default 229,229,229.
+.It Cm palette-dark-grey Ns = Ns Ar r,g,b
+ANSI color 8 (dark grey); color value, default 127,127,127.
+.It Cm palette-light-red Ns = Ns Ar r,g,b
+ANSI color 9 (light red); color value, default 255,0,0.
+.It Cm palette-light-green Ns = Ns Ar r,g,b
+ANSI color 10 (light green); color value, default 0,255,0.
+.It Cm palette-light-yellow Ns = Ns Ar r,g,b
+ANSI color 11 (light yellow); color value, default 255,255,0.
+.It Cm palette-light-blue Ns = Ns Ar r,g,b
+ANSI color 12 (light blue); color value, default 92,92,255.
+.It Cm palette-light-magenta Ns = Ns Ar r,g,b
+ANSI color 13 (light magenta); color value, default 255,0,255.
+.It Cm palette-light-cyan Ns = Ns Ar r,g,b
+ANSI color 14 (light cyan); color value, default 0,255,255.
+.It Cm palette-white Ns = Ns Ar r,g,b
+ANSI color 15 (white); color value, default 255,255,255.
+.It Cm palette-foreground Ns = Ns Ar r,g,b
+Default foreground; color value, default 229,229,229.
+.It Cm palette-background Ns = Ns Ar r,g,b
+Default background; color value, default 0,0,0.
+.El
+.Ss Grab Syntax
+Modifier tokens are
+.Cm <shift> ,
+.Cm <lock>
+(Caps Lock),
+.Cm <control>
+or
+.Cm <ctrl> ,
+.Cm <alt>
+and
+.Cm <logo> .
+They are case-insensitive and must come before the key.
+The key is a case-sensitive XKB keysym name such as
+.Cm Up ,
+.Cm Prior ,
+.Cm Return
+or
+.Cm plus .
+.Pp
+A shortcut may list several keysyms separated by
+.Cm + ,
+as in
+.Cm H+E+L+L+O ;
+it then matches a key producing exactly those keysyms.
+Several alternative shortcuts for one action are separated by commas.
+An empty value disables the grab.
+An event matches only if its set of the five modifiers is exactly the set in
+the shortcut, so an extra held modifier prevents a match.
+An unknown modifier or a keysym name in the wrong case is an error: the
+option is ignored on the command line and aborts the file load in a
+configuration file.
+.Pp
+Examples:
+.Bd -literal -offset indent
+# Reboot with Ctrl+Alt+Delete
+grab-reboot=<Ctrl><Alt>Delete
+
+# A Ctrl+Alt+F1 binding
+grab-session-next=<Ctrl><Alt>F1
+
+# Two alternative shortcuts for zooming in
+grab-zoom-in=<Ctrl>plus,<Ctrl>equal
+
+# A key that produces the keysyms H, E, L, L, O
+grab-page-up=<Shift>H+E+L+L+O
+
+# Disable scrollback scrolling with the keyboard
+grab-scroll-up=
+.Ed
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa /etc/kmshaunt/kmshaunt.conf
+Main configuration file.
+.It Pa /etc/kmshaunt/<seat>.seat.conf
+Per-seat configuration file, normally
+.Pa /etc/kmshaunt/seat0.seat.conf .
+.El
+.Sh EXAMPLES
+A minimal configuration:
+.Bd -literal -offset indent
+# /etc/kmshaunt/kmshaunt.conf
+font-name=monospace
+font-size=16
+sb-size=10000
+.Ed
+.Pp
+Use the Solarized preset:
+.Bd -literal -offset indent
+palette=solarized
+.Ed
+.Pp
+Explicit custom colors; slots not listed keep their defaults:
+.Bd -literal -offset indent
+palette=custom
+palette-foreground=131,148,150
+palette-background=0,43,54
+palette-blue=38,139,210
+.Ed
+.Pp
+A German keyboard layout with custom repeat timing:
+.Bd -literal -offset indent
+xkb-layout=de
+xkb-variant=nodeadkeys
+xkb-options=ctrl:nocaps,compose:ralt
+xkb-repeat-delay=300
+xkb-repeat-rate=30
+.Ed
+.Pp
+Two monitors with explicit modes and orientation:
+.Bd -literal -offset indent
+multi-monitor=scaled
+mode=card0[HDMI-A-1]3840x2160@60
+mode=card0[DP-1]1920x1080@60
+screen=card0[DP-1]left
+screen=[eDP-1]disabled
+.Ed
+.Pp
+A per-seat file that overrides the main configuration for one seat:
+.Bd -literal -offset indent
+# /etc/kmshaunt/seat1.seat.conf
+vt=3
+session-max=10
+.Ed
+.Sh SEE ALSO
+.Xr kmscon 1 ,
+.Xr kmshaunt 1
