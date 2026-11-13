@@ -18,10 +18,12 @@
 # back out through `..`, which breaks on symlinked packages.
 #
 # The C libraries (libdrm, xkbcommon, libinput, libudev, fontconfig,
-# freetype, harfbuzz, spng, seat) are found through pkg-config: build.zig
-# queries it for the translate-c include paths and linkSystemLibrary uses
-# it for linking. harfbuzz comes from the flake pkgs with nix/overlay.nix
-# applied (withRaster), so libharfbuzz-raster and hb-raster.h are present.
+# freetype, harfbuzz, spng, seat, libgbm, libglvnd) are found through
+# pkg-config: build.zig queries it for the translate-c include paths and
+# linkSystemLibrary uses it for linking. harfbuzz comes from the flake pkgs
+# with nix/overlay.nix applied (withRaster), so libharfbuzz-raster and
+# hb-raster.h are present. libgbm (mesa) provides gbm.h/libgbm and libglvnd
+# the EGL/GLES2 headers + libEGL/libGLESv2 for the drm3d backend.
 {
   lib,
   stdenv,
@@ -29,6 +31,8 @@
   zig_0_17,
   pkg-config,
   libdrm,
+  libgbm,
+  libglvnd,
   libxkbcommon,
   libinput,
   systemd,
@@ -100,6 +104,8 @@ stdenv.mkDerivation (finalAttrs: {
 
   buildInputs = [
     libdrm
+    libgbm # gbm.h + libgbm (mesa), drm3d scanout buffers
+    libglvnd # EGL/GLES2 headers + libEGL/libGLESv2, drm3d rendering
     libxkbcommon
     libinput
     systemd # libudev

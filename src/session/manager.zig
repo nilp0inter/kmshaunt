@@ -40,7 +40,8 @@
 //!   seat.c:1043): use `openInitial` at startup, `newSession` for the grab.
 //! * On real VTs kmscon force-disables session-control with a warning
 //!   (seat.c:780-784). That is seat knowledge the manager does not have:
-//!   the seat layer clears `cfg.session_control` before `Manager.init`.
+//!   main.zig's setupSeat clears `cfg.session_control` before
+//!   `Manager.init` when the seat is a real VT (not libseat).
 //!
 //! Focus is not running: switching sessions only moves the active index;
 //! every session stays started (session.zig: `isActive` means "running",
@@ -904,6 +905,33 @@ test "manager: resize pushes the grid to every session and to new ones" {
     }
     try m.newSession();
     try testing.expectEqual(Grid{ .cols = 100, .rows = 40 }, mockById(2).created);
+}
+
+test "manager: repeated geometry changes resize every live session (mode change)" {
+    const a = testing.allocator;
+    var cfg = config.Config.init(a);
+    defer cfg.deinit();
+    cfg.session_control = true;
+    mockReset();
+    defer mockFree();
+
+    var m = try mockManager(&cfg);
+    defer m.deinit();
+    try m.openInitial();
+    try m.newSession();
+
+    // Two mode changes: every live session follows each new grid, and the
+    // manager grid tracks the last one for future sessions.
+    try m.resize(100, 40);
+    try m.resize(64, 20);
+    for (mock_list.items) |mock| {
+        try testing.expectEqual(@as(u32, 2), mock.resize_calls);
+        try testing.expectEqual(Grid{ .cols = 64, .rows = 20 }, mock.grid.?);
+    }
+    try testing.expectEqual(@as(u16, 64), m.cols);
+    try testing.expectEqual(@as(u16, 20), m.rows);
+    try m.newSession();
+    try testing.expectEqual(Grid{ .cols = 64, .rows = 20 }, mockById(2).created);
 }
 
 test "manager: deinit stops and destroys every session" {

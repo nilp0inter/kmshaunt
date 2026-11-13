@@ -14,14 +14,15 @@
 //!  4. Seat: `LibseatSeat` when `--libseat`, else `VtReal.openVt`. Callbacks
 //!     activated/deactivated drive DRM master take/drop. The VT/libseat fd
 //!     is registered with the loop.
-//!  5. Video: `Fbdev` when `--no-drm`, else one `Drm2d` per GPU selected by
-//!     `--gpus` (master is per device; `--hwaccel` requests Drm3d, whose
-//!     GBM/EGL/GL bindings are not wired into build.zig yet, so it falls back
-//!     to Drm2d with a warning). Each card is modeset to its first enabled
-//!     connector via `selectModeIndex` (`--mode`/`--use-original-mode`/
+//!  5. Video: `Fbdev` when `--no-drm`, else one DRM backend per GPU selected
+//!     by `--gpus` (master is per device). `--hwaccel` selects Drm3d
+//!     (GBM/EGL/GLES2 scanout); a card where GBM/EGL/GLES2 cannot come up
+//!     (error.Unsupported) or nothing is connected (error.NoConnectedDisplay)
+//!     falls back to Drm2d with a warning. Each card is modeset to its first
+//!     enabled connector via `selectModeIndex` (`--mode`/`--use-original-mode`/
 //!     preferred), `--screen` rotation/disable, `--soft-cursor` force, and a
-//!     udev hotplug monitor. The backend is single-active-connector, so one
-//!     output per card is driven (M5.4 multi-output scanout gap).
+//!     udev hotplug monitor. One connector per card is driven (M5.4
+//!     multi-output scanout gap).
 //!  6. Font: `Discovery.primaryFace` + `cellMetrics`; the shared grid and
 //!     per-connector viewports come from `computeLayout` (`--multi-monitor`
 //!     clone/largest/scaled). `--font-size 0` derives a size from the primary
@@ -33,7 +34,7 @@
 //!  9. Each terminal's pty master registered EPOLLIN edge-triggered.
 //! 10. Frame loop paced by DRM page-flip events; DPMS + cursor-blink +
 //!     kitty-animation timers.
-//! 11. issue text, asciicast recorder, locale1 live keymap follow.
+//! 11. issue text, asciicast playback, locale1 live keymap follow.
 //! 12. `loop.run`; SIGTERM/INT (or oneshot child exit) stops it; everything
 //!     is deinitialised in reverse order.
 //!
@@ -71,6 +72,7 @@ const libseat = @import("seat/libseat.zig");
 const multiseat = @import("seat/multiseat.zig");
 const video = @import("video.zig");
 const drm2d = @import("video/drm2d.zig");
+const drm3d = @import("video/drm3d.zig");
 const fbdev = @import("video/fbdev.zig");
 const render = @import("render.zig");
 const cpu = @import("render/cpu.zig");
@@ -226,13 +228,136 @@ const PtyReg = struct {
     token: loop.Token,
 };
 
-/// One driven DRM output: a Drm2d instance (one per card — DRM master is per
-/// device) modeset to a single connector, plus its viewport into the shared
-/// canvas. No pointer into `outputs` is ever handed to the loop: every fd
-/// callback uses the Console as userdata and drains all outputs, so the list
-/// may grow/reorder freely (ROADMAP M5.4).
+/// One opened DRM card: Drm2d (dumb buffers) or Drm3d (GBM/EGL/GLES2,
+/// `--hwaccel`). The frame loop runs through the `video.Backend` vtable;
+/// this union adds the DRM-specific calls the console needs (master
+/// handoff, event fd, hotplug, mode selection). One connector per card is
+/// driven here; Drm2d's per-connector multi-output methods
+/// (beginFrameFor/endFrameFor/activeCount) stay on the concrete type (M5.4).
+const DrmOutput = union(enum) {
+    drm2d: *drm2d.Drm2d,
+    drm3d: *drm3d.Drm3d,
+
+    fn backend(self: DrmOutput) video.Backend {
+        return switch (self) {
+            .drm2d => |d| d.backend(),
+            .drm3d => |d| d.backend(),
+        };
+    }
+
+    fn cardName(self: DrmOutput) []const u8 {
+        return switch (self) {
+            .drm2d => |d| d.card_name,
+            .drm3d => |d| d.card_name,
+        };
+    }
+
+    fn cardPath(self: DrmOutput) []const u8 {
+        return switch (self) {
+            .drm2d => |d| d.card_path,
+            .drm3d => |d| d.card_path,
+        };
+    }
+
+    fn eventFd(self: DrmOutput) i32 {
+        return switch (self) {
+            .drm2d => |d| d.eventFd(),
+            .drm3d => |d| d.eventFd(),
+        };
+    }
+
+    fn hotplugFd(self: DrmOutput) ?i32 {
+        return switch (self) {
+            .drm2d => |d| d.hotplugFd(),
+            .drm3d => |d| d.hotplugFd(),
+        };
+    }
+
+    fn enableHotplug(self: DrmOutput, ops: drm2d.HotplugOps) !void {
+        return switch (self) {
+            .drm2d => |d| d.enableHotplug(ops),
+            .drm3d => |d| d.enableHotplug(ops),
+        };
+    }
+
+    fn takeMaster(self: DrmOutput) !void {
+        return switch (self) {
+            .drm2d => |d| d.takeMaster(),
+            .drm3d => |d| d.takeMaster(),
+        };
+    }
+
+    fn dropMaster(self: DrmOutput) !void {
+        return switch (self) {
+            .drm2d => |d| d.dropMaster(),
+            .drm3d => |d| d.dropMaster(),
+        };
+    }
+
+    fn readEvents(self: DrmOutput) !void {
+        return switch (self) {
+            .drm2d => |d| d.readEvents(),
+            .drm3d => |d| d.readEvents(),
+        };
+    }
+
+    fn needsFullRedraw(self: DrmOutput) bool {
+        return switch (self) {
+            .drm2d => |d| d.needsFullRedraw(),
+            .drm3d => |d| d.needsFullRedraw(),
+        };
+    }
+
+    fn flipPending(self: DrmOutput) bool {
+        return switch (self) {
+            .drm2d => |d| d.flipPending(),
+            .drm3d => |d| d.flipPending(),
+        };
+    }
+
+    fn pollHotplug(self: DrmOutput) !bool {
+        return switch (self) {
+            .drm2d => |d| d.pollHotplug(),
+            .drm3d => |d| d.pollHotplug(),
+        };
+    }
+
+    fn connectors(self: DrmOutput) ![]const video.ConnectorInfo {
+        return switch (self) {
+            .drm2d => |d| d.connectors(),
+            .drm3d => |d| d.connectors(),
+        };
+    }
+
+    fn selectModeIndex(self: DrmOutput, ci: usize, spec: ?video.ModeSpec, use_original: bool) !?usize {
+        return switch (self) {
+            .drm2d => |d| d.selectModeIndex(ci, spec, use_original),
+            .drm3d => |d| d.selectModeIndex(ci, spec, use_original),
+        };
+    }
+
+    fn setMode(self: DrmOutput, ci: usize, mi: usize) !void {
+        return switch (self) {
+            .drm2d => |d| d.setMode(ci, mi),
+            .drm3d => |d| d.setMode(ci, mi),
+        };
+    }
+
+    fn deinit(self: DrmOutput) void {
+        switch (self) {
+            .drm2d => |d| d.deinit(),
+            .drm3d => |d| d.deinit(),
+        }
+    }
+};
+
+/// One driven DRM output: a DRM backend instance (one per card — DRM master
+/// is per device) modeset to a single connector, plus its viewport into the
+/// shared canvas. No pointer into `outputs` is ever handed to the loop:
+/// every fd callback uses the Console as userdata and drains all outputs,
+/// so the list may grow/reorder freely (ROADMAP M5.4).
 const Output = struct {
-    drm: *drm2d.Drm2d,
+    drm: DrmOutput,
     event_token: ?loop.Token = null,
     hotplug_token: ?loop.Token = null,
     /// Driven connector index in the last connectors() probe.
@@ -261,11 +386,11 @@ const max_outputs = 16;
 /// The single-seat console. Heap-allocated and never moved: every callback
 /// userdata pointer and every borrowed sub-object address derives from it.
 /// Value-type sub-objects are embedded as optionals (their address is stable
-/// inside this struct); Drm2d and LibseatSeat own their heap allocation.
+/// inside this struct); the DRM backends and LibseatSeat own their heap allocation.
 const Console = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
-    cfg: *const config.Config,
+    cfg: *config.Config,
 
     lp: loop.Loop = .{ .epoll_fd = -1 },
     signals: ?*loop.SignalSource = null,
@@ -277,10 +402,10 @@ const Console = struct {
     seat_cbs: seat.Seat.Callbacks = .{},
     seat_token: ?loop.Token = null,
 
-    // Video. DRM: one Drm2d per selected card, each modeset to one connector
-    // (`outputs`, in card order). fbdev: a single output via `fb`. `backend`,
-    // `mode` and `rotation` describe the primary (first) output for font
-    // auto-sizing, DPMS and logging.
+    // Video. DRM: one backend (Drm2d, or Drm3d with --hwaccel) per selected
+    // card, each modeset to one connector (`outputs`, in card order). fbdev:
+    // a single output via `fb`. `backend`, `mode` and `rotation` describe the
+    // primary (first) output for font auto-sizing, DPMS and logging.
     outputs: std.ArrayListUnmanaged(Output) = .empty,
     fb: ?fbdev.Fbdev = null,
     backend: video.Backend = undefined,
@@ -324,7 +449,10 @@ const Console = struct {
     blink_timer: loop.Timer = .{},
     respawn_timer: loop.Timer = .{},
     kitty_timer: loop.Timer = .{},
-    recorder: ?*asciicast.Recorder = null,
+    asciicast_timer: loop.Timer = .{},
+    /// asciicast playback (M2.4), bound to the terminal it plays into.
+    playback: ?*asciicast.Playback = null,
+    playback_ts: ?*terminal.TerminalSession = null,
     loc1: ?*locale1.Locale1 = null,
     locale_token: ?loop.Token = null,
 
@@ -346,12 +474,8 @@ const Console = struct {
             self.alloc.destroy(l);
             self.loc1 = null;
         }
-        if (self.recorder) |r| {
-            r.finish() catch {};
-            r.deinit();
-            self.alloc.destroy(r);
-            self.recorder = null;
-        }
+        self.stopPlayback();
+        self.asciicast_timer.deinit();
         self.respawn_timer.deinit();
         self.kitty_timer.deinit();
         self.blink_timer.deinit();
@@ -469,11 +593,20 @@ const Console = struct {
         try self.blink_timer.init(&self.lp, .{ .callback = onBlinkTimer, .userdata = @intFromPtr(self) });
         try self.respawn_timer.init(&self.lp, .{ .callback = onRespawnTimer, .userdata = @intFromPtr(self) });
         try self.kitty_timer.init(&self.lp, .{ .callback = onKittyTimer, .userdata = @intFromPtr(self) });
+        try self.asciicast_timer.init(&self.lp, .{ .callback = onAsciicastTimer, .userdata = @intFromPtr(self) });
         if (self.cfg.blink) try self.blink_timer.armInterval(blink_interval_ns);
         self.armDpms();
 
         // 11. issue text before login.
         try self.showIssue();
+
+        // 11b. asciicast playback after the issue text (kmscon
+        // terminal_open: issue write, then asciinema_start). A bad file
+        // only warns, like kmscon terminal.c:1528-1532.
+        if (self.cfg.asciicast) |path| {
+            self.startPlayback(path) catch |err|
+                log.warn("cannot load asciicast {s}: {t}", .{ path, err });
+        }
 
         // 12. locale1 live keymap follow (best effort: no bus is fine).
         self.setupLocale1() catch |err| log.info("locale1 unavailable: {t}", .{err});
@@ -502,6 +635,12 @@ const Console = struct {
                 self.seat_token = try self.lp.addSource(fd, loop.ev.in_, onSeatEvent, @intFromPtr(self));
             }
         } else {
+            // Real VT: kmscon force-disables session-control with a warning
+            // (seat.c:792-796). Clear it before Manager.init reads it.
+            if (self.cfg.session_control) {
+                log.warn("session control cannot be configured on real VT, disabling session control", .{});
+                self.cfg.session_control = false;
+            }
             self.vt = vt_real.VtReal.init(vt_real.Sys.real);
             const v = &self.vt.?;
             const requested = try vtNumber(self.cfg.vt);
@@ -522,17 +661,15 @@ const Console = struct {
             self.rotation = sel.rotation;
             return;
         }
-        if (self.cfg.hwaccel) {
-            // Drm3d exists but its GBM/EGL/GL C bindings are not wired
-            // into build.zig (owned by the build integration); fall back.
-            log.warn("--hwaccel: Drm3d not available in this build, using Drm2d", .{});
-        }
+        // --hwaccel selects Drm3d per card in openCard; cards where
+        // GBM/EGL/GLES2 cannot come up fall back to Drm2d with a warning.
         try self.setupDrm();
     }
 
-    /// Open one Drm2d per GPU selected by `--gpus` (DRM master is per device,
-    /// recipes §10.3), then modeset each to its first enabled connector.
-    /// Falls back to card0 when enumeration/selection yields nothing.
+    /// Open one DRM backend per GPU selected by `--gpus` (DRM master is per
+    /// device, recipes §10.3), then modeset each to its first enabled
+    /// connector. Falls back to card0 when enumeration/selection yields
+    /// nothing.
     fn setupDrm(self: *Console) !void {
         const candidates = drm2d.enumerateGpus(self.alloc, self.io) catch |err| blk: {
             log.warn("gpu enumerate: {t}", .{err});
@@ -555,7 +692,7 @@ const Console = struct {
             i -= 1;
             const o = &self.outputs.items[i];
             const sel = self.selectForCard(o.drm) catch |err| blk: {
-                log.warn("probe {s}: {t}", .{ o.drm.card_name, err });
+                log.warn("probe {s}: {t}", .{ o.drm.cardName(), err });
                 break :blk null;
             };
             if (sel) |s| {
@@ -574,14 +711,13 @@ const Console = struct {
         self.backend = self.outputs.items[0].drm.backend();
     }
 
-    /// Open a card, force the software cursor per `--soft-cursor`, enable the
-    /// udev hotplug monitor, take master and register the event + hotplug fds.
-    /// All callbacks use the Console as userdata (never an Output pointer), so
+    /// Open a card with the configured backend, enable the udev hotplug
+    /// monitor, take master and register the event + hotplug fds. All
+    /// callbacks use the Console as userdata (never an Output pointer), so
     /// the outputs list may grow freely.
     fn openCard(self: *Console, path: ?[]const u8) !void {
-        const drm = try drm2d.Drm2d.init(self.alloc, path, drm2d.libdrm.ops());
+        const drm = try self.openDrmBackend(path);
         errdefer drm.deinit();
-        drm.setSoftCursorForce(self.cfg.soft_cursor);
         drm.enableHotplug(drm2d.libudev.hotplugOps()) catch |err|
             log.warn("hotplug enable: {t}", .{err});
         try drm.takeMaster();
@@ -598,6 +734,41 @@ const Console = struct {
         });
     }
 
+    /// Instantiate the backend for one card. `--hwaccel` tries Drm3d
+    /// (GBM/EGL/GLES2); error.Unsupported (the GL stack cannot come up) and
+    /// error.NoConnectedDisplay fall back to Drm2d with a warning. Other
+    /// errors propagate to the caller's per-card warn-and-skip.
+    fn openDrmBackend(self: *Console, path: ?[]const u8) !DrmOutput {
+        if (self.cfg.hwaccel) {
+            const d3 = drm3d.Drm3d.init(
+                self.alloc,
+                path,
+                drm2d.libdrm.ops(),
+                drm3d.libgbm.ops(),
+                drm3d.libegl.ops(),
+                drm3d.libgl.ops(),
+            ) catch |err| switch (err) {
+                error.Unsupported, error.NoConnectedDisplay => {
+                    log.warn("--hwaccel: drm3d on {s}: {t}; using drm2d", .{ path orelse "/dev/dri/card0", err });
+                    return self.openDrm2d(path);
+                },
+                else => return err,
+            };
+            log.info("--hwaccel: drm3d on {s}", .{path orelse "/dev/dri/card0"});
+            return .{ .drm3d = d3 };
+        }
+        return self.openDrm2d(path);
+    }
+
+    /// Drm2d card open; `--soft-cursor` forces the software cursor (Drm3d
+    /// always composites it in GL, so it has no such knob).
+    fn openDrm2d(self: *Console, path: ?[]const u8) !DrmOutput {
+        const drm = try drm2d.Drm2d.init(self.alloc, path, drm2d.libdrm.ops());
+        errdefer drm.deinit();
+        drm.setSoftCursorForce(self.cfg.soft_cursor);
+        return .{ .drm2d = drm };
+    }
+
     fn removeOutput(self: *Console, index: usize) void {
         const o = self.outputs.items[index];
         if (o.hotplug_token) |t| self.lp.removeSource(t);
@@ -607,10 +778,10 @@ const Console = struct {
     }
 
     /// First connected, enabled connector on a card + its mode via
-    /// selectModeIndex (`mode=` / `use-original-mode` / preferred, M5.3). The
-    /// backend is single-active-connector, so further enabled connectors on
-    /// the same card are reported but not driven (M5.4 scanout gap).
-    fn selectForCard(self: *Console, drm: *drm2d.Drm2d) !?ModeSelection {
+    /// selectModeIndex (`mode=` / `use-original-mode` / preferred, M5.3). One
+    /// connector per card is driven, so further enabled connectors on the
+    /// same card are reported but not driven (M5.4 scanout gap).
+    fn selectForCard(self: *Console, drm: DrmOutput) !?ModeSelection {
         const conns = try drm.connectors();
         var result: ?ModeSelection = null;
         var enabled_count: usize = 0;
@@ -631,7 +802,7 @@ const Console = struct {
             };
         }
         if (enabled_count > 1) {
-            log.warn("{s}: {d} enabled connectors; drm2d drives one per card (M5.4 scanout gap)", .{ drm.card_name, enabled_count });
+            log.warn("{s}: {d} enabled connectors; one driven per card (M5.4 scanout gap)", .{ drm.cardName(), enabled_count });
         }
         return result;
     }
@@ -703,7 +874,7 @@ const Console = struct {
         } else {
             for (self.outputs.items) |o| {
                 conns[n] = .{
-                    .gpu = o.drm.card_name,
+                    .gpu = o.drm.cardName(),
                     .connector = o.name,
                     .width_px = o.mode.width_px,
                     .height_px = o.mode.height_px,
@@ -741,17 +912,6 @@ const Console = struct {
         self.mgr = try manager.Manager.init(self.alloc, self.cfg);
         self.mgr.?.createSession = createTerminal;
         try self.mgr.?.resize(self.cols, self.rows);
-
-        if (self.cfg.asciicast) |path| {
-            const r = try self.alloc.create(asciicast.Recorder);
-            errdefer self.alloc.destroy(r);
-            r.* = try asciicast.Recorder.init(self.alloc, path, .{
-                .width = self.cols,
-                .height = self.rows,
-                .loop = self.cfg.asciicast_loop,
-            });
-            self.recorder = r;
-        }
 
         try self.mgr.?.openInitial();
     }
@@ -797,6 +957,43 @@ const Console = struct {
         defer self.alloc.free(text);
         ts.vt.write(text);
         self.markDirty();
+    }
+
+    /// Start asciicast playback into the active terminal (M2.4). The
+    /// player writes through playbackWrite; the timer drives the delays.
+    fn startPlayback(self: *Console, path: []const u8) !void {
+        const ts = self.activeTerminal() orelse return;
+        const pb = try self.alloc.create(asciicast.Playback);
+        errdefer self.alloc.destroy(pb);
+        pb.* = try asciicast.Playback.init(self.alloc, path, self.cfg.asciicast_loop, playbackWrite, ts);
+        errdefer pb.deinit();
+        const delay = pb.start();
+        try self.asciicast_timer.armOneShot(delay);
+        self.playback = pb;
+        self.playback_ts = ts;
+    }
+
+    /// Stop and free the playback: first key input, the bound session
+    /// closed, the stream exhausted, or shutdown. Idempotent.
+    fn stopPlayback(self: *Console) void {
+        const pb = self.playback orelse return;
+        pb.stop();
+        pb.deinit();
+        self.alloc.destroy(pb);
+        self.playback = null;
+        self.playback_ts = null;
+        self.asciicast_timer.disarm() catch |err| log.warn("asciicast timer: {t}", .{err});
+    }
+
+    /// Whether the manager still owns this session (playback is bound to
+    /// its terminal; closing that session ends the playback, like kmscon
+    /// freeing the player in terminal_destroy).
+    fn sessionAlive(self: *Console, ts: *terminal.TerminalSession) bool {
+        const m = &self.mgr.?;
+        for (m.sessions.items) |s| {
+            if (s.ptr == @as(*anyopaque, ts)) return true;
+        }
+        return false;
     }
 
     // -- helpers -----------------------------------------------------------
@@ -980,12 +1177,13 @@ const Console = struct {
         if (self.mgr == null) return;
         const m = &self.mgr.?;
         switch (id) {
-            7, 8, 9, 10 => m.handleGrab(id), // session next/prev/close/new
-            13 => { // reboot (disabled by default)
-                log.warn("reboot grab triggered", .{});
-                // reboot(2): LINUX_REBOOT_MAGIC1/2 + RB_AUTOBOOT (linux/reboot.h).
-                _ = linux.syscall4(.reboot, 0xfee1dead, 0x28121969, 0x01234567, 0);
+            7, 8, 9, 10 => { // session next/prev/close/new
+                m.handleGrab(id);
+                if (self.playback_ts) |ts| {
+                    if (!self.sessionAlive(ts)) self.stopPlayback();
+                }
             },
+            13 => self.handleReboot(), // reboot (disabled by default)
             1, 2, 3, 4 => self.handleScroll(id), // scroll/page (M2.2)
             5, 6 => self.handleZoom(id), // zoom in/out (M3.8)
             11, 12 => self.handleRotate(id), // rotate cw/ccw (M5.4)
@@ -1014,6 +1212,28 @@ const Console = struct {
             else => return,
         };
         result catch |err| log.warn("scroll grab: {t}", .{err});
+    }
+
+    /// grab-reboot (M6.4): follow /proc/sys/kernel/ctrl-alt-del exactly
+    /// like kmscon seat_trigger_reboot (seat.c:421-455). 0 -> soft reboot
+    /// (SIGINT to init); any other value -> sync() + hard reboot. An
+    /// unreadable value defaults to the soft path, like kmscon.
+    fn handleReboot(self: *Console) void {
+        switch (rebootAction(readCtrlAltDel())) {
+            .soft => {
+                log.warn("soft reboot triggered by keyboard shortcut on seat {s}", .{self.seatName()});
+                posix.kill(1, .INT) catch |err|
+                    log.err("failed to signal PID 1 for reboot: {t}", .{err});
+            },
+            .hard => {
+                log.warn("hard reboot triggered by keyboard shortcut on seat {s}", .{self.seatName()});
+                linux.sync();
+                // reboot(2): LINUX_REBOOT_MAGIC1/2 + RB_AUTOBOOT.
+                const rc = linux.reboot(.MAGIC1, .MAGIC2, .RESTART, null);
+                if (linux.errno(rc) != .SUCCESS)
+                    log.err("failed to reboot system: {s}", .{@tagName(linux.errno(rc))});
+            },
+        }
     }
 
     /// grab-zoom-in/out: step the font size, then reconfigure the grid and
@@ -1052,10 +1272,11 @@ const Console = struct {
 
     /// Recompute the shared canvas + viewports from the current cell size and
     /// rotations, resize the renderer and every session, and rebuild the
-    /// shadow when the canvas size changed. Shared by zoom/rotate.
+    /// shadow when the canvas size changed. The single mode-change ->
+    /// session-resize path: zoom/rotate and the hotplug reprobe (M2.5).
     fn reconfigureGrid(self: *Console) !void {
         try self.rebuildLayout();
-        try self.mgr.?.resize(self.cols, self.rows);
+        if (self.mgr) |*m| try m.resize(self.cols, self.rows);
     }
 
     /// Re-probe connectors on every open card after a hotplug event, re-select
@@ -1067,7 +1288,7 @@ const Console = struct {
             i -= 1;
             const o = &self.outputs.items[i];
             const sel = self.selectForCard(o.drm) catch |err| blk: {
-                log.warn("reprobe {s}: {t}", .{ o.drm.card_name, err });
+                log.warn("reprobe {s}: {t}", .{ o.drm.cardName(), err });
                 break :blk null;
             };
             if (sel) |s| {
@@ -1075,7 +1296,7 @@ const Console = struct {
                     o.mode.height_px != s.mode.height_px or o.mode.refresh_mhz != s.mode.refresh_mhz;
                 if (changed) {
                     o.drm.setMode(s.ci, s.mi) catch |err|
-                        log.warn("re-modeset {s}: {t}", .{ o.drm.card_name, err });
+                        log.warn("re-modeset {s}: {t}", .{ o.drm.cardName(), err });
                 }
                 o.ci = s.ci;
                 o.mode = s.mode;
@@ -1093,11 +1314,10 @@ const Console = struct {
         self.mode = self.outputs.items[0].mode;
         self.rotation = self.outputs.items[0].rotation;
         self.backend = self.outputs.items[0].drm.backend();
-        self.rebuildLayout() catch |err| {
+        self.reconfigureGrid() catch |err| {
             log.warn("hotplug regrid: {t}", .{err});
             return;
         };
-        if (self.mgr) |*m| m.resize(self.cols, self.rows) catch |err| log.warn("hotplug resize: {t}", .{err});
         self.full_redraw = true;
         self.markDirty();
     }
@@ -1135,7 +1355,7 @@ const Console = struct {
 
     fn hasCard(self: *const Console, path: []const u8) bool {
         for (self.outputs.items) |o| {
-            if (std.mem.eql(u8, o.drm.card_path, path)) return true;
+            if (std.mem.eql(u8, o.drm.cardPath(), path)) return true;
         }
         return false;
     }
@@ -1280,30 +1500,7 @@ const Console = struct {
     }
 
     fn pumpTerminal(self: *Console, ts: *terminal.TerminalSession) void {
-        if (self.recorder == null) {
-            ts.onPtyReadable() catch |err| log.warn("pty pump: {t}", .{err});
-        } else {
-            // Recording path: tap the master bytes for the asciicast recorder
-            // before feeding the terminal (terminal.zig has no output hook).
-            var buf: [16384]u8 = undefined;
-            while (true) {
-                const n = posix.read(ts.masterFd(), &buf) catch |err| switch (err) {
-                    error.WouldBlock => break,
-                    error.InputOutput => {
-                        ts.reapChild() catch {};
-                        break;
-                    },
-                    else => break,
-                };
-                if (n == 0) {
-                    ts.reapChild() catch {};
-                    break;
-                }
-                const bytes = buf[0..n];
-                self.recorder.?.recordOutput(bytes) catch |err| log.warn("asciicast: {t}", .{err});
-                ts.vt.write(bytes);
-            }
-        }
+        ts.onPtyReadable() catch |err| log.warn("pty pump: {t}", .{err});
         self.markDirty();
     }
 
@@ -1361,6 +1558,21 @@ const Console = struct {
         self.markDirty();
     }
 
+    fn onAsciicastTimer(_: *loop.Timer, expirations: u64, ud: usize) void {
+        _ = expirations;
+        const self: *Console = @ptrFromInt(ud);
+        const pb = self.playback orelse return;
+        if (pb.advance()) |delay| {
+            self.asciicast_timer.armOneShot(delay) catch |err| {
+                log.warn("asciicast timer: {t}", .{err});
+                self.stopPlayback();
+            };
+        } else {
+            // Exhausted without loop (or stopped): tear down.
+            self.stopPlayback();
+        }
+    }
+
     fn onInput(ud: usize, event: sess.InputEvent) void {
         const self: *Console = @ptrFromInt(ud);
         self.wakeDpms();
@@ -1382,6 +1594,9 @@ const Console = struct {
                 }
             }
         }
+        // The first keyboard input stops asciicast playback (kmscon
+        // terminal.c:978); the key itself still reaches the session.
+        if (event == .key) self.stopPlayback();
         if (self.mgr) |*m| m.onInput(event) catch |err| log.warn("onInput: {t}", .{err});
         self.markDirty();
     }
@@ -1543,6 +1758,15 @@ fn hookGrab(ud: ?*anyopaque, id: u16) void {
     if (current) |c| c.handleGrab(id);
 }
 
+/// asciicast.Playback sink: feed the terminal emulator, NOT the pty child
+/// (kmscon asciinema_write -> tsm_vte_input, terminal.c:478-486). The
+/// animation renders on screen without typing into the login session.
+fn playbackWrite(ud: ?*anyopaque, bytes: []const u8) void {
+    const ts: *terminal.TerminalSession = @ptrCast(@alignCast(ud.?));
+    ts.vt.write(bytes);
+    if (current) |c| c.markDirty();
+}
+
 fn hookChildExit(ud: ?*anyopaque, status: terminal.Pty.ReapStatus) void {
     const c = current orelse return;
     const ts: *terminal.TerminalSession = @ptrCast(@alignCast(ud.?));
@@ -1627,10 +1851,52 @@ fn vtNumber(vt_path: ?[]const u8) !?u8 {
 }
 
 // ---------------------------------------------------------------------------
+// grab-reboot decision (M6.4, kmscon seat.c seat_trigger_reboot)
+// ---------------------------------------------------------------------------
+
+/// The reboot path selected by /proc/sys/kernel/ctrl-alt-del.
+const RebootAction = enum {
+    /// SIGINT to PID 1: init handles a graceful restart.
+    soft,
+    /// sync() + reboot(RB_AUTOBOOT).
+    hard,
+};
+
+/// kmscon: 0 -> soft reboot, any other value -> hard reboot. A value that
+/// could not be read defaults to soft (seat.c:421-455 initializes
+/// ctrl_alt_del to 0 and only overwrites it on a successful fscanf).
+fn rebootAction(ctrl_alt_del: ?i32) RebootAction {
+    return if ((ctrl_alt_del orelse 0) == 0) .soft else .hard;
+}
+
+/// Read /proc/sys/kernel/ctrl-alt-del; null when the file cannot be opened
+/// or read (kmscon defaults to the soft path in that case).
+fn readCtrlAltDel() ?i32 {
+    const fd = posix.openat(posix.AT.FDCWD, "/proc/sys/kernel/ctrl-alt-del", .{}, 0) catch return null;
+    defer _ = linux.close(fd);
+    var buf: [32]u8 = undefined;
+    const n = posix.read(fd, &buf) catch return null;
+    return parseCtrlAltDel(buf[0..n]);
+}
+
+/// fscanf("%d") semantics: leading whitespace, optional sign, decimal
+/// digits; null when no integer is present (kmscon then defaults to soft).
+fn parseCtrlAltDel(bytes: []const u8) ?i32 {
+    var i: usize = 0;
+    while (i < bytes.len and std.ascii.isWhitespace(bytes[i])) : (i += 1) {}
+    const start = i;
+    if (i < bytes.len and (bytes[i] == '+' or bytes[i] == '-')) i += 1;
+    const digits = i;
+    while (i < bytes.len and std.ascii.isDigit(bytes[i])) : (i += 1) {}
+    if (i == digits) return null;
+    return std.fmt.parseInt(i32, bytes[start..i], 10) catch null;
+}
+
+// ---------------------------------------------------------------------------
 // Run paths
 // ---------------------------------------------------------------------------
 
-fn runConsole(io: std.Io, alloc: std.mem.Allocator, cfg: *const config.Config) !void {
+fn runConsole(io: std.Io, alloc: std.mem.Allocator, cfg: *config.Config) !void {
     const c = try alloc.create(Console);
     defer alloc.destroy(c);
     c.* = .{ .alloc = alloc, .io = io, .cfg = cfg };
@@ -1862,4 +2128,29 @@ test "multi-monitor wiring: mmMode + computeLayout shared grid for two outputs" 
     const largest = layout.computeLayout(&conns, cell, mmMode(.largest), &plans);
     try std.testing.expectEqual(@as(u32, 240), largest.cols);
     try std.testing.expectEqual(@as(u32, 67), largest.rows);
+}
+
+// ---------------------------------------------------------------------------
+// M6.4 grab-reboot decision tests (hermetic: no /proc read, no reboot).
+// ---------------------------------------------------------------------------
+
+test "parseCtrlAltDel: fscanf %d semantics" {
+    try std.testing.expectEqual(@as(?i32, 0), parseCtrlAltDel("0\n"));
+    try std.testing.expectEqual(@as(?i32, 1), parseCtrlAltDel("1\n"));
+    try std.testing.expectEqual(@as(?i32, 1), parseCtrlAltDel(" 1 "));
+    try std.testing.expectEqual(@as(?i32, 0), parseCtrlAltDel("+0"));
+    try std.testing.expectEqual(@as(?i32, -1), parseCtrlAltDel("-1"));
+    try std.testing.expectEqual(@as(?i32, 1), parseCtrlAltDel("1 trailing text"));
+    try std.testing.expectEqual(@as(?i32, null), parseCtrlAltDel(""));
+    try std.testing.expectEqual(@as(?i32, null), parseCtrlAltDel("\n"));
+    try std.testing.expectEqual(@as(?i32, null), parseCtrlAltDel("abc"));
+    try std.testing.expectEqual(@as(?i32, null), parseCtrlAltDel("+"));
+}
+
+test "rebootAction: 0 soft, nonzero hard, unreadable defaults soft (kmscon)" {
+    try std.testing.expectEqual(RebootAction.soft, rebootAction(0));
+    try std.testing.expectEqual(RebootAction.hard, rebootAction(1));
+    try std.testing.expectEqual(RebootAction.hard, rebootAction(2));
+    try std.testing.expectEqual(RebootAction.hard, rebootAction(-1));
+    try std.testing.expectEqual(RebootAction.soft, rebootAction(null));
 }

@@ -1,10 +1,19 @@
 //! src/video/drm2d.zig -- DRM dumb-buffer video backend (ROADMAP M1.3, M5
-//! video parity, M8.2 damage-only presentation).
+//! video parity, M5.4 same-card multi-connector, M5.6 all-connector DPMS,
+//! M8.2 damage-only presentation).
 //!
 //! Implements the `video.Backend` vtable on top of libdrm's legacy KMS path:
 //! dumb buffers + mmap, `drmModeSetCrtc` modesets, event-driven page flips,
 //! connector `DPMS` property, legacy hardware cursor. Atomic commits are
 //! deliberately out of scope (recipes §13); drm3d owns that path.
+//!
+//! One instance drives any number of connectors on its card (M5.4): each
+//! modeset connector owns a CRTC, a double-buffer pair and its own flip
+//! state (recipes §4.5/§5.5, kmscon's per-display model). The legacy
+//! single-output API and the vtable drive the primary (first modeset)
+//! connector; `beginFrameFor`/`endFrameFor`/`flipPendingFor`/`waitFlipFor`
+//! address any connector by its index in the last `connectors()` result.
+//! `setDpms` applies to every modeset connector (M5.6).
 //!
 //! Every call recipe, struct layout and ordering constraint comes from
 //! docs/reference/drm2d-recipes.md (libdrm 2.4.134, Linux v6.12). Constraint
@@ -60,8 +69,9 @@
 //!  - #3  master before forced probe: init enumerates read-only
 //!        (GetConnectorCurrent, no master needed); `takeMaster` re-enumerates
 //!        with forced probe once master is held.
-//!  - #4  one outstanding flip: `endFrame` refuses while pending; EBUSY keeps
-//!        the pending flag set; only FLIP_COMPLETE clears it (`readEvents`).
+//!  - #4  one outstanding flip per CRTC: `endFrame`/`endFrameFor` refuse
+//!        while that connector's flip is pending; EBUSY keeps the pending
+//!        flag set; only FLIP_COMPLETE clears it (`readEvents`).
 //!  - #5  SetCrtc before any flip and after DPMS-on: `setMode` modesets before
 //!        buffers can flip; `setDpms(.on)` re-runs SetCrtc.
 //!  - #6  both dumb buffers use XRGB8888 (depth 24 / bpp 32), never mixed.
@@ -617,11 +627,14 @@ const CursorPlane = struct { id: u32, possible_crtcs: u32 };
 const Crtc = struct { id: u32, index: usize };
 
 /// The DRM dumb-buffer backend. One instance per card (master is per device,
-/// recipes §10.3); M1.3 drives the first connected connector.
+/// recipes §10.3); it drives every connector modeset through `setMode`, one
+/// CRTC and buffer pair each (M5.4). The primary (first modeset) connector
+/// is what the legacy single-output API and the Backend vtable address.
 ///
 /// Lifecycle: init (open, enumerate read-only, pick connector+mode) ->
-/// takeMaster (seat activate) -> setMode -> frame loop (beginFrame/endFrame,
-/// readEvents on fd readability) -> dropMaster (seat deactivate) -> deinit.
+/// takeMaster (seat activate) -> setMode (per connector) -> frame loop
+/// (beginFrame[For]/endFrame[For], readEvents on fd readability) ->
+/// dropMaster (seat deactivate) -> deinit.
 pub const Drm2d = struct {
     allocator: Allocator,
     ops: DrmOps,
@@ -636,18 +649,10 @@ pub const Drm2d = struct {
     /// Index into conns of the first connected connector found at init.
     chosen: ?usize,
 
-    active: ?Active = null,
-    bufs: [2]Buffer = undefined,
-    bufs_live: bool = false,
-    /// Index of the buffer currently scanned out.
-    front: u1 = 0,
-    /// Constraint #4: set on successful submit (or EBUSY), cleared only by
-    /// FLIP_COMPLETE in readEvents.
-    flip_pending: bool = false,
-    /// Buffer index the in-flight flip will make front.
-    flipping_to: u1 = 0,
-    /// Constraint #10: first frame after a modeset presents without damage.
-    full_redraw: bool = true,
+    /// Modeset connectors in modeset order; index 0 is the primary output.
+    /// Every entry owns live buffers (an output leaves the list only through
+    /// teardown: setMode failure, disableConnector, hotplug, deinit).
+    outputs: std.ArrayList(Output) = .empty,
 
     dpms: DpmsState = .on,
     dirtyfb_supported: bool = false,
@@ -670,12 +675,29 @@ pub const Drm2d = struct {
     /// crtc_id so events for other CRTCs (or after unbind) are ignored.
     const flip_cookie: u64 = 0x4B4D_5348_4155_4E54; // "KMSHAUNT"
 
-    const Active = struct {
+    /// One modeset connector: its CRTC, mode and double-buffer pair
+    /// (recipes §4.5: exactly two buffers per display), plus the per-CRTC
+    /// flip pacing state (recipes §5.5).
+    const Output = struct {
         connector_id: u32,
+        /// Index into conns/infos, refreshed by connectors().
+        conn_idx: usize,
         mode_idx: usize,
         crtc_id: u32,
         crtc_index: usize,
         mode: ModeInfo,
+        bufs: [2]Buffer = undefined,
+        bufs_live: bool = false,
+        /// Index of the buffer currently scanned out.
+        front: u1 = 0,
+        /// Constraint #4: set on successful submit (or EBUSY), cleared only
+        /// by FLIP_COMPLETE in readEvents.
+        flip_pending: bool = false,
+        /// Buffer index the in-flight flip will make front.
+        flipping_to: u1 = 0,
+        /// Constraint #10: first frame after a modeset presents without
+        /// damage.
+        full_redraw: bool = true,
     };
 
     /// Open the card and enumerate. `card_path` null selects /dev/dri/card0
@@ -750,12 +772,13 @@ pub const Drm2d = struct {
     /// (constraint #13), free enumeration state, close the fd.
     pub fn deinit(self: *Drm2d) void {
         // Constraint #12: never free buffers under a pending flip.
-        if (self.flip_pending) self.waitFlip() catch {};
+        if (self.flipPending()) self.waitFlip() catch {};
         self.cursorTeardown();
         if (self.hotplug) |*h| h.deinit();
         self.allocator.free(self.cursor_planes);
         self.ops.drop_master(self.ops.ctx, self.fd) catch {};
-        self.destroyBuffers();
+        for (self.outputs.items) |*o| self.destroyBuffers(o);
+        self.outputs.deinit(self.allocator);
         freeConns(self.allocator, self.conns);
         self.allocator.free(self.infos);
         self.resources.deinit(self.allocator);
@@ -792,13 +815,11 @@ pub const Drm2d = struct {
         if (!already) try self.ops.set_master(self.ops.ctx, self.fd);
         self.master = true;
         _ = try self.connectors();
-        if (self.active) |act| {
-            if (self.bufs_live) {
-                try self.ops.set_crtc(self.ops.ctx, self.fd, act.crtc_id, self.bufs[self.front].fb_id, 0, 0, &.{act.connector_id}, &act.mode);
-                self.full_redraw = true;
-                if (self.dpms != .on) try self.applyDpms(self.dpms);
-            }
+        for (self.outputs.items) |*o| {
+            try self.ops.set_crtc(self.ops.ctx, self.fd, o.crtc_id, o.bufs[o.front].fb_id, 0, 0, &.{o.connector_id}, &o.mode);
+            o.full_redraw = true;
         }
+        if (self.dpms != .on and self.outputs.items.len > 0) try self.applyDpms(self.dpms);
     }
 
     /// Drop DRM master (seat deactivate, before VT_RELDISP — constraint #2).
@@ -807,8 +828,8 @@ pub const Drm2d = struct {
     /// (recipes §1.2).
     pub fn dropMaster(self: *Drm2d) !void {
         if (!self.master) return;
-        if (self.flip_pending) self.waitFlip() catch {};
-        if (self.supportsHwCursor() and self.active != null) self.setCursor(null, 0, 0) catch {};
+        if (self.flipPending()) self.waitFlip() catch {};
+        if (self.supportsHwCursor() and self.outputs.items.len > 0) self.setCursor(null, 0, 0) catch {};
         self.ops.drop_master(self.ops.ctx, self.fd) catch |err| switch (err) {
             error.InvalidArgument => {},
             else => return err,
@@ -826,9 +847,10 @@ pub const Drm2d = struct {
 
     /// Re-probe connectors (hotplug refresh). Constraint #14: this only
     /// re-enumerates — never reopens the fd or retakes master. As master the
-    /// probe is forced (EDID re-read); otherwise read-only. An active
-    /// connector that vanished is torn down, unless a flip is still in
-    /// flight (constraint #12: teardown deferred to the next call).
+    /// probe is forced (EDID re-read); otherwise read-only. A modeset
+    /// connector that vanished is torn down, unless its own flip is still
+    /// in flight (constraint #12: teardown deferred to the next call);
+    /// the other connectors keep scanning out.
     pub fn connectors(self: *Drm2d) ![]const ConnectorInfo {
         var new_res = try self.ops.get_resources(self.ops.ctx, self.fd, self.allocator);
         errdefer new_res.deinit(self.allocator);
@@ -844,14 +866,21 @@ pub const Drm2d = struct {
         self.conns = new_conns;
         self.infos = new_infos;
 
-        if (self.active) |act| {
-            const idx = self.connIndex(act.connector_id);
-            const still_connected = if (idx) |i| self.conns[i].connected else false;
-            if (idx) |i| self.infos[i].current_mode = act.mode_idx;
-            if (!still_connected and !self.flip_pending) {
-                self.destroyBuffers();
-                self.active = null;
+        var i: usize = 0;
+        while (i < self.outputs.items.len) {
+            const o = &self.outputs.items[i];
+            const idx = self.connIndex(o.connector_id);
+            const still_connected = if (idx) |ci| self.conns[ci].connected else false;
+            if (idx) |ci| {
+                o.conn_idx = ci;
+                self.infos[ci].current_mode = o.mode_idx;
             }
+            if (!still_connected and !o.flip_pending) {
+                self.destroyBuffers(o);
+                _ = self.outputs.orderedRemove(i);
+                continue;
+            }
+            i += 1;
         }
         return self.infos;
     }
@@ -863,15 +892,51 @@ pub const Drm2d = struct {
         return null;
     }
 
+    /// Number of connectors currently modeset on this card (M5.4).
+    pub fn activeCount(self: *const Drm2d) usize {
+        return self.outputs.items.len;
+    }
+
+    /// Connector index (into the last connectors() result) of the i-th
+    /// modeset output, in modeset order. i must be < activeCount().
+    pub fn activeConnectorIdx(self: *const Drm2d, i: usize) usize {
+        return self.outputs.items[i].conn_idx;
+    }
+
+    /// The primary (first modeset) output: what the legacy single-output
+    /// API and the Backend vtable drive. Null before the first setMode.
+    fn primary(self: *Drm2d) ?*Output {
+        if (self.outputs.items.len == 0) return null;
+        return &self.outputs.items[0];
+    }
+
+    fn outputFor(self: *Drm2d, connector_idx: usize) ?*Output {
+        for (self.outputs.items) |*o| {
+            if (o.conn_idx == connector_idx) return o;
+        }
+        return null;
+    }
+
+    fn outputForId(self: *Drm2d, connector_id: u32) ?*Output {
+        for (self.outputs.items) |*o| {
+            if (o.connector_id == connector_id) return o;
+        }
+        return null;
+    }
+
     // ------------------------------------------------------------------
     // Modeset
     // ------------------------------------------------------------------
 
     /// Modeset connector `connector_idx` to `mode_idx` (indices into the
-    /// last connectors() result). Recreates the double-buffer pair at the
-    /// new size and runs SetCrtc before any flip can happen (constraint #5).
-    /// SetCrtc forces DPMS on, so a tracked non-on state is re-applied
-    /// afterwards (recipes §7.2.2). Requires master (takeMaster first).
+    /// last connectors() result). Each connector gets its own CRTC and
+    /// double-buffer pair (M5.4); other modeset connectors keep scanning
+    /// out untouched. Re-modesetting an already-driven connector recreates
+    /// only its own buffers. Runs SetCrtc before any flip can happen
+    /// (constraint #5). SetCrtc forces DPMS on, so a tracked non-on state
+    /// is re-applied to this connector afterwards (recipes §7.2.2).
+    /// Requires master (takeMaster first). error.NoCrtcAvailable when every
+    /// CRTC this connector can use is already driven by another connector.
     pub fn setMode(self: *Drm2d, connector_idx: usize, mode_idx: usize) !void {
         if (connector_idx >= self.conns.len) return error.InvalidConnector;
         const conn = &self.conns[connector_idx];
@@ -883,49 +948,84 @@ pub const Drm2d = struct {
         const crtc = try self.findCrtc(conn);
 
         // Constraint #12: never free buffers under a pending flip.
-        if (self.flip_pending) try self.waitFlip();
+        const existing = self.outputForId(conn.id);
+        if (existing) |o| {
+            if (o.flip_pending) try self.waitFlipOut(o);
+        }
 
-        self.destroyBuffers();
-        self.createBuffers(mode.hdisplay, mode.vdisplay) catch |err| {
-            self.destroyBuffers();
-            return err;
-        };
-
-        // Full modeset: fb + mode validated against each other, count must
-        // match the connector array (recipes §3 constraints 1-2).
-        self.ops.set_crtc(self.ops.ctx, self.fd, crtc.id, self.bufs[0].fb_id, 0, 0, &.{conn.id}, &mode) catch |err| {
-            self.destroyBuffers();
-            return err;
-        };
-
-        self.active = .{
+        var out: Output = .{
             .connector_id = conn.id,
+            .conn_idx = connector_idx,
             .mode_idx = mode_idx,
             .crtc_id = crtc.id,
             .crtc_index = crtc.index,
             .mode = mode,
         };
-        self.front = 0;
-        self.flip_pending = false;
-        self.full_redraw = true;
+        self.createBuffers(&out, mode.hdisplay, mode.vdisplay) catch |err| {
+            self.destroyBuffers(&out);
+            return err;
+        };
+
+        // Full modeset: fb + mode validated against each other, count must
+        // match the connector array (recipes §3 constraints 1-2).
+        self.ops.set_crtc(self.ops.ctx, self.fd, crtc.id, out.bufs[0].fb_id, 0, 0, &.{conn.id}, &mode) catch |err| {
+            self.destroyBuffers(&out);
+            return err;
+        };
+
+        const o: *Output = if (existing) |old| blk: {
+            // The new fb is on screen now; release the old pair.
+            self.destroyBuffers(old);
+            old.* = out;
+            break :blk old;
+        } else blk: {
+            self.outputs.append(self.allocator, out) catch |err| {
+                // The modeset already happened; undo it before failing.
+                self.ops.set_crtc(self.ops.ctx, self.fd, crtc.id, 0, 0, 0, &.{}, null) catch {};
+                self.destroyBuffers(&out);
+                return err;
+            };
+            break :blk &self.outputs.items[self.outputs.items.len - 1];
+        };
         self.infos[connector_idx].current_mode = mode_idx;
 
         // Probe DirtyFB once per modeset with both-absent clips (recipes §6
         // policy 1). ENOSYS/EOPNOTSUPP is the common dumb-buffer case.
         self.dirtyfb_supported = true;
-        self.ops.dirty_fb(self.ops.ctx, self.fd, self.bufs[0].fb_id, &.{}) catch {
+        self.ops.dirty_fb(self.ops.ctx, self.fd, o.bufs[0].fb_id, &.{}) catch {
             self.dirtyfb_supported = false;
         };
 
-        if (self.dpms != .on) try self.applyDpms(self.dpms);
+        if (self.dpms != .on) try self.applyDpmsOne(conn.id, self.dpms);
+    }
+
+    /// Stop driving connector `connector_idx`: wait for its pending flip,
+    /// disable its CRTC, release its buffer pair. The other connectors keep
+    /// scanning out. No-op when the connector is not modeset.
+    pub fn disableConnector(self: *Drm2d, connector_idx: usize) !void {
+        const o = self.outputFor(connector_idx) orelse return;
+        const connector_id = o.connector_id;
+        if (o.flip_pending) try self.waitFlipOut(o);
+        // mode=null with empty connector_ids disables the CRTC (DrmOps).
+        self.ops.set_crtc(self.ops.ctx, self.fd, o.crtc_id, 0, 0, 0, &.{}, null) catch {};
+        self.destroyBuffers(o);
+        for (self.outputs.items, 0..) |*item, i| {
+            if (item.connector_id == connector_id) {
+                _ = self.outputs.orderedRemove(i);
+                break;
+            }
+        }
+        if (self.connIndex(connector_id)) |ci| self.infos[ci].current_mode = null;
     }
 
     /// kmscon modeset_find_crtc (recipes §2.3): bound encoder first, then
-    /// walk possible encoders against the CRTC list by *index* bit.
+    /// walk possible encoders against the CRTC list by *index* bit. CRTCs
+    /// already driven by another modeset connector on this card are
+    /// skipped: one CRTC per output (M5.4).
     fn findCrtc(self: *Drm2d, conn: *const Conn) !Crtc {
         if (conn.encoder_id != 0) {
             if (self.ops.get_encoder(self.ops.ctx, self.fd, conn.encoder_id)) |enc| {
-                if (enc.crtc_id != 0) {
+                if (enc.crtc_id != 0 and !self.crtcInUse(enc.crtc_id, conn.id)) {
                     for (self.resources.crtcs, 0..) |cid, j| {
                         if (cid == enc.crtc_id) return .{ .id = cid, .index = j };
                     }
@@ -936,7 +1036,9 @@ pub const Drm2d = struct {
             const enc = self.ops.get_encoder(self.ops.ctx, self.fd, eid) catch continue;
             for (self.resources.crtcs, 0..) |cid, j| {
                 if (j >= 32) break;
-                if (enc.possible_crtcs & (@as(u32, 1) << @intCast(j)) != 0) {
+                if (enc.possible_crtcs & (@as(u32, 1) << @intCast(j)) != 0 and
+                    !self.crtcInUse(cid, conn.id))
+                {
                     return .{ .id = cid, .index = j };
                 }
             }
@@ -944,38 +1046,73 @@ pub const Drm2d = struct {
         return error.NoCrtcAvailable;
     }
 
+    /// True when another modeset connector already drives this CRTC.
+    fn crtcInUse(self: *const Drm2d, crtc_id: u32, except_connector: u32) bool {
+        for (self.outputs.items) |*o| {
+            if (o.crtc_id == crtc_id and o.connector_id != except_connector) return true;
+        }
+        return false;
+    }
+
     // ------------------------------------------------------------------
     // Frame loop
     // ------------------------------------------------------------------
 
-    /// The back buffer to draw into. error.Busy while a flip is in flight:
-    /// with two buffers the back buffer belongs to the pending flip and must
-    /// not be written until FLIP_COMPLETE (recipes §5.5).
+    /// The primary output's back buffer (single-output callers and the
+    /// Backend vtable); multi-connector callers use beginFrameFor.
+    /// error.Busy while a flip is in flight: with two buffers the back
+    /// buffer belongs to the pending flip and must not be written until
+    /// FLIP_COMPLETE (recipes §5.5).
     pub fn beginFrame(self: *Drm2d) !*Framebuffer {
-        if (!self.bufs_live) return error.NoActiveDisplay;
-        if (self.flip_pending) return error.Busy;
-        return &self.bufs[self.front ^ 1].view;
+        const o = self.primary() orelse return error.NoActiveDisplay;
+        return beginFrameOut(o);
     }
 
-    /// Submit a page flip presenting the back buffer (returns once
-    /// SUBMITTED, contract). Damage is an advisory DirtyFB hint sent between
-    /// render and flip; empty damage presents everything. Refuses while a
-    /// flip is pending or DPMS is not on (recipes §7.2.3). EBUSY keeps the
-    /// pending flag set — never clear it on EBUSY (constraint #4).
+    /// The back buffer of connector `connector_idx` (index into the last
+    /// connectors() result). error.NoActiveDisplay when that connector is
+    /// not modeset; error.Busy while its own flip is in flight.
+    pub fn beginFrameFor(self: *Drm2d, connector_idx: usize) !*Framebuffer {
+        const o = self.outputFor(connector_idx) orelse return error.NoActiveDisplay;
+        return beginFrameOut(o);
+    }
+
+    fn beginFrameOut(o: *Output) !*Framebuffer {
+        if (o.flip_pending) return error.Busy;
+        return &o.bufs[o.front ^ 1].view;
+    }
+
+    /// Submit a page flip presenting the primary output's back buffer
+    /// (returns once SUBMITTED, contract); multi-connector callers use
+    /// endFrameFor. Damage is an advisory DirtyFB hint sent between render
+    /// and flip; empty damage presents everything. Refuses while a flip is
+    /// pending or DPMS is not on (recipes §7.2.3). EBUSY keeps the pending
+    /// flag set — never clear it on EBUSY (constraint #4).
     pub fn endFrame(self: *Drm2d, damage: []const Damage) !void {
-        const act = self.active orelse return error.NoActiveDisplay;
-        if (self.flip_pending) return error.Busy;
+        const o = self.primary() orelse return error.NoActiveDisplay;
+        return self.endFrameOut(o, damage);
+    }
+
+    /// Submit a page flip on connector `connector_idx`'s CRTC presenting
+    /// its back buffer. Same contract as endFrame, per connector: one
+    /// outstanding flip per CRTC, damage clipped to this connector's mode.
+    pub fn endFrameFor(self: *Drm2d, connector_idx: usize, damage: []const Damage) !void {
+        const o = self.outputFor(connector_idx) orelse return error.NoActiveDisplay;
+        return self.endFrameOut(o, damage);
+    }
+
+    fn endFrameOut(self: *Drm2d, o: *Output, damage: []const Damage) !void {
+        if (o.flip_pending) return error.Busy;
         if (self.dpms != .on) return error.DisplayOff;
-        const back = self.front ^ 1;
-        const buf = &self.bufs[back];
+        const back = o.front ^ 1;
+        const buf = &o.bufs[back];
 
         // Constraint #10: no damage on the first frame after a modeset, and
         // clips always describe the fb being flipped, half-open, <= 256.
-        if (self.dirtyfb_supported and !self.full_redraw and damage.len > 0) {
+        if (self.dirtyfb_supported and !o.full_redraw and damage.len > 0) {
             var clips: [drm.FB_DIRTY_MAX_CLIPS]Clip = undefined;
             var n: usize = 0;
             for (damage) |d| {
-                const c = d.clipTo(act.mode.hdisplay, act.mode.vdisplay) orelse continue;
+                const c = d.clipTo(o.mode.hdisplay, o.mode.vdisplay) orelse continue;
                 if (n == clips.len) break;
                 clips[n] = .{
                     .x1 = @intCast(c.x),
@@ -994,36 +1131,66 @@ pub const Drm2d = struct {
             }
         }
 
-        self.ops.page_flip(self.ops.ctx, self.fd, act.crtc_id, buf.fb_id, drm.PAGE_FLIP_EVENT, flip_cookie) catch |err| switch (err) {
+        self.ops.page_flip(self.ops.ctx, self.fd, o.crtc_id, buf.fb_id, drm.PAGE_FLIP_EVENT, flip_cookie) catch |err| switch (err) {
             error.Busy => {
                 // A flip from an earlier submit is still in flight: keep
                 // pending set, drop this frame, retry after FLIP_COMPLETE.
-                self.flip_pending = true;
-                self.flipping_to = back;
+                o.flip_pending = true;
+                o.flipping_to = back;
                 return error.Busy;
             },
             else => return err,
         };
-        self.flip_pending = true;
-        self.flipping_to = back;
-        self.full_redraw = false;
+        o.flip_pending = true;
+        o.flipping_to = back;
+        o.full_redraw = false;
     }
 
-    /// True while a submitted flip has not completed. Pure flag: the loop
-    /// drives completion by calling readEvents when eventFd is readable.
+    /// True while any output has a submitted flip that has not completed.
+    /// Pure flag: the loop drives completion by calling readEvents when
+    /// eventFd is readable.
     pub fn flipPending(self: *const Drm2d) bool {
-        return self.flip_pending;
+        for (self.outputs.items) |*o| {
+            if (o.flip_pending) return true;
+        }
+        return false;
     }
 
-    /// Block until the pending flip completes, bounded at 1000 ms like
+    /// True while connector `connector_idx`'s submitted flip is in flight.
+    pub fn flipPendingFor(self: *const Drm2d, connector_idx: usize) bool {
+        for (self.outputs.items) |*o| {
+            if (o.conn_idx == connector_idx) return o.flip_pending;
+        }
+        return false;
+    }
+
+    /// Block until every pending flip completes, bounded at 1000 ms like
     /// kmscon's drm_video_wait_pflip (recipes §5.4). error.Timeout when the
-    /// event never arrives; the pending flag stays set.
+    /// events never arrive; the pending flags stay set.
     pub fn waitFlip(self: *Drm2d) !void {
-        if (!self.flip_pending) return;
         var waited_ms: i32 = 0;
-        while (self.flip_pending) {
+        while (self.flipPending()) {
             try self.readEvents();
-            if (!self.flip_pending) return;
+            if (!self.flipPending()) return;
+            if (waited_ms >= 1000) return error.Timeout;
+            try self.ops.poll(self.ops.ctx, self.fd, 100);
+            waited_ms += 100;
+        }
+    }
+
+    /// Block until connector `connector_idx`'s pending flip completes
+    /// (no-op when none is pending or the connector is not modeset).
+    /// Same 1000 ms bound as waitFlip.
+    pub fn waitFlipFor(self: *Drm2d, connector_idx: usize) !void {
+        const o = self.outputFor(connector_idx) orelse return;
+        try self.waitFlipOut(o);
+    }
+
+    fn waitFlipOut(self: *Drm2d, o: *Output) !void {
+        var waited_ms: i32 = 0;
+        while (o.flip_pending) {
+            try self.readEvents();
+            if (!o.flip_pending) return;
             if (waited_ms >= 1000) return error.Timeout;
             try self.ops.poll(self.ops.ctx, self.fd, 100);
             waited_ms += 100;
@@ -1032,9 +1199,11 @@ pub const Drm2d = struct {
 
     /// Drain the DRM event fd (call from the loop on readability, or from
     /// waitFlip). Parses drm_event_vblank manually: 32 bytes, user_data @8,
-    /// crtc_id @28 (recipes §5.2, verified layout §0.2). FLIP_COMPLETE for
-    /// our CRTC (or crtc_id 0 on old kernels) with our cookie clears the
-    /// pending flag and swaps front/back. error.WouldBlock means drained.
+    /// crtc_id @28 (recipes §5.2, verified layout §0.2). FLIP_COMPLETE with
+    /// our cookie clears the matching output's pending flag and swaps its
+    /// front/back: by crtc_id, or — on old kernels reporting crtc_id 0 —
+    /// the oldest pending output (one event per submitted flip).
+    /// error.WouldBlock means drained.
     pub fn readEvents(self: *Drm2d) !void {
         var buf: [1024]u8 align(8) = undefined;
         while (true) {
@@ -1057,12 +1226,23 @@ pub const Drm2d = struct {
             if (typ == drm.EVENT_FLIP_COMPLETE and len >= 32) {
                 const user_data = std.mem.readInt(u64, bytes[off + 8 ..][0..8], .little);
                 const crtc_id = std.mem.readInt(u32, bytes[off + 28 ..][0..4], .little);
-                if (user_data == flip_cookie and self.flip_pending) {
-                    if (self.active) |act| {
+                if (user_data == flip_cookie) {
+                    if (crtc_id != 0) {
+                        for (self.outputs.items) |*o| {
+                            if (o.flip_pending and o.crtc_id == crtc_id) {
+                                o.flip_pending = false;
+                                o.front = o.flipping_to;
+                                break;
+                            }
+                        }
+                    } else {
                         // crtc_id 0: kernel without DRM_CAP_CRTC_IN_VBLANK_EVENT.
-                        if (crtc_id == 0 or crtc_id == act.crtc_id) {
-                            self.flip_pending = false;
-                            self.front = self.flipping_to;
+                        for (self.outputs.items) |*o| {
+                            if (o.flip_pending) {
+                                o.flip_pending = false;
+                                o.front = o.flipping_to;
+                                break;
+                            }
                         }
                     }
                 }
@@ -1071,37 +1251,67 @@ pub const Drm2d = struct {
         }
     }
 
-    /// True when the next endFrame must present everything (first frame
-    /// after a modeset or DPMS-on wake). The renderer should redraw fully.
+    /// True when any output's next endFrame must present everything (first
+    /// frame after a modeset or DPMS-on wake). The renderer should redraw
+    /// fully.
     pub fn needsFullRedraw(self: *const Drm2d) bool {
-        return self.full_redraw;
+        for (self.outputs.items) |*o| {
+            if (o.full_redraw) return true;
+        }
+        return false;
+    }
+
+    /// True when connector `connector_idx`'s next endFrameFor must present
+    /// everything.
+    pub fn needsFullRedrawFor(self: *const Drm2d, connector_idx: usize) bool {
+        for (self.outputs.items) |*o| {
+            if (o.conn_idx == connector_idx) return o.full_redraw;
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------
     // DPMS
     // ------------------------------------------------------------------
 
-    /// Set the DPMS state on the active connector through its legacy "DPMS"
-    /// property (recipes §7). Waking to .on re-runs SetCrtc before any flip
-    /// (constraint #5, recipes §7.2.3). error.Unsupported when the connector
-    /// has no DPMS property; error.NoActiveDisplay before the first setMode.
+    /// Set the DPMS state on ALL modeset connectors through their legacy
+    /// "DPMS" property (recipes §7, M5.6: "DPMS Off on every activated
+    /// display"). Connectors without a DPMS property are skipped;
+    /// error.Unsupported only when no active connector has one. Waking to
+    /// .on re-runs SetCrtc on every output before any flip (constraint #5,
+    /// recipes §7.2.3). error.NoActiveDisplay before the first setMode.
     pub fn setDpms(self: *Drm2d, state: DpmsState) !void {
-        const act = self.active orelse return error.NoActiveDisplay;
+        if (self.outputs.items.len == 0) return error.NoActiveDisplay;
         const was = self.dpms;
         try self.applyDpms(state);
         self.dpms = state;
         if (state == .on and was != .on) {
-            if (self.flip_pending) try self.waitFlip();
-            try self.ops.set_crtc(self.ops.ctx, self.fd, act.crtc_id, self.bufs[self.front].fb_id, 0, 0, &.{act.connector_id}, &act.mode);
-            self.full_redraw = true;
+            for (self.outputs.items) |*o| {
+                if (o.flip_pending) try self.waitFlipOut(o);
+                try self.ops.set_crtc(self.ops.ctx, self.fd, o.crtc_id, o.bufs[o.front].fb_id, 0, 0, &.{o.connector_id}, &o.mode);
+                o.full_redraw = true;
+            }
         }
     }
 
+    /// Apply the DPMS property to every modeset connector. Device errors
+    /// propagate; a missing property skips that connector.
     fn applyDpms(self: *Drm2d, state: DpmsState) !void {
-        const act = self.active orelse return error.NoActiveDisplay;
-        const idx = self.connIndex(act.connector_id) orelse return error.NoActiveDisplay;
+        var any = false;
+        for (self.outputs.items) |*o| {
+            const idx = self.connIndex(o.connector_id) orelse continue;
+            const prop_id = self.conns[idx].dpms_prop_id orelse continue;
+            try self.ops.connector_set_property(self.ops.ctx, self.fd, o.connector_id, prop_id, dpmsValue(state));
+            any = true;
+        }
+        if (!any) return error.Unsupported;
+    }
+
+    /// Apply DPMS to one connector (the setMode re-apply, recipes §7.2.2).
+    fn applyDpmsOne(self: *Drm2d, connector_id: u32, state: DpmsState) !void {
+        const idx = self.connIndex(connector_id) orelse return error.NoActiveDisplay;
         const prop_id = self.conns[idx].dpms_prop_id orelse return error.Unsupported;
-        try self.ops.connector_set_property(self.ops.ctx, self.fd, act.connector_id, prop_id, dpmsValue(state));
+        try self.ops.connector_set_property(self.ops.ctx, self.fd, connector_id, prop_id, dpmsValue(state));
     }
 
     pub fn dpmsState(self: *const Drm2d) DpmsState {
@@ -1112,18 +1322,19 @@ pub const Drm2d = struct {
     // Hardware cursor (legacy SetCursor2 path, recipes §8.1/§8.3/§8.4)
     // ------------------------------------------------------------------
 
-    /// Position a hardware cursor image at (x, y), or hide it when img is
-    /// null. The image is copied (top-left overlap, no scaling) into an
-    /// ARGB8888 dumb buffer sized from DRM_CAP_CURSOR_WIDTH/HEIGHT. Any
-    /// device failure permanently disables the hardware cursor and returns
-    /// error.Unsupported so the renderer composites a software cursor.
+    /// Position a hardware cursor image at (x, y) on the primary output's
+    /// CRTC, or hide it when img is null. The image is copied (top-left
+    /// overlap, no scaling) into an ARGB8888 dumb buffer sized from
+    /// DRM_CAP_CURSOR_WIDTH/HEIGHT. Any device failure permanently disables
+    /// the hardware cursor and returns error.Unsupported so the renderer
+    /// composites a software cursor.
     pub fn setCursor(self: *Drm2d, img: ?*Framebuffer, x: i32, y: i32) !void {
-        const act = self.active orelse return error.NoActiveDisplay;
+        const o = self.primary() orelse return error.NoActiveDisplay;
         if (!self.supportsHwCursor()) return error.Unsupported;
 
         if (img == null) {
             // handle 0 turns the cursor off (recipes §8.1).
-            self.ops.set_cursor2(self.ops.ctx, self.fd, act.crtc_id, 0, 0, 0, 0, 0) catch return self.cursorFallback();
+            self.ops.set_cursor2(self.ops.ctx, self.fd, o.crtc_id, 0, 0, 0, 0, 0) catch return self.cursorFallback();
             return;
         }
         const image = img.?;
@@ -1160,19 +1371,19 @@ pub const Drm2d = struct {
 
         // Hotspot (0,0): the hotspot cap is not set on the legacy path
         // (recipes §8.1).
-        self.ops.set_cursor2(self.ops.ctx, self.fd, act.crtc_id, cb.handle, w, h, 0, 0) catch return self.cursorFallback();
-        self.ops.move_cursor(self.ops.ctx, self.fd, act.crtc_id, x, y) catch return self.cursorFallback();
+        self.ops.set_cursor2(self.ops.ctx, self.fd, o.crtc_id, cb.handle, w, h, 0, 0) catch return self.cursorFallback();
+        self.ops.move_cursor(self.ops.ctx, self.fd, o.crtc_id, x, y) catch return self.cursorFallback();
     }
 
     /// Whether setCursor can use a hardware cursor plane (M5.7). True only
-    /// when a cursor plane exists for the active CRTC, the size caps are
+    /// when a cursor plane exists for the primary CRTC, the size caps are
     /// present, no SetCursor2 attempt has failed, and `--soft-cursor` is not
     /// forcing software (constraint #8: caps alone do not prove a plane).
     pub fn supportsHwCursor(self: *const Drm2d) bool {
         if (self.force_soft_cursor or self.hw_cursor_failed) return false;
         if (self.cursor_w == null or self.cursor_h == null) return false;
         if (self.cursor_planes.len == 0) return false;
-        if (self.active) |act| return self.cursorPlaneForCrtc(act.crtc_index) != null;
+        if (self.outputs.items.len > 0) return self.cursorPlaneForCrtc(self.outputs.items[0].crtc_index) != null;
         return true; // a plane exists; no CRTC chosen yet
     }
 
@@ -1191,8 +1402,8 @@ pub const Drm2d = struct {
     /// setCursor() returns error.Unsupported so the renderer composites it.
     pub fn setSoftCursorForce(self: *Drm2d, force: bool) void {
         if (force and !self.force_soft_cursor and self.supportsHwCursor()) {
-            if (self.active) |act| {
-                self.ops.set_cursor2(self.ops.ctx, self.fd, act.crtc_id, 0, 0, 0, 0, 0) catch {};
+            if (self.primary()) |o| {
+                self.ops.set_cursor2(self.ops.ctx, self.fd, o.crtc_id, 0, 0, 0, 0, 0) catch {};
             }
         }
         self.force_soft_cursor = force;
@@ -1313,17 +1524,17 @@ pub const Drm2d = struct {
         };
     }
 
-    fn createBuffers(self: *Drm2d, w: u32, h: u32) !void {
+    fn createBuffers(self: *Drm2d, o: *Output, w: u32, h: u32) !void {
         var created: usize = 0;
         errdefer {
-            for (self.bufs[0..created]) |*b| self.destroyBuffer(b);
-            self.bufs_live = false;
+            for (o.bufs[0..created]) |*b| self.destroyBuffer(b);
+            o.bufs_live = false;
         }
-        for (&self.bufs) |*b| {
+        for (&o.bufs) |*b| {
             b.* = try self.createBuffer(w, h);
             created += 1;
         }
-        self.bufs_live = true;
+        o.bufs_live = true;
     }
 
     /// Constraint #13: munmap -> RmFB -> DestroyDumb. Failures during
@@ -1335,10 +1546,10 @@ pub const Drm2d = struct {
         b.* = undefined;
     }
 
-    fn destroyBuffers(self: *Drm2d) void {
-        if (!self.bufs_live) return;
-        for (&self.bufs) |*b| self.destroyBuffer(b);
-        self.bufs_live = false;
+    fn destroyBuffers(self: *Drm2d, o: *Output) void {
+        if (!o.bufs_live) return;
+        for (&o.bufs) |*b| self.destroyBuffer(b);
+        o.bufs_live = false;
     }
 
     // ------------------------------------------------------------------
@@ -3229,8 +3440,7 @@ test "hotplug: re-enumeration reflects disconnect, defers teardown mid-flip" {
     fake.connectors = &conns;
     const infos = try d.connectors();
     try testing.expect(!infos[1].connected);
-    try testing.expect(d.bufs_live);
-    try testing.expect(d.active != null);
+    try testing.expectEqual(@as(usize, 1), d.activeCount());
     // No reopen, no master retake (constraint #14).
     try testing.expectEqual(@as(usize, 1), fake.count(.open));
     try testing.expectEqual(@as(usize, 1), fake.count(.set_master));
@@ -3239,9 +3449,424 @@ test "hotplug: re-enumeration reflects disconnect, defers teardown mid-flip" {
     fake.queueFlipEvent(41, Drm2d.flip_cookie);
     try d.readEvents();
     _ = try d.connectors();
-    try testing.expect(!d.bufs_live);
-    try testing.expect(d.active == null);
+    try testing.expectEqual(@as(usize, 0), d.activeCount());
     try testing.expectError(error.NoActiveDisplay, d.beginFrame());
+}
+
+// ---------------------------------------------------------------------------
+// Multi-connector (ROADMAP M5.4): one CRTC + buffer pair + flip state per
+// connector on the same card, all-connector DPMS (M5.6). The default fake
+// card has two CRTCs (41, 42): HDMI-A-1 binds encoder 51 -> crtc 41, DP-1
+// walks encoder 52 (possible_crtcs 0b10) -> crtc 42.
+// ---------------------------------------------------------------------------
+
+/// init + takeMaster + modeset HDMI-A-1 at 1024x768 (crtc 41) and DP-1 at
+/// 1920x1080 (crtc 42). Returns the backend; caller deinits.
+fn setupDual(a: Allocator, fake: *FakeDrm) !*Drm2d {
+    const d = try Drm2d.init(a, "/dev/dri/card0", fake.ops());
+    errdefer d.deinit();
+    try d.takeMaster();
+    try d.setMode(1, 0);
+    try d.setMode(2, 0);
+    return d;
+}
+
+test "multi: modeset two connectors, one CRTC and buffer pair each" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupDual(a, &fake);
+    defer d.deinit();
+
+    try testing.expectEqual(@as(usize, 2), d.activeCount());
+    try testing.expectEqual(@as(usize, 1), d.activeConnectorIdx(0));
+    try testing.expectEqual(@as(usize, 2), d.activeConnectorIdx(1));
+    // Two buffer pairs, each at its own connector's mode size.
+    try testing.expectEqual(@as(usize, 4), fake.count(.create_dumb));
+    try testing.expectEqual(@as(usize, 4), fake.buffers.items.len);
+    try testing.expectEqual(@as(u32, 1024), fake.buffers.items[0].width);
+    try testing.expectEqual(@as(u32, 768), fake.buffers.items[0].height);
+    try testing.expectEqual(@as(u32, 1920), fake.buffers.items[2].width);
+    try testing.expectEqual(@as(u32, 1080), fake.buffers.items[2].height);
+    // One SetCrtc per connector, on distinct CRTCs.
+    try testing.expectEqual(@as(usize, 2), fake.set_crtc_calls.items.len);
+    const sc0 = fake.set_crtc_calls.items[0];
+    const sc1 = fake.set_crtc_calls.items[1];
+    try testing.expectEqual(@as(u32, 41), sc0.crtc_id);
+    try testing.expectEqualSlices(u32, &.{62}, sc0.connector_ids);
+    try testing.expectEqual(@as(u16, 1024), sc0.mode.?.hdisplay);
+    try testing.expectEqual(@as(u32, 42), sc1.crtc_id);
+    try testing.expectEqualSlices(u32, &.{63}, sc1.connector_ids);
+    try testing.expectEqual(@as(u16, 1920), sc1.mode.?.hdisplay);
+    try testing.expectEqual(@as(?usize, 0), d.infos[1].current_mode);
+    try testing.expectEqual(@as(?usize, 0), d.infos[2].current_mode);
+    // Per-connector back buffers at the right size; legacy path = primary.
+    const f1 = try d.beginFrameFor(1);
+    try testing.expectEqual(@as(u32, 1024), f1.width);
+    const f2 = try d.beginFrameFor(2);
+    try testing.expectEqual(@as(u32, 1920), f2.width);
+    try testing.expect(@intFromPtr(f1.mem.ptr) != @intFromPtr(f2.mem.ptr));
+    const fp = try d.beginFrame();
+    try testing.expectEqual(@intFromPtr(f1.mem.ptr), @intFromPtr(fp.mem.ptr));
+    // A connector that was never modeset has no display.
+    try testing.expectError(error.NoActiveDisplay, d.beginFrameFor(0));
+    try testing.expectError(error.NoActiveDisplay, d.endFrameFor(0, &.{}));
+}
+
+test "multi: second connector fails when no free CRTC remains" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    // Single-CRTC card; both encoders could drive crtc 41 (52 even reports
+    // it bound), so both findCrtc paths must skip the CRTC already in use.
+    fake.crtcs = &.{41};
+    const encs = [_]FakeEncoder{
+        .{ .id = 51, .crtc_id = 41, .possible_crtcs = 0b01 },
+        .{ .id = 52, .crtc_id = 41, .possible_crtcs = 0b01 },
+    };
+    fake.encoders = &encs;
+    const d = try Drm2d.init(a, "/dev/dri/card0", fake.ops());
+    defer d.deinit();
+    try d.takeMaster();
+    try d.setMode(1, 0);
+    try testing.expectError(error.NoCrtcAvailable, d.setMode(2, 0));
+    // The first connector is untouched: its buffers and flip path survive.
+    try testing.expectEqual(@as(usize, 1), d.activeCount());
+    try testing.expectEqual(@as(usize, 2), fake.count(.create_dumb));
+    _ = try d.beginFrame();
+    try d.endFrame(&.{});
+    try testing.expect(d.flipPending());
+}
+
+test "multi: independent per-connector flips and completion" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupDual(a, &fake);
+    defer d.deinit();
+
+    const f1 = try d.beginFrameFor(1);
+    f1.set(0, 0, 0x11111111);
+    try d.endFrameFor(1, &.{});
+    const f2 = try d.beginFrameFor(2);
+    f2.set(0, 0, 0x22222222);
+    try d.endFrameFor(2, &.{});
+    // One outstanding flip per CRTC; both in flight at once.
+    try testing.expect(d.flipPendingFor(1));
+    try testing.expect(d.flipPendingFor(2));
+    try testing.expect(d.flipPending());
+    try testing.expectEqual(@as(usize, 2), fake.flip_calls.items.len);
+    try testing.expectEqual(@as(u32, 41), fake.flip_calls.items[0].crtc_id);
+    try testing.expectEqual(fake.buffers.items[1].fb_id.?, fake.flip_calls.items[0].fb_id);
+    try testing.expectEqual(@as(u32, 42), fake.flip_calls.items[1].crtc_id);
+    try testing.expectEqual(fake.buffers.items[3].fb_id.?, fake.flip_calls.items[1].fb_id);
+    // Each connector refuses drawing and a second flip while its own is
+    // pending (constraint #4, per CRTC).
+    try testing.expectError(error.Busy, d.beginFrameFor(1));
+    try testing.expectError(error.Busy, d.endFrameFor(1, &.{}));
+    try testing.expectError(error.Busy, d.beginFrameFor(2));
+    try testing.expectError(error.Busy, d.endFrameFor(2, &.{}));
+    // Completion is per CRTC: crtc 41's event frees only connector 1.
+    fake.queueFlipEvent(41, Drm2d.flip_cookie);
+    try d.readEvents();
+    try testing.expect(!d.flipPendingFor(1));
+    try testing.expect(d.flipPendingFor(2));
+    try testing.expect(d.flipPending());
+    _ = try d.beginFrameFor(1);
+    try testing.expectError(error.Busy, d.beginFrameFor(2));
+    fake.queueFlipEvent(42, Drm2d.flip_cookie);
+    try d.readEvents();
+    try testing.expect(!d.flipPending());
+    // Alternation is per connector: the next backs are the other buffers.
+    const g1 = try d.beginFrameFor(1);
+    try testing.expectEqual(@intFromPtr(fake.buffers.items[0].map.ptr), @intFromPtr(g1.mem.ptr));
+    const g2 = try d.beginFrameFor(2);
+    try testing.expectEqual(@intFromPtr(fake.buffers.items[2].map.ptr), @intFromPtr(g2.mem.ptr));
+}
+
+test "multi: crtc_id 0 events complete pending outputs in order" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupDual(a, &fake);
+    defer d.deinit();
+    _ = try d.beginFrameFor(1);
+    try d.endFrameFor(1, &.{});
+    _ = try d.beginFrameFor(2);
+    try d.endFrameFor(2, &.{});
+    // Old kernel without DRM_CAP_CRTC_IN_VBLANK_EVENT: one event per
+    // submitted flip, completed in submission order.
+    fake.queueFlipEvent(0, Drm2d.flip_cookie);
+    try d.readEvents();
+    try testing.expect(!d.flipPendingFor(1));
+    try testing.expect(d.flipPendingFor(2));
+    fake.queueFlipEvent(0, Drm2d.flip_cookie);
+    try d.readEvents();
+    try testing.expect(!d.flipPending());
+}
+
+test "multi: damage clips against each connector's own mode" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupDual(a, &fake);
+    defer d.deinit();
+
+    // First frame per connector: full redraw, no clips (constraint #10).
+    _ = try d.beginFrameFor(1);
+    try d.endFrameFor(1, &.{.{ .x = 0, .y = 0, .w = 10, .h = 10 }});
+    _ = try d.beginFrameFor(2);
+    try d.endFrameFor(2, &.{.{ .x = 0, .y = 0, .w = 10, .h = 10 }});
+    try testing.expectEqual(@as(usize, 2), fake.dirty_calls.items.len); // probes only
+    fake.queueFlipEvent(41, Drm2d.flip_cookie);
+    fake.queueFlipEvent(42, Drm2d.flip_cookie);
+    try d.readEvents();
+
+    // Second frame: clips trimmed to each fb's own size, on that fb.
+    _ = try d.beginFrameFor(1);
+    try d.endFrameFor(1, &.{.{ .x = 1000, .y = 750, .w = 100, .h = 100 }});
+    _ = try d.beginFrameFor(2);
+    try d.endFrameFor(2, &.{.{ .x = 1900, .y = 1060, .w = 100, .h = 100 }});
+    try testing.expectEqual(@as(usize, 4), fake.dirty_calls.items.len);
+    const dc1 = fake.dirty_calls.items[2];
+    try testing.expectEqual(fake.buffers.items[0].fb_id.?, dc1.fb_id);
+    try testing.expectEqual(@as(usize, 1), dc1.clips.len);
+    try testing.expectEqual(Clip{ .x1 = 1000, .y1 = 750, .x2 = 1024, .y2 = 768 }, dc1.clips[0]);
+    const dc2 = fake.dirty_calls.items[3];
+    try testing.expectEqual(fake.buffers.items[2].fb_id.?, dc2.fb_id);
+    try testing.expectEqual(@as(usize, 1), dc2.clips.len);
+    try testing.expectEqual(Clip{ .x1 = 1900, .y1 = 1060, .x2 = 1920, .y2 = 1080 }, dc2.clips[0]);
+}
+
+test "multi: DPMS applies to every active connector, wake re-modesets all" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupDual(a, &fake);
+    defer d.deinit();
+
+    // Off on BOTH connectors (M5.6).
+    try d.setDpms(.off);
+    try testing.expectEqual(DpmsState.off, d.dpmsState());
+    try testing.expectEqual(@as(usize, 2), fake.prop_calls.items.len);
+    try testing.expectEqual(PropCall{ .connector_id = 62, .prop_id = 7, .value = 3 }, fake.prop_calls.items[0]);
+    try testing.expectEqual(PropCall{ .connector_id = 63, .prop_id = 7, .value = 3 }, fake.prop_calls.items[1]);
+    // Flips refused on both connectors while off (recipes §7.2.3).
+    try testing.expectError(error.DisplayOff, d.endFrameFor(1, &.{}));
+    try testing.expectError(error.DisplayOff, d.endFrameFor(2, &.{}));
+    // setMode re-applies the tracked state to that connector only.
+    try d.setMode(1, 1);
+    try testing.expectEqual(@as(usize, 3), fake.prop_calls.items.len);
+    try testing.expectEqual(PropCall{ .connector_id = 62, .prop_id = 7, .value = 3 }, fake.prop_calls.items[2]);
+    // Wake: property On on both, then SetCrtc on both CRTCs (constraint #5).
+    const modesets_before = fake.set_crtc_calls.items.len;
+    try d.setDpms(.on);
+    try testing.expectEqual(@as(usize, 5), fake.prop_calls.items.len);
+    try testing.expectEqual(PropCall{ .connector_id = 62, .prop_id = 7, .value = 0 }, fake.prop_calls.items[3]);
+    try testing.expectEqual(PropCall{ .connector_id = 63, .prop_id = 7, .value = 0 }, fake.prop_calls.items[4]);
+    try testing.expectEqual(modesets_before + 2, fake.set_crtc_calls.items.len);
+    try testing.expect(d.needsFullRedrawFor(1));
+    try testing.expect(d.needsFullRedrawFor(2));
+    _ = try d.beginFrameFor(1);
+    try d.endFrameFor(1, &.{});
+    _ = try d.beginFrameFor(2);
+    try d.endFrameFor(2, &.{});
+    try testing.expect(d.flipPendingFor(1));
+    try testing.expect(d.flipPendingFor(2));
+}
+
+test "multi: DPMS skips connectors without the property, unsupported when none" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    var conns = fake_connectors;
+    conns[2].props = &fake_props_none; // DP-1 has no DPMS property
+    fake.connectors = &conns;
+    const d = try Drm2d.init(a, "/dev/dri/card0", fake.ops());
+    defer d.deinit();
+    try d.takeMaster();
+    try d.setMode(1, 0);
+    try d.setMode(2, 0);
+    // Applied to HDMI-A-1 only; the card still tracks the state.
+    try d.setDpms(.off);
+    try testing.expectEqual(@as(usize, 1), fake.prop_calls.items.len);
+    try testing.expectEqual(@as(u32, 62), fake.prop_calls.items[0].connector_id);
+    try testing.expectEqual(DpmsState.off, d.dpmsState());
+    // No active connector with a DPMS property -> Unsupported.
+    var conns2 = fake_connectors;
+    conns2[1].props = &fake_props_none;
+    conns2[2].props = &fake_props_none;
+    fake.connectors = &conns2;
+    _ = try d.connectors();
+    try testing.expectError(error.Unsupported, d.setDpms(.on));
+}
+
+test "multi: waitFlip drains every pending flip, waitFlipFor just one" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupDual(a, &fake);
+    defer d.deinit();
+
+    _ = try d.beginFrameFor(1);
+    try d.endFrameFor(1, &.{});
+    _ = try d.beginFrameFor(2);
+    try d.endFrameFor(2, &.{});
+    fake.queueFlipEvent(41, Drm2d.flip_cookie);
+    fake.queueFlipEvent(42, Drm2d.flip_cookie);
+    try d.waitFlip();
+    try testing.expect(!d.flipPending());
+
+    // No events: bounded timeout, both flags stay set.
+    _ = try d.beginFrameFor(1);
+    try d.endFrameFor(1, &.{});
+    _ = try d.beginFrameFor(2);
+    try d.endFrameFor(2, &.{});
+    try testing.expectError(error.Timeout, d.waitFlip());
+    try testing.expect(d.flipPendingFor(1));
+    try testing.expect(d.flipPendingFor(2));
+    try testing.expectEqual(@as(usize, 10), fake.count(.poll));
+    // waitFlipFor waits only its own connector.
+    fake.queueFlipEvent(41, Drm2d.flip_cookie);
+    try d.waitFlipFor(1);
+    try testing.expect(!d.flipPendingFor(1));
+    try testing.expect(d.flipPendingFor(2));
+}
+
+test "multi: re-modeset replaces only that connector's buffers" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupDual(a, &fake);
+    defer d.deinit();
+
+    const dumb_before = fake.count(.create_dumb);
+    const modesets_before = fake.set_crtc_calls.items.len;
+    try d.setMode(1, 1); // HDMI-A-1 -> 1920x1080
+    try testing.expectEqual(dumb_before + 2, fake.count(.create_dumb));
+    try testing.expectEqual(modesets_before + 1, fake.set_crtc_calls.items.len);
+    const sc = fake.set_crtc_calls.items[modesets_before];
+    try testing.expectEqual(@as(u32, 41), sc.crtc_id);
+    try testing.expectEqual(@as(u16, 1920), sc.mode.?.hdisplay);
+    // Old HDMI buffers released; DP-1's pair untouched.
+    try testing.expect(fake.buffers.items[0].destroyed);
+    try testing.expect(fake.buffers.items[1].destroyed);
+    try testing.expect(!fake.buffers.items[2].destroyed);
+    try testing.expect(!fake.buffers.items[3].destroyed);
+    try testing.expectEqual(@as(usize, 2), d.activeCount());
+    const f2 = try d.beginFrameFor(2);
+    try testing.expectEqual(@as(u32, 1920), f2.width);
+    const f1 = try d.beginFrameFor(1);
+    try testing.expectEqual(@as(u32, 1920), f1.width);
+    try testing.expectEqual(@as(u32, 1080), f1.height);
+    try testing.expectEqual(@as(?usize, 1), d.infos[1].current_mode);
+}
+
+test "multi: hotplug tears down only the unplugged connector" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupDual(a, &fake);
+    defer d.deinit();
+
+    // DP-1 vanishes while its flip is in flight: teardown deferred (#12).
+    _ = try d.beginFrameFor(2);
+    try d.endFrameFor(2, &.{});
+    var conns = fake_connectors;
+    conns[2].connected = false;
+    fake.connectors = &conns;
+    const infos = try d.connectors();
+    try testing.expect(!infos[2].connected);
+    try testing.expectEqual(@as(usize, 2), d.activeCount());
+    // HDMI-A-1 keeps flipping throughout.
+    _ = try d.beginFrameFor(1);
+    try d.endFrameFor(1, &.{});
+    fake.queueFlipEvent(41, Drm2d.flip_cookie);
+    try d.readEvents();
+    try testing.expect(!d.flipPendingFor(1));
+    try testing.expect(d.flipPendingFor(2));
+    // DP-1's flip completes; the next re-probe removes only that output.
+    fake.queueFlipEvent(42, Drm2d.flip_cookie);
+    try d.readEvents();
+    _ = try d.connectors();
+    try testing.expectEqual(@as(usize, 1), d.activeCount());
+    try testing.expectEqual(@as(usize, 1), d.activeConnectorIdx(0));
+    try testing.expectError(error.NoActiveDisplay, d.beginFrameFor(2));
+    try testing.expect(fake.buffers.items[2].unmapped);
+    try testing.expect(fake.buffers.items[3].destroyed);
+    try testing.expect(!fake.buffers.items[0].unmapped);
+    _ = try d.beginFrameFor(1);
+    try d.endFrameFor(1, &.{});
+    try testing.expect(d.flipPendingFor(1));
+}
+
+test "multi: master handoff re-modesets every output" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupDual(a, &fake);
+    defer d.deinit();
+
+    try d.dropMaster();
+    try testing.expect(!d.isMaster());
+    const modesets_before = fake.set_crtc_calls.items.len;
+    try d.takeMaster();
+    try testing.expect(d.isMaster());
+    try testing.expectEqual(modesets_before + 2, fake.set_crtc_calls.items.len);
+    try testing.expect(d.needsFullRedraw());
+    try testing.expect(d.needsFullRedrawFor(1));
+    try testing.expect(d.needsFullRedrawFor(2));
+}
+
+test "multi: disableConnector releases one output, keeps the other" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupDual(a, &fake);
+    defer d.deinit();
+
+    try d.disableConnector(2);
+    try testing.expectEqual(@as(usize, 1), d.activeCount());
+    try testing.expectError(error.NoActiveDisplay, d.beginFrameFor(2));
+    // CRTC disabled (empty connector list, no mode), buffers released.
+    const sc = fake.set_crtc_calls.items[fake.set_crtc_calls.items.len - 1];
+    try testing.expectEqual(@as(u32, 42), sc.crtc_id);
+    try testing.expectEqual(@as(usize, 0), sc.connector_ids.len);
+    try testing.expect(sc.mode == null);
+    try testing.expect(fake.buffers.items[2].destroyed);
+    try testing.expect(fake.buffers.items[3].destroyed);
+    try testing.expect(!fake.buffers.items[0].destroyed);
+    try testing.expectEqual(@as(?usize, null), d.infos[2].current_mode);
+    // Idempotent; the remaining output keeps working.
+    try d.disableConnector(2);
+    _ = try d.beginFrameFor(1);
+    try d.endFrameFor(1, &.{});
+    try testing.expect(d.flipPendingFor(1));
+}
+
+test "multi: vtable drives the primary while the secondary scans out" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupDual(a, &fake);
+    const b = d.backend();
+    defer b.deinit();
+
+    const frame = try b.beginFrame();
+    try testing.expectEqual(@as(u32, 1024), frame.width);
+    try b.endFrame(&.{});
+    try testing.expect(b.flipPending());
+    // The secondary flips independently through the concrete API.
+    _ = try d.beginFrameFor(2);
+    try d.endFrameFor(2, &.{});
+    fake.queueFlipEvent(41, Drm2d.flip_cookie);
+    fake.queueFlipEvent(42, Drm2d.flip_cookie);
+    try d.readEvents();
+    try testing.expect(!b.flipPending());
+    // The vtable DPMS reaches both connectors too.
+    try b.setDpms(.off);
+    try testing.expectEqual(@as(usize, 2), fake.prop_calls.items.len);
+    try testing.expectEqual(DpmsState.off, d.dpmsState());
 }
 
 test "vtable: backend interface dispatches to the same state" {

@@ -133,6 +133,7 @@ const render = @import("../render.zig");
 const config = @import("../config/config.zig");
 const pty_mod = @import("../misc/pty.zig");
 const palette = @import("../misc/palette.zig");
+const asciicast = @import("../misc/asciicast.zig");
 
 pub const Pty = pty_mod.Pty;
 
@@ -266,6 +267,10 @@ pub const TerminalSession = struct {
             .rows = rows,
         };
         try self.vt.setScrollbackMaxLines(cfg.sb_size);
+        // sb-size is a LINE budget; ghostty's default 10 KB byte cap would
+        // prune history long before the line limit (M8.3). Size the byte
+        // budget to hold sb_size lines of cells (16 B/cell is generous).
+        try self.vt.setScrollbackMaxBytes(@as(usize, cfg.sb_size) * cols * 16);
         try self.vt.setOption(.default_cursor_blink, &cfg.blink);
         try self.applyPalette();
         return self;
@@ -1252,6 +1257,61 @@ test "terminal: echo round-trip via onInput key encoding" {
     try testing.expect(s.isActive());
 }
 
+/// stty for the echo-off login test; same lookup order as misc/pty.zig's
+/// findTool (NixOS system path first, then FHS). Existence probe through the
+/// io-based std.Io.Dir API: std.fs.cwd() was removed in Zig 0.17.
+fn findStty(io: std.Io) ?[]const u8 {
+    const paths = [_][]const u8{ "/run/current-system/sw/bin/stty", "/usr/bin/stty", "/bin/stty" };
+    for (paths) |p| {
+        _ = std.Io.Dir.cwd().statFile(io, p, .{}) catch continue;
+        return p;
+    }
+    return null;
+}
+
+test "terminal: echo-off canonical read receives typed keys (login password parity)" {
+    // util-linux login reads the password through PAM misc_conv: a canonical
+    // read(2) with ECHO cleared via TCSAFLUSH, after the username was read
+    // with echo on. Reproduce that transition with sh + stty and type both
+    // lines through the key encoder; the password must reach the child even
+    // though nothing echoes it back (interactive login hang regression).
+    //
+    // Waiting for the prompt is part of the contract, not test convenience:
+    // misc_conv disables ECHO with TCSAFLUSH *before* printing "Password: ",
+    // so bytes typed ahead of the prompt are discarded by the kernel and the
+    // password arrives truncated. Interactive-login scenarios (VM or T4) must
+    // type the password only after the prompt is on screen.
+    const stty = findStty(std.testing.io) orelse return error.SkipZigTest;
+    var cmd_buf: [320]u8 = undefined;
+    const cmd = try std.fmt.bufPrint(&cmd_buf, "read u; {s} -echo; printf 'Password: ' >&2; read p; {s} echo; printf 'GOT:%s:%s\\n' \"$u\" \"$p\"", .{ stty, stty });
+    const argv = [_][]const u8{ "/bin/sh", "-c", cmd };
+    var cfg = testCfg(&argv);
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    const s = ts.session();
+    try s.start();
+
+    // Username with echo on (misc_conv PAM_PROMPT_ECHO_ON).
+    const user = [_]struct { k: vt.Key, c: u8 }{
+        .{ .k = .a, .c = 'a' }, .{ .k = .l, .c = 'l' }, .{ .k = .i, .c = 'i' },
+        .{ .k = .c, .c = 'c' }, .{ .k = .e, .c = 'e' },
+    };
+    for (user) |key| try sendChar(s, key.k, key.c);
+    try sendChar(s, .enter, null);
+    _ = try pumpUntilText(&ts, "Password:", 5000);
+
+    // Password with echo off (misc_conv PAM_PROMPT_ECHO_OFF): no echo comes
+    // back, so only the child's own GOT line proves the keys arrived.
+    const pass = [_]struct { k: vt.Key, c: u8 }{
+        .{ .k = .f, .c = 'f' }, .{ .k = .o, .c = 'o' }, .{ .k = .o, .c = 'o' },
+        .{ .k = .b, .c = 'b' }, .{ .k = .a, .c = 'a' }, .{ .k = .r, .c = 'r' },
+    };
+    for (pass) |key| try sendChar(s, key.k, key.c);
+    try sendChar(s, .enter, null);
+    _ = try pumpUntilText(&ts, "GOT:alice:foobar", 5000);
+}
+
 test "terminal: resize propagates to vt and pty winsize" {
     var cfg = testCfg(&.{"/bin/sh"});
     defer cfg.deinit();
@@ -1266,6 +1326,112 @@ test "terminal: resize propagates to vt and pty winsize" {
     try testing.expectEqual(@as(u16, 30), ws.rows);
     try testing.expectEqual(@as(u16, 100), try ts.vt.cols());
     try testing.expectEqual(@as(u16, 30), try ts.vt.rows());
+}
+
+test "terminal: mode-change resize reflows the terminal grid (M2.5)" {
+    var cfg = testCfg(&.{"/bin/sh"});
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    const s = ts.session();
+    try s.start();
+
+    // One 120-char line: at 80 columns it soft-wraps onto two rows, but
+    // the full sequence is still contiguous in the row text only when the
+    // grid is wide enough to hold it on one row.
+    var long_buf: [120]u8 = undefined;
+    for (&long_buf, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 10));
+    const long: []const u8 = &long_buf;
+    ts.vt.write(long);
+    var buf: [8192]u8 = undefined;
+
+    // A mode change narrows the grid: the session resize must reflow the
+    // line through vt.resize (libghostty), not just report the new size.
+    try s.resize(40, 24);
+    try testing.expectEqual(@as(u16, 40), try ts.vt.cols());
+    try testing.expectEqual(@as(u16, 24), try ts.vt.rows());
+    const ws = try ts.pty.getWinsize();
+    try testing.expectEqual(@as(u16, 40), ws.cols);
+    try testing.expectEqual(@as(u16, 24), ws.rows);
+    const narrow = try screenText(&ts, &buf);
+    try testing.expect(std.mem.indexOf(u8, narrow, long) == null); // re-wrapped
+    try testing.expect(std.mem.indexOf(u8, narrow, long[0..40]) != null);
+    try testing.expect(std.mem.indexOf(u8, narrow, long[40..80]) != null);
+    try testing.expect(std.mem.indexOf(u8, narrow, long[80..120]) != null);
+
+    // Widening again reflows the soft-wrapped line back onto one row.
+    try s.resize(120, 24);
+    const wide = try screenText(&ts, &buf);
+    try testing.expect(std.mem.indexOf(u8, wide, long) != null);
+}
+
+test "terminal: sb-size scrollback retained, not byte-pruned (M8.3)" {
+    var cfg = testCfg(&.{"/bin/sh"});
+    cfg.sb_size = 4000;
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+
+    // The byte budget must be sized to sb-size, not left at ghostty's
+    // 10 KB default (which prunes history to ~one page regardless of the
+    // line budget). Cells are 8 B in a ~512 KiB page, so sb_size*cols*16
+    // is a generous ~2x provision.
+    const budget = (try ts.vt.scrollbackMaxBytes()).?;
+    try testing.expect(budget >= @as(usize, cfg.sb_size) * 80);
+
+    // Push 2x sb_size lines straight into the vt (no pty child needed).
+    // The LINE budget must govern retention: history stays near sb_size,
+    // not the ~one page a 10 KB byte budget would leave.
+    var i: usize = 0;
+    while (i < 2 * @as(usize, cfg.sb_size)) : (i += 1) {
+        var line: [32]u8 = undefined;
+        const s = try std.fmt.bufPrint(&line, "line {d}\n", .{i});
+        ts.vt.write(s);
+    }
+    const history = try ts.vt.scrollbackRows();
+    // Line pruning is page-granular: history lands within one page below
+    // sb_size. Half of sb_size is far above the ~one page the unfixed
+    // 10 KB byte budget would retain.
+    try testing.expect(history >= @as(usize, cfg.sb_size) / 2);
+    try testing.expect(history <= @as(usize, cfg.sb_size));
+}
+
+/// The production playback sink shape (main.zig playbackWrite): raw
+/// asciicast bytes go to the terminal emulator, never to the pty child.
+fn playbackSink(ud: ?*anyopaque, bytes: []const u8) void {
+    const ts: *TerminalSession = @ptrCast(@alignCast(ud.?));
+    ts.vt.write(bytes);
+}
+
+test "terminal: asciicast playback renders into the terminal (M2.4)" {
+    var cfg = testCfg(&.{"/bin/sh"});
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    const s = ts.session();
+    try s.start();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/play.cast", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(path);
+    const file =
+        \\{"version":2,"width":80,"height":24}
+        \\[0.0, "o", "hello asciicast"]
+        \\
+    ;
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "play.cast", .data = file });
+
+    // Drive the Playback synchronously (the console arms a timer with the
+    // returned delays; the write path is the one under test here).
+    var pb = try asciicast.Playback.init(testing.allocator, path, false, playbackSink, &ts);
+    defer pb.deinit();
+    _ = pb.start();
+    try testing.expectEqual(@as(?u64, null), pb.advance());
+
+    var buf: [8192]u8 = undefined;
+    const text = try screenText(&ts, &buf);
+    try testing.expect(std.mem.indexOf(u8, text, "hello asciicast") != null);
 }
 
 test "terminal: DA and size reports reply through write_pty" {

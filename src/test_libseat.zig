@@ -251,7 +251,7 @@ fn expectCalls(f: *Fake, expected: []const Call) !void {
     try std.testing.expectEqualSlices(Call, expected, f.calls.items);
 }
 
-test "libseat: init opens, drains dispatch(0) and replays the queued enable" {
+test "libseat: init drains dispatch(0); activate, not setCallbacks, replays the enable" {
     const a = std.testing.allocator;
     var f = Fake{ .allocator = a };
     defer f.deinit();
@@ -267,15 +267,51 @@ test "libseat: init opens, drains dispatch(0) and replays the queued enable" {
     try std.testing.expect(s.isActive());
     try expectCalls(&f, &.{ .open_seat, .dispatch });
 
-    // Callbacks could only be installed after init: the activation that the
-    // drain observed must be replayed exactly once.
+    // Regression (M6.7 startup segfault): the owner installs callbacks
+    // mid-setup, before its video/session state exists. setCallbacks must
+    // NOT deliver the enable the drain observed -- firing there ran the
+    // owner's activated callback against an undefined video backend
+    // (NULL vtable, flipPending at offset 0x28).
     var counters = Counters{ .fake = &f };
     const cbs = counters.callbacks();
     s.setCallbacks(&cbs, @intFromPtr(&counters));
+    try std.testing.expectEqual(@as(usize, 0), counters.activated);
+
+    // The owner calls activate once it is ready: the queued enable is
+    // delivered exactly once, with the right userdata.
+    try s.activate();
     try std.testing.expectEqual(@as(usize, 1), counters.activated);
     try std.testing.expectEqual(@intFromPtr(&counters), counters.last_userdata);
 
+    // Neither a second activate nor re-installing callbacks re-fires it.
+    try s.activate();
     s.setCallbacks(&cbs, @intFromPtr(&counters));
+    try std.testing.expectEqual(@as(usize, 1), counters.activated);
+}
+
+test "libseat: disable before activate drops the never-delivered enable" {
+    const a = std.testing.allocator;
+    var f = Fake{ .allocator = a };
+    defer f.deinit();
+
+    f.enable_on_dispatch = true;
+    const s = try setup(a, &f);
+    defer s.deinit();
+
+    var counters = Counters{ .fake = &f };
+    const cbs = counters.callbacks();
+    s.setCallbacks(&cbs, @intFromPtr(&counters));
+
+    // The seat goes away before the owner ever activated: the pending
+    // initial enable is stale and must not fire on a later activate.
+    f.disable();
+    try std.testing.expect(!s.isActive());
+    try s.activate();
+    try std.testing.expectEqual(@as(usize, 0), counters.activated);
+
+    // A fresh enable is delivered immediately (callbacks now exist).
+    f.enable();
+    try std.testing.expect(s.isActive());
     try std.testing.expectEqual(@as(usize, 1), counters.activated);
 }
 

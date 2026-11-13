@@ -49,6 +49,14 @@
 //! user callback. Device re-opening is the owner's job: every device we
 //! tracked was closed on disable, so the owner calls `openDevice` again.
 //!
+//! Delivery ordering: the enable that `init`'s drain observes arrives
+//! before the owner has installed callbacks. It stays pending and is
+//! delivered by the first `activate` after `setCallbacks` -- never by
+//! `setCallbacks` itself: the owner installs callbacks mid-setup, and an
+//! `activated` fired there runs against half-initialized owner state
+//! (the M6.7 startup segfault: main.zig's callback reached the still
+//! undefined video backend, `flipPending` at vtable offset 0x28).
+//!
 //! `disable_seat` means "you are about to lose the seat, and the event must
 //! be acknowledged with `libseat_disable_seat`". In one synchronous
 //! callback we:
@@ -241,8 +249,9 @@ pub const LibseatSeat = struct {
     active: bool = false,
     /// True when an enable arrived before the owner installed an
     /// `activated` callback (typically during `init`'s drain). The first
-    /// `setCallbacks`/`activate` that sees the callback delivers it, so
-    /// the initial enable is never lost.
+    /// `activate` after `setCallbacks` delivers it, so the initial enable
+    /// is never lost. Cleared by a disable: a never-delivered activation
+    /// is stale once the seat goes away.
     activation_pending: bool = false,
     paused: bool = false,
     /// True while an outer `ops.dispatch` is on the stack; nested dispatches
@@ -368,8 +377,10 @@ pub const LibseatSeat = struct {
 
     /// Take the console. libseat is provider-driven: activation happens
     /// when the seat provider delivers `enable_seat`, not on request. This
-    /// pumps pending events once (so a queued enable is delivered) and is
-    /// otherwise a no-op.
+    /// pumps pending events once (so a queued enable is delivered) and
+    /// delivers the initial enable `init`'s drain observed before any
+    /// callback existed; the owner calls this once it is ready to service
+    /// an activation. Otherwise a no-op.
     pub fn activate(self: *LibseatSeat) Error!void {
         _ = try self.dispatch(0);
         self.flushActivation();
@@ -406,15 +417,17 @@ pub const LibseatSeat = struct {
         self.guard.dispatch(self.callbacks.resume_, self.userdata);
     }
 
-    /// Install callbacks (copied; see `seat_contract.Seat.Callbacks`). If the seat
-    /// was already enabled before any `activated` callback existed --
-    /// typical when `init`'s post-open drain delivers the seatd enable --
-    /// the callback is delivered here so the owner cannot miss the initial
-    /// activation. Re-installing callbacks does not re-fire it.
+    /// Install callbacks (copied; see `seat_contract.Seat.Callbacks`).
+    /// Never fires a callback: the owner installs callbacks mid-setup
+    /// (main.zig `setupSeat`, before video/sessions exist), and an
+    /// `activated` delivered here would run against half-initialized
+    /// state. An enable that arrived before the callbacks existed (the
+    /// `init` drain) stays pending and is delivered by `activate` -- the
+    /// same ordering `VtReal` provides (its `setCallbacks` only stores,
+    /// `activate` fires). Re-installing callbacks does not re-fire it.
     pub fn setCallbacks(self: *LibseatSeat, callbacks: *const seat_contract.Seat.Callbacks, userdata: usize) void {
         self.callbacks = callbacks.*;
         self.userdata = userdata;
-        self.flushActivation();
     }
 
     /// Open a seat device (`libseat_open_device`) while the seat is
@@ -555,6 +568,9 @@ pub const LibseatSeat = struct {
         // 2. isActive() == false from here on.
         self.active = false;
         self.paused = false;
+        // A never-delivered initial activation is stale now; the next
+        // enable queues a fresh one.
+        self.activation_pending = false;
         // 3. Tell the owner it lost the console (before the ack, so the
         //    owner has stopped touching devices when the provider proceeds).
         self.guard.dispatch(self.callbacks.deactivated, self.userdata);

@@ -51,11 +51,14 @@ test {
     _ = @import("misc/spng_decode.zig");
     _ = @import("misc/locale1.zig");
     // Src-level roots carrying their own integration tests on top of the
-    // module tests (fake libinput event queue over a real xkb keymap; fake
-    // libseat backend protocol tests; fake sd-bus locale1 reader; fake
-    // sd-login multiseat monitor).
+    // module tests (drm3d GBM/EGL/GL backend tests; fake libinput event
+    // queue over a real xkb keymap; fake libseat backend protocol tests;
+    // real libseat ops over the noop backend; fake sd-bus locale1 reader;
+    // fake sd-login multiseat monitor).
+    _ = @import("test_drm3d.zig");
     _ = @import("test_libinput.zig");
     _ = @import("test_libseat.zig");
+    _ = @import("test_libseat_real.zig");
     _ = @import("test_locale1.zig");
     _ = @import("test_manager.zig");
     _ = @import("test_multiseat.zig");

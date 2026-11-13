@@ -40,6 +40,7 @@ comptime {
     // C-interop modules (bindings wired in build.zig).
     _ = @import("vt.zig");
     _ = @import("video/drm2d.zig");
+    _ = @import("video/drm3d.zig");
     _ = @import("input/xkb.zig");
     _ = @import("input/libinput.zig");
     _ = @import("seat/libseat.zig");

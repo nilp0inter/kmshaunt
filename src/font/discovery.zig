@@ -541,10 +541,21 @@ fn patternInt(pat: *const fc.FcPattern, object: [*:0]const u8) !c_int {
 // exact standalone command). They adapt to the installed font set: CJK and
 // color-emoji paths assert coverage only when such a font exists, and the
 // guaranteed-missing noncharacter U+10FFFF always exercises the negative
-// cache path.
+// cache path. The LCD width test instead pins the KMSHAUNT_TEST_TEXT_FONT
+// fixture (DejaVu Sans) so it does not depend on the host monospace match.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+/// Path of the pinned text-font fixture (DejaVu Sans). The derivation
+/// exports KMSHAUNT_TEST_TEXT_FONT; the fallback is the same store path
+/// the color.zig tests use. Keeps font-sensitive tests independent of
+/// the host's fontconfig match.
+fn testTextFontPath(alloc: std.mem.Allocator) ![]u8 {
+    if (std.c.getenv("KMSHAUNT_TEST_TEXT_FONT")) |value|
+        return alloc.dupe(u8, std.mem.span(value));
+    return alloc.dupe(u8, "/nix/store/mz1hvwkd5i24d93ihpdczqhn65mik69d-dejavu-fonts-2.37/share/fonts/truetype/DejaVuSans.ttf");
+}
 
 test "init, primary monospace face, cell metrics" {
     var d = try Discovery.init(testing.allocator);
@@ -618,20 +629,46 @@ test "lcd flag renders triple-width subpixel coverage" {
     var d = try Discovery.init(testing.allocator);
     defer d.deinit();
 
-    var face = try d.primaryFace(null, 16);
+    // Pin the text fixture (DejaVu Sans, a scalable outline face) rather
+    // than the host's monospace match: outside the sandbox the host font
+    // set can match a face whose 'A' is a bitmap strike, so the width
+    // relation below would depend on the environment.
+    const path = try testTextFontPath(testing.allocator);
+    defer testing.allocator.free(path);
+    var face = try d.loadFace(path, 0);
+    try face.setPixelSize(16);
     const idx = face.glyphIndex('A') orelse return error.TestUnexpectedResult;
+    // The fixture is a scalable outline face without bitmap strikes, so
+    // 'A' must load as an outline and the lcd flag must select LCD
+    // rendering (loadGlyph falls back to NORMAL only for bitmap/color
+    // glyphs).
+    try ftCheck(ft.FT_Load_Glyph(face.ft_face, idx, ft.FT_LOAD_DEFAULT));
+    try testing.expect(face.ft_face.*.glyph.*.format == ft.FT_GLYPH_FORMAT_OUTLINE);
+
     face.lcd = true;
     const lcd = try face.loadGlyph(idx, false);
+    const lcd_pixel_mode = face.ft_face.*.glyph.*.bitmap.pixel_mode;
     try testing.expect(lcd.format == .gray);
     face.lcd = false;
     const normal = try face.loadGlyph(idx, false);
-    // LCD triples the horizontal resolution. FreeType rounds the glyph
-    // box to whole pixels for NORMAL but to thirds for LCD, so the base
-    // width can differ by a pixel: accept ~3x, or equal width for
-    // bitmap-only faces that fall back to NORMAL (documented).
-    try testing.expect(lcd.width == normal.width or
-        (lcd.width >= normal.width * 3 - 3 and lcd.width <= normal.width * 3 + 3));
-    try testing.expect(lcd.width >= normal.width);
+    const normal_pixel_mode = face.ft_face.*.glyph.*.bitmap.pixel_mode;
+
+    // Direct evidence of the render modes: LCD yields FT_PIXEL_MODE_LCD
+    // (one coverage byte per RGB subpixel), NORMAL yields GRAY.
+    try testing.expect(lcd_pixel_mode == ft.FT_PIXEL_MODE_LCD);
+    try testing.expect(normal_pixel_mode == ft.FT_PIXEL_MODE_GRAY);
+
+    // LCD triples the horizontal resolution, but not to exactly 3x the
+    // NORMAL width: FreeType grid-fits the outline's control box to whole
+    // pixels for NORMAL, while for LCD it first pads the box by 2/3 pixel
+    // on each side for the 5-tap LCD filter (ft_lcd_padding, +/-43 in 26.6
+    // units), then rounds and triples the width. The padding grows the
+    // rounded box by at most one pixel per side, so the LCD width is a
+    // multiple of 3 in [3*normal, 3*normal + 6]. Height is untouched.
+    try testing.expect(lcd.width % 3 == 0);
+    try testing.expect(lcd.width >= normal.width * 3);
+    try testing.expect(lcd.width <= normal.width * 3 + 6);
+    try testing.expectEqual(normal.height, lcd.height);
 }
 
 test "fallback: CJK coverage or graceful null, negative cache" {

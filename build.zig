@@ -66,6 +66,9 @@ const CInterop = struct {
     hb_c: *std.Build.Module,
     sd_bus_c: *std.Build.Module,
     sd_login_c: *std.Build.Module,
+    gbm_c: *std.Build.Module,
+    egl_c: *std.Build.Module,
+    gl_c: *std.Build.Module,
 
     fn init(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) CInterop {
         // libghostty-vt, pinned to 1.0.1 in build.zig.zon. The C API is the
@@ -96,6 +99,13 @@ const CInterop = struct {
         const sd_bus = translateC(b, target, optimize, "src/sd-bus-c.h", &.{"libsystemd"});
         const sd_login = translateC(b, target, optimize, "src/sd-login-c.h", &.{"libsystemd"});
 
+        // GBM/EGL/GLES2 for the drm3d backend (M5.1). On nixpkgs gbm.h
+        // ships in libgbm (mesa) and the EGL/GLES2 headers in libglvnd;
+        // the pkg-config names are gbm/egl/glesv2.
+        const gbm = translateC(b, target, optimize, "src/gbm-c.h", &.{"gbm"});
+        const egl = translateC(b, target, optimize, "src/egl-c.h", &.{"egl"});
+        const gl = translateC(b, target, optimize, "src/gl-c.h", &.{"glesv2"});
+
         return .{
             .vt_c = vt_c,
             .ghostty_vt = ghostty_vt,
@@ -107,6 +117,9 @@ const CInterop = struct {
             .hb_c = hb.createModule(),
             .sd_bus_c = sd_bus.createModule(),
             .sd_login_c = sd_login.createModule(),
+            .gbm_c = gbm.createModule(),
+            .egl_c = egl.createModule(),
+            .gl_c = gl.createModule(),
         };
     }
 
@@ -127,16 +140,22 @@ const CInterop = struct {
         m.addImport("harfbuzz-c", self.hb_c);
         m.addImport("sd-bus-c", self.sd_bus_c);
         m.addImport("sd-login-c", self.sd_login_c);
+        m.addImport("gbm-c", self.gbm_c);
+        m.addImport("egl-c", self.egl_c);
+        m.addImport("gl-c", self.gl_c);
 
         // pkg-config module names (libdrm.pc, xkbcommon.pc, libinput.pc,
         // libudev.pc, libsystemd.pc, fontconfig.pc, freetype2.pc,
         // harfbuzz.pc, harfbuzz-raster.pc from the withRaster overlay,
-        // spng.pc, libseat.pc). spng and seat are link-only:
-        // spng_decode.zig and libseat.zig carry their own C declarations.
+        // spng.pc, libseat.pc, gbm.pc, egl.pc, glesv2.pc). spng and seat
+        // are link-only: spng_decode.zig and libseat.zig carry their own
+        // C declarations. gbm/egl/glesv2 back drm3d's libgbm/libegl/libgl
+        // wrappers (libgbm from mesa, libEGL/libGLESv2 from libglvnd).
         for ([_][]const u8{
             "libdrm",     "xkbcommon",  "libinput", "libudev",
             "libsystemd", "fontconfig", "freetype2", "harfbuzz",
             "harfbuzz-raster", "spng",  "libseat",
+            "gbm", "egl", "glesv2",
         }) |name| m.linkSystemLibrary(name, .{});
     }
 };
