@@ -338,14 +338,24 @@ pub const TerminalSession = struct {
         return self.clipboard[@intFromEnum(location)].items;
     }
 
-    /// epoll pump: drain the pty master into the terminal. Effects fire
-    /// inline (vt.write). EIO/EOF means every slave fd closed -- NOT
-    /// necessarily child exit (login vhangup); a non-blocking reap is
-    /// attempted. Breaks on EAGAIN; register the fd edge-triggered.
-    pub fn onPtyReadable(self: *TerminalSession) anyerror!void {
+    /// Max bytes drained per pump before yielding to the loop (M8.1).
+    /// A sustained output burst must not monopolize input/rendering;
+    /// when the budget is hit the caller re-arms the edge-triggered
+    /// source so pending data wakes the loop again.
+    pub const pump_budget: usize = 128 * 1024;
+
+    /// epoll pump: drain the pty master into the terminal, at most
+    /// `pump_budget` bytes per call. Effects fire inline (vt.write).
+    /// EIO/EOF means every slave fd closed -- NOT necessarily child exit
+    /// (login vhangup); a non-blocking reap is attempted. Breaks on
+    /// EAGAIN; register the fd edge-triggered. Returns true when the
+    /// budget was exhausted (data may remain; re-arm the source).
+    pub fn onPtyReadable(self: *TerminalSession) anyerror!bool {
         try self.ensureBound();
-        if (!self.active) return;
+        if (!self.active) return false;
         var buf: [16384]u8 = undefined;
+        var drained: usize = 0;
+        var more = false;
         while (true) {
             const n = self.pty.read(&buf) catch |err| switch (err) {
                 error.WouldBlock => break,
@@ -360,6 +370,11 @@ pub const TerminalSession = struct {
                 break;
             }
             self.vt.write(buf[0..n]);
+            drained += n;
+            if (drained >= pump_budget) {
+                more = true;
+                break;
+            }
         }
         // A program that enables mouse tracking takes over the pointer:
         // drop any in-progress selection (no mode-change callback exists,
@@ -367,6 +382,7 @@ pub const TerminalSession = struct {
         if (try self.vt.mouseTracking()) {
             if (self.selecting or (try self.vt.selection()) != null) try self.clearSelection();
         }
+        return more;
     }
 
     /// SIGCHLD path (and the pump's EIO path): reap non-blocking. On a
@@ -1111,7 +1127,9 @@ fn pumpUntil(
     while (!pred(ctx, ts)) {
         if (nowMs() - start > timeout_ms) return error.TestTimeout;
         const ready = try std.posix.poll(&pfd, 10);
-        if (ready > 0) try ts.onPtyReadable();
+        if (ready > 0) {
+            _ = try ts.onPtyReadable();
+        }
     }
 }
 
@@ -1488,7 +1506,7 @@ test "terminal: private OSC setBackground/setForeground hooks, no reply" {
     }.p, 5000);
     // Let any (wrong) reply or the non-matching variants arrive.
     sleepMs(100);
-    try ts.onPtyReadable();
+    _ = try ts.onPtyReadable();
     try testing.expectEqual(@as(u32, 1), log.backgrounds);
     try testing.expectEqual(@as(u32, 1), log.foregrounds);
     // No reply and no visible output: the screen stays blank.
@@ -1946,7 +1964,7 @@ test "terminal: enabling mouse tracking drops the selection" {
 
     // The program enables tracking; the next pump drops the selection.
     ts.vt.write("\x1b[?1000h");
-    try ts.onPtyReadable();
+    _ = try ts.onPtyReadable();
     try testing.expectEqual(@as(?vt.Selection, null), try ts.vt.selection());
     try testing.expect(!ts.selecting);
 }

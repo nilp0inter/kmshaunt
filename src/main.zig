@@ -18,11 +18,11 @@
 //!     by `--gpus` (master is per device). `--hwaccel` selects Drm3d
 //!     (GBM/EGL/GLES2 scanout); a card where GBM/EGL/GLES2 cannot come up
 //!     (error.Unsupported) or nothing is connected (error.NoConnectedDisplay)
-//!     falls back to Drm2d with a warning. Each card is modeset to its first
-//!     enabled connector via `selectModeIndex` (`--mode`/`--use-original-mode`/
+//!     falls back to Drm2d with a warning. Each card modesets every enabled
+//!     connected connector via `selectModeIndex` (`--mode`/`--use-original-mode`/
 //!     preferred), `--screen` rotation/disable, `--soft-cursor` force, and a
-//!     udev hotplug monitor. One connector per card is driven (M5.4
-//!     multi-output scanout gap).
+//!     udev hotplug monitor: one Output per connector, one shared backend per
+//!     card (M5.4 multi-connector scanout; Drm3d drives one connector).
 //!  6. Font: `Discovery.primaryFace` + `cellMetrics`; the shared grid and
 //!     per-connector viewports come from `computeLayout` (`--multi-monitor`
 //!     clone/largest/scaled). `--font-size 0` derives a size from the primary
@@ -32,7 +32,8 @@
 //!  8. Input: `xkb.Keymap` + `Input` (libinput), sink routes to the manager,
 //!     repeat through a `loop.Timer` adapter, VT-switch grabs handled here.
 //!  9. Each terminal's pty master registered EPOLLIN edge-triggered.
-//! 10. Frame loop paced by DRM page-flip events; DPMS + cursor-blink +
+//! 10. Frame loop paced by a one-shot frame timer (one display refresh)
+//!     plus DRM page-flip completion events; DPMS + cursor-blink +
 //!     kitty-animation timers.
 //! 11. issue text, asciicast playback, locale1 live keymap follow.
 //! 12. `loop.run`; SIGTERM/INT (or oneshot child exit) stops it; everything
@@ -229,11 +230,11 @@ const PtyReg = struct {
 };
 
 /// One opened DRM card: Drm2d (dumb buffers) or Drm3d (GBM/EGL/GLES2,
-/// `--hwaccel`). The frame loop runs through the `video.Backend` vtable;
-/// this union adds the DRM-specific calls the console needs (master
-/// handoff, event fd, hotplug, mode selection). One connector per card is
-/// driven here; Drm2d's per-connector multi-output methods
-/// (beginFrameFor/endFrameFor/activeCount) stay on the concrete type (M5.4).
+/// `--hwaccel`). The legacy `video.Backend` vtable drives the primary
+/// (first modeset) connector; this union adds the DRM-specific calls the
+/// console needs (master handoff, event fd, hotplug, mode selection) and
+/// the per-connector frame path (M5.4). Drm2d modesets several connectors
+/// per card; Drm3d drives a single connector.
 const DrmOutput = union(enum) {
     drm2d: *drm2d.Drm2d,
     drm3d: *drm3d.Drm3d,
@@ -343,6 +344,38 @@ const DrmOutput = union(enum) {
         };
     }
 
+    fn setDpms(self: DrmOutput, state: video.DpmsState) !void {
+        return switch (self) {
+            .drm2d => |d| d.setDpms(state),
+            .drm3d => |d| d.setDpms(state),
+        };
+    }
+
+    /// Back buffer of connector `ci` (index into the last connectors()
+    /// probe). Drm3d has a single scanout, so the index is ignored there.
+    fn beginFrameFor(self: DrmOutput, ci: usize) !*video.Framebuffer {
+        return switch (self) {
+            .drm2d => |d| d.beginFrameFor(ci),
+            .drm3d => |d| d.beginFrame(),
+        };
+    }
+
+    fn endFrameFor(self: DrmOutput, ci: usize, damage: []const video.Damage) !void {
+        return switch (self) {
+            .drm2d => |d| d.endFrameFor(ci, damage),
+            .drm3d => |d| d.endFrame(damage),
+        };
+    }
+
+    /// The card's backend identity: all outputs of one card share the same
+    /// pointer (DRM master is per device).
+    fn cardPtr(self: DrmOutput) *anyopaque {
+        return switch (self) {
+            .drm2d => |d| d,
+            .drm3d => |d| d,
+        };
+    }
+
     fn deinit(self: DrmOutput) void {
         switch (self) {
             .drm2d => |d| d.deinit(),
@@ -351,23 +384,45 @@ const DrmOutput = union(enum) {
     }
 };
 
-/// One driven DRM output: a DRM backend instance (one per card — DRM master
-/// is per device) modeset to a single connector, plus its viewport into the
+/// Per-connector frame sink for present(): Drm2d drives each modeset
+/// connector's own CRTC + buffer pair (M5.4); Drm3d's single scanout
+/// ignores the connector index.
+const DrmFrame = struct {
+    drm: DrmOutput,
+    ci: usize,
+
+    fn beginFrame(self: DrmFrame) !*video.Framebuffer {
+        return self.drm.beginFrameFor(self.ci);
+    }
+
+    fn endFrame(self: DrmFrame, damage: []const video.Damage) !void {
+        return self.drm.endFrameFor(self.ci, damage);
+    }
+};
+
+/// One driven DRM output: one connector modeset on its card's backend (one
+/// backend per card — DRM master is per device), plus its viewport into the
 /// shared canvas. No pointer into `outputs` is ever handed to the loop:
-/// every fd callback uses the Console as userdata and drains all outputs,
+/// every fd callback uses the Console as userdata and drains all cards,
 /// so the list may grow/reorder freely (ROADMAP M5.4).
 const Output = struct {
     drm: DrmOutput,
+    /// Card-level fd tokens, held by the card's first output only (the fds
+    /// are registered once per card).
     event_token: ?loop.Token = null,
     hotplug_token: ?loop.Token = null,
     /// Driven connector index in the last connectors() probe.
     ci: usize = 0,
-    /// Connector name, borrowed from the backend's last connectors() result
-    /// (refreshed whenever the output is re-selected).
+    /// Connector name, owned: a connectors() re-probe frees the borrowed
+    /// slices, and reprobe diffs outputs by name (M5.4).
     name: []const u8 = "",
     mode: video.Mode = .{ .width_px = 0, .height_px = 0, .refresh_mhz = 0, .width_mm = 0, .height_mm = 0 },
     rotation: layout.Rotation = .normal,
     plan: layout.Plan = .{},
+    /// Damage presented in this output's previous frame: the back buffer
+    /// alternates, so it is two frames stale and the next blit must cover
+    /// both frames' damage (M8.1 band-limited present).
+    prev_damage: sess.DamageList = .empty,
 };
 
 /// A connector + mode chosen for one output (selectForCard/selectFbMode).
@@ -380,7 +435,8 @@ const ModeSelection = struct {
 };
 
 /// Upper bound on simultaneous outputs: the GPU selection buffer holds 8
-/// cards (one output each); fbdev adds at most one. Headroom for both.
+/// cards, each driving several connectors (M5.4); fbdev adds at most one.
+/// Headroom for both.
 const max_outputs = 16;
 
 /// The single-seat console. Heap-allocated and never moved: every callback
@@ -403,9 +459,10 @@ const Console = struct {
     seat_token: ?loop.Token = null,
 
     // Video. DRM: one backend (Drm2d, or Drm3d with --hwaccel) per selected
-    // card, each modeset to one connector (`outputs`, in card order). fbdev:
-    // a single output via `fb`. `backend`, `mode` and `rotation` describe the
-    // primary (first) output for font auto-sizing, DPMS and logging.
+    // card, modeset to every enabled connector (`outputs`, one per
+    // connector, in card order). fbdev: a single output via `fb`. `backend`,
+    // `mode` and `rotation` describe the primary (first) output for font
+    // auto-sizing and logging.
     outputs: std.ArrayListUnmanaged(Output) = .empty,
     fb: ?fbdev.Fbdev = null,
     backend: video.Backend = undefined,
@@ -419,6 +476,8 @@ const Console = struct {
     fb_plan: layout.Plan = .{},
     /// Scratch physical damage for the viewport present path.
     phys_damage: sess.DamageList = .empty,
+    /// fbdev back-buffer damage history (DRM outputs use Output.prev_damage).
+    fb_prev_damage: sess.DamageList = .empty,
     /// Hotplug arrived while the seat was inactive; reprobe on activation.
     reprobe_pending: bool = false,
 
@@ -440,6 +499,10 @@ const Console = struct {
 
     // Input.
     keymap: ?xkb.Keymap = null,
+    /// Effective xkb config: cfg fields win, locale1 fills unset ones
+    /// (M6.5 startup parity). Tracked so setupLocale1 can close the
+    /// read-vs-subscribe race.
+    xkb_effective: xkb.Options = .{},
     input: ?libinput.Input = null,
     repeat: ?*RepeatAdapter = null,
     input_token: ?loop.Token = null,
@@ -450,6 +513,8 @@ const Console = struct {
     respawn_timer: loop.Timer = .{},
     kitty_timer: loop.Timer = .{},
     asciicast_timer: loop.Timer = .{},
+    /// M8.1 frame pacing: coalesces damage into one render per refresh.
+    frame_timer: loop.Timer = .{},
     /// asciicast playback (M2.4), bound to the terminal it plays into.
     playback: ?*asciicast.Playback = null,
     playback_ts: ?*terminal.TerminalSession = null,
@@ -462,6 +527,8 @@ const Console = struct {
     dpms_off: bool = false,
     seat_active: bool = false,
     respawn_pending: ?*terminal.TerminalSession = null,
+    /// A frame timer arm is in flight (pins the deadline under load).
+    frame_armed: bool = false,
 
     // -- lifecycle ---------------------------------------------------------
 
@@ -476,6 +543,7 @@ const Console = struct {
         }
         self.stopPlayback();
         self.asciicast_timer.deinit();
+        self.frame_timer.deinit();
         self.respawn_timer.deinit();
         self.kitty_timer.deinit();
         self.blink_timer.deinit();
@@ -520,6 +588,7 @@ const Console = struct {
         }
         self.damage.deinit(self.alloc);
         self.phys_damage.deinit(self.alloc);
+        self.fb_prev_damage.deinit(self.alloc);
         if (self.disc) |*d| {
             d.deinit();
             self.disc = null;
@@ -528,8 +597,12 @@ const Console = struct {
         for (self.outputs.items) |*o| {
             if (o.hotplug_token) |t| self.lp.removeSource(t);
             if (o.event_token) |t| self.lp.removeSource(t);
-            o.drm.deinit();
+            self.alloc.free(o.name);
+            o.prev_damage.deinit(self.alloc);
         }
+        // One backend per card: deinit each card once, not per output.
+        var cards: [max_outputs]DrmOutput = undefined;
+        for (cards[0..self.uniqueCards(&cards)]) |drm| drm.deinit();
         self.outputs.deinit(self.alloc);
         if (self.fb) |*f| {
             f.deinit();
@@ -594,6 +667,7 @@ const Console = struct {
         try self.respawn_timer.init(&self.lp, .{ .callback = onRespawnTimer, .userdata = @intFromPtr(self) });
         try self.kitty_timer.init(&self.lp, .{ .callback = onKittyTimer, .userdata = @intFromPtr(self) });
         try self.asciicast_timer.init(&self.lp, .{ .callback = onAsciicastTimer, .userdata = @intFromPtr(self) });
+        try self.frame_timer.init(&self.lp, .{ .callback = onFrameTimer, .userdata = @intFromPtr(self) });
         if (self.cfg.blink) try self.blink_timer.armInterval(blink_interval_ns);
         self.armDpms();
 
@@ -667,9 +741,9 @@ const Console = struct {
     }
 
     /// Open one DRM backend per GPU selected by `--gpus` (DRM master is per
-    /// device, recipes §10.3), then modeset each to its first enabled
-    /// connector. Falls back to card0 when enumeration/selection yields
-    /// nothing.
+    /// device, recipes §10.3), modesetting every enabled connected connector
+    /// on each card (M5.4). Falls back to card0 when enumeration/selection
+    /// yields nothing.
     fn setupDrm(self: *Console) !void {
         const candidates = drm2d.enumerateGpus(self.alloc, self.io) catch |err| blk: {
             log.warn("gpu enumerate: {t}", .{err});
@@ -686,25 +760,6 @@ const Console = struct {
         if (self.outputs.items.len == 0) {
             try self.openCard(null);
         }
-        // Select + modeset each card; drop cards with no usable connector.
-        var i: usize = self.outputs.items.len;
-        while (i > 0) {
-            i -= 1;
-            const o = &self.outputs.items[i];
-            const sel = self.selectForCard(o.drm) catch |err| blk: {
-                log.warn("probe {s}: {t}", .{ o.drm.cardName(), err });
-                break :blk null;
-            };
-            if (sel) |s| {
-                try o.drm.setMode(s.ci, s.mi);
-                o.ci = s.ci;
-                o.mode = s.mode;
-                o.rotation = s.rotation;
-                o.name = s.name;
-            } else {
-                self.removeOutput(i);
-            }
-        }
         if (self.outputs.items.len == 0) return error.NoConnectedDisplay;
         self.mode = self.outputs.items[0].mode;
         self.rotation = self.outputs.items[0].rotation;
@@ -712,9 +767,12 @@ const Console = struct {
     }
 
     /// Open a card with the configured backend, enable the udev hotplug
-    /// monitor, take master and register the event + hotplug fds. All
-    /// callbacks use the Console as userdata (never an Output pointer), so
-    /// the outputs list may grow freely.
+    /// monitor, take master and register the event + hotplug fds once per
+    /// card (tokens on the first Output). Modeset every enabled connected
+    /// connector and append one Output per connector, all sharing the
+    /// card's backend (M5.4). All callbacks use the Console as userdata
+    /// (never an Output pointer), so the outputs list may grow freely.
+    /// error.NoConnectedDisplay when no connector can be driven.
     fn openCard(self: *Console, path: ?[]const u8) !void {
         const drm = try self.openDrmBackend(path);
         errdefer drm.deinit();
@@ -727,11 +785,50 @@ const Console = struct {
         if (drm.hotplugFd()) |hfd| {
             hotplug_token = try self.lp.addSource(hfd, loop.ev.in_, onHotplugEvent, @intFromPtr(self));
         }
-        try self.outputs.append(self.alloc, .{
-            .drm = drm,
-            .event_token = event_token,
-            .hotplug_token = hotplug_token,
-        });
+        errdefer {
+            if (hotplug_token) |t| self.lp.removeSource(t);
+        }
+        const conns = try drm.connectors();
+        var sel_buf: [max_outputs]ModeSelection = undefined;
+        const room = max_outputs -| self.outputs.items.len;
+        const sels = try self.selectForCard(drm, conns, sel_buf[0..room]);
+        // Modeset first: a failed modeset only skips its own connector,
+        // the others keep scanning out.
+        var active: [max_outputs]ModeSelection = undefined;
+        var n_active: usize = 0;
+        for (sels) |s| {
+            drm.setMode(s.ci, s.mi) catch |err| {
+                log.warn("modeset {s}/{s}: {t}", .{ drm.cardName(), s.name, err });
+                continue;
+            };
+            active[n_active] = s;
+            n_active += 1;
+        }
+        if (n_active == 0) return error.NoConnectedDisplay;
+        try self.outputs.ensureTotalCapacity(self.alloc, self.outputs.items.len + n_active);
+        // Own the connector names: a later connectors() re-probe frees the
+        // borrowed slices, and reprobe diffs outputs by name.
+        var n_named: usize = 0;
+        errdefer {
+            for (active[0..n_named]) |s| self.alloc.free(s.name);
+        }
+        for (active[0..n_active]) |*s| {
+            s.name = try self.alloc.dupe(u8, s.name);
+            n_named += 1;
+        }
+        // No fallible step past this point: capacity is reserved and the
+        // names are owned, so the appends cannot fail halfway.
+        for (active[0..n_active], 0..) |s, i| {
+            self.outputs.appendAssumeCapacity(.{
+                .drm = drm,
+                .event_token = if (i == 0) event_token else null,
+                .hotplug_token = if (i == 0) hotplug_token else null,
+                .ci = s.ci,
+                .name = s.name,
+                .mode = s.mode,
+                .rotation = s.rotation,
+            });
+        }
     }
 
     /// Instantiate the backend for one card. `--hwaccel` tries Drm3d
@@ -769,42 +866,75 @@ const Console = struct {
         return .{ .drm2d = drm };
     }
 
-    fn removeOutput(self: *Console, index: usize) void {
-        const o = self.outputs.items[index];
-        if (o.hotplug_token) |t| self.lp.removeSource(t);
-        if (o.event_token) |t| self.lp.removeSource(t);
-        o.drm.deinit();
+    /// Remove one output (connector dropped or deselected). The backend is
+    /// shared with the card's other outputs: deinit it only when the last
+    /// output of the card goes away, and hand the fd tokens to a surviving
+    /// output. `still_connected_ci` is the dropped connector's index in the
+    /// last connectors() probe when it is still connected (null otherwise):
+    /// such a connector is disabled so it stops scanning out (M5.4).
+    fn removeOutput(self: *Console, index: usize, still_connected_ci: ?usize) void {
+        var o = self.outputs.items[index];
         _ = self.outputs.swapRemove(index);
+        var survivor: ?*Output = null;
+        for (self.outputs.items) |*s| {
+            if (s.drm.cardPtr() == o.drm.cardPtr()) {
+                survivor = s;
+                break;
+            }
+        }
+        if (survivor) |s| {
+            if (o.event_token) |t| {
+                if (s.event_token == null) s.event_token = t else self.lp.removeSource(t);
+            }
+            if (o.hotplug_token) |t| {
+                if (s.hotplug_token == null) s.hotplug_token = t else self.lp.removeSource(t);
+            }
+            if (still_connected_ci) |ci| {
+                switch (o.drm) {
+                    .drm2d => |d| d.disableConnector(ci) catch |err|
+                        log.warn("disable {s}/{s}: {t}", .{ d.card_name, o.name, err }),
+                    .drm3d => {}, // single connector: no sibling output exists
+                }
+            }
+        } else {
+            if (o.event_token) |t| self.lp.removeSource(t);
+            if (o.hotplug_token) |t| self.lp.removeSource(t);
+            o.drm.deinit();
+        }
+        self.alloc.free(o.name);
+        o.prev_damage.deinit(self.alloc);
     }
 
-    /// First connected, enabled connector on a card + its mode via
-    /// selectModeIndex (`mode=` / `use-original-mode` / preferred, M5.3). One
-    /// connector per card is driven, so further enabled connectors on the
-    /// same card are reported but not driven (M5.4 scanout gap).
-    fn selectForCard(self: *Console, drm: DrmOutput) !?ModeSelection {
-        const conns = try drm.connectors();
-        var result: ?ModeSelection = null;
-        var enabled_count: usize = 0;
+    /// Every connected, enabled connector on a card + its mode via
+    /// selectModeIndex (`mode=` / `use-original-mode` / preferred, M5.3), in
+    /// probe order, written into `buf` (M5.4: one output per connector).
+    /// Drm3d drives a single connector per card, so only its first selection
+    /// is returned. `conns` is the caller's connectors() probe: reprobe also
+    /// needs the full list to diff dropped outputs. Names borrow it.
+    fn selectForCard(self: *Console, drm: DrmOutput, conns: []const video.ConnectorInfo, buf: []ModeSelection) ![]ModeSelection {
+        const multi = switch (drm) {
+            .drm2d => true,
+            .drm3d => false,
+        };
+        var n: usize = 0;
         for (conns, 0..) |conn, ci| {
+            if (n == buf.len) break;
             if (!conn.connected or conn.modes.len == 0) continue;
             const screen = self.cfg.getScreen(conn.card_name, conn.name);
             if (!screen.enabled) continue;
-            enabled_count += 1;
-            if (result != null) continue;
             const spec = modeSpecFor(self.cfg, conn.card_name, conn.name);
             const mi = (try drm.selectModeIndex(ci, spec, self.cfg.use_original_mode)) orelse continue;
-            result = .{
+            buf[n] = .{
                 .ci = ci,
                 .mi = mi,
                 .mode = conn.modes[mi],
                 .rotation = orientationToRotation(screen.orientation),
                 .name = conn.name,
             };
+            n += 1;
+            if (!multi) break;
         }
-        if (enabled_count > 1) {
-            log.warn("{s}: {d} enabled connectors; one driven per card (M5.4 scanout gap)", .{ drm.cardName(), enabled_count });
-        }
-        return result;
+        return buf[0..n];
     }
 
     /// fbdev path: first connected, enabled connector + preferred/mode= match
@@ -917,13 +1047,23 @@ const Console = struct {
     }
 
     fn setupInput(self: *Console) !void {
-        self.keymap = try xkb.Keymap.init(self.io, self.alloc, .{
+        // M6.5 parity: seed the keymap with locale1's CURRENT layout, not
+        // just cfg. Explicit cfg fields win over locale1 (overlay).
+        var cur_keymap: ?locale1.CurrentKeymap =
+            locale1.Locale1.readCurrent(self.alloc, locale1.real) catch |err| blk: {
+                log.info("locale1 startup read: {t}", .{err});
+                break :blk null;
+            };
+        defer if (cur_keymap) |*c| c.deinit();
+        const loc: locale1.KeymapOptions = if (cur_keymap) |*c| c.options() else .{};
+        self.xkb_effective = loc.overlay(xkb.Options, .{
             .model = self.cfg.xkb_model,
             .layout = self.cfg.xkb_layout,
             .variant = self.cfg.xkb_variant,
             .options = self.cfg.xkb_options,
             .keymap_file = self.cfg.xkb_keymap,
         });
+        self.keymap = try xkb.Keymap.init(self.io, self.alloc, self.xkb_effective);
         self.input = try libinput.Input.init(self.alloc, self.io, &self.keymap.?, self.cfg, libinput.LibinputOps.real);
         self.input.?.setSink(onInput, @intFromPtr(self));
 
@@ -943,6 +1083,25 @@ const Console = struct {
         errdefer self.alloc.destroy(l);
         l.* = try locale1.Locale1.init(self.alloc, locale1.real);
         self.loc1 = l;
+        // Close the race between the startup one-shot read and the
+        // subscription: the follower's init snapshot is read after its
+        // match is installed, so re-apply it if it differs from startup.
+        const eff = l.keymapOptions().overlay(xkb.Options, .{
+            .model = self.cfg.xkb_model,
+            .layout = self.cfg.xkb_layout,
+            .variant = self.cfg.xkb_variant,
+            .options = self.cfg.xkb_options,
+            .keymap_file = self.cfg.xkb_keymap,
+        });
+        if (!std.meta.eql(eff, self.xkb_effective)) {
+            if (self.input) |*in| {
+                if (in.state.reload(eff)) |_| {
+                    self.xkb_effective = eff;
+                } else |err| {
+                    log.warn("keymap reload: {t}", .{err});
+                }
+            }
+        }
         const fd = try l.fd();
         self.locale_token = try self.lp.addSource(fd, loop.ev.in_, onLocale1Event, @intFromPtr(self));
     }
@@ -1022,17 +1181,113 @@ const Console = struct {
             log.warn("dpms timer: {t}", .{err});
     }
 
+    /// Each open card exactly once, in first-output order: outputs share
+    /// one backend per card (M5.4). Writes into buf, returns the count.
+    fn uniqueCards(self: *const Console, buf: []DrmOutput) usize {
+        var n: usize = 0;
+        for (self.outputs.items) |o| {
+            var dup = false;
+            for (buf[0..n]) |s| {
+                if (s.cardPtr() == o.drm.cardPtr()) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            buf[n] = o.drm;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// This card's output driving the named connector, or null (the
+    /// reprobe diff matches by owned name, M5.4).
+    fn outputForName(self: *Console, drm: DrmOutput, name: []const u8) ?*Output {
+        for (self.outputs.items) |*o| {
+            if (o.drm.cardPtr() == drm.cardPtr() and std.mem.eql(u8, o.name, name)) return o;
+        }
+        return null;
+    }
+
+    /// Whether any output still references this card's backend.
+    fn hasCardDrm(self: *const Console, drm: DrmOutput) bool {
+        for (self.outputs.items) |o| {
+            if (o.drm.cardPtr() == drm.cardPtr()) return true;
+        }
+        return false;
+    }
+
+    /// Set DPMS on every card once (M5.6): setDpms reaches all modeset
+    /// connectors of a card, so shared backends must not be called per
+    /// output. Returns true when at least one card accepted the state.
+    fn setDpmsAll(self: *Console, state: video.DpmsState) bool {
+        if (self.fb != null) {
+            self.backend.setDpms(state) catch |err| {
+                log.warn("dpms: {t}", .{err});
+                return false;
+            };
+            return true;
+        }
+        var cards: [max_outputs]DrmOutput = undefined;
+        var any = false;
+        for (cards[0..self.uniqueCards(&cards)]) |drm| {
+            drm.setDpms(state) catch |err| {
+                log.warn("dpms {s}: {t}", .{ drm.cardName(), err });
+                continue;
+            };
+            any = true;
+        }
+        return any;
+    }
+
+    /// Record damage and schedule a frame. Rendering never runs in the
+    /// pty-drain or input hot path: the frame timer coalesces all damage
+    /// since the last frame into one render, so a burst of pty reads costs
+    /// one presentation and input is never blocked on drawing (kmscon's
+    /// damage-driven model, M8.1).
     fn markDirty(self: *Console) void {
         self.dirty = true;
+        self.scheduleFrame();
+    }
+
+    /// Arm the one-shot frame timer unless a frame is already scheduled.
+    /// Re-arming on every markDirty would push the deadline back forever
+    /// under continuous output (starvation), so the armed flag pins it.
+    fn scheduleFrame(self: *Console) void {
+        if (self.frame_armed) return;
+        self.frame_timer.armOneShot(self.frameIntervalNs()) catch |err| {
+            log.warn("frame timer: {t}", .{err});
+            return;
+        };
+        self.frame_armed = true;
+    }
+
+    /// One display refresh, clamped to 4..50 ms so a bogus mode can neither
+    /// stall nor spin the frame clock. 60 Hz when the mode reports none.
+    fn frameIntervalNs(self: *const Console) u64 {
+        const mhz = self.mode.refresh_mhz;
+        if (mhz == 0) return 16_666_667;
+        const ns = @as(u64, 1_000_000_000_000) / @as(u64, mhz);
+        return std.math.clamp(ns, 4 * std.time.ns_per_ms, 50 * std.time.ns_per_ms);
+    }
+
+    fn onFrameTimer(_: *loop.Timer, expirations: u64, ud: usize) void {
+        _ = expirations;
+        const self: *Console = @ptrFromInt(ud);
+        self.frame_armed = false;
         self.renderIfDirty();
     }
 
     fn videoTakeMaster(self: *Console) void {
-        for (self.outputs.items) |o| o.drm.takeMaster() catch |err| log.err("takeMaster: {t}", .{err});
+        var cards: [max_outputs]DrmOutput = undefined;
+        for (cards[0..self.uniqueCards(&cards)]) |drm|
+            drm.takeMaster() catch |err| log.err("takeMaster: {t}", .{err});
     }
 
     fn videoDropMaster(self: *Console) void {
-        for (self.outputs.items) |o| o.drm.dropMaster() catch |err| log.err("dropMaster: {t}", .{err});
+        var cards: [max_outputs]DrmOutput = undefined;
+        for (cards[0..self.uniqueCards(&cards)]) |drm|
+            drm.dropMaster() catch |err| log.err("dropMaster: {t}", .{err});
     }
 
     /// True while any output has a submitted flip in flight. The slowest
@@ -1046,10 +1301,12 @@ const Console = struct {
     }
 
     /// Present the active session if there is damage and no flip is in
-    /// flight. DRM completion re-triggers this through onDrmEvent; fbdev is
-    /// synchronous (flipPending always false). The session renders once into
-    /// the shared shadow canvas, which is then presented into every output's
-    /// back buffer through its viewport plan (M5.4).
+    /// flight. Called from the frame timer (damage coalescing) and from
+    /// onDrmEvent (flip completion presents damage accumulated while the
+    /// flip was in flight); fbdev is synchronous (flipPending always false).
+    /// The session renders once into the shared shadow canvas, which is then
+    /// presented into every output's back buffer through its viewport plan
+    /// (M5.4).
     fn renderIfDirty(self: *Console) void {
         if (!self.dirty or self.dpms_off or !self.seat_active) return;
         if (self.anyFlipPending()) return;
@@ -1078,10 +1335,10 @@ const Console = struct {
         // renderer through the next frame's placement list.
         self.tickKittyAnimations();
         if (self.fb != null) {
-            self.present(self.backend, self.fb_plan);
+            self.present(self.backend, self.fb_plan, &self.fb_prev_damage);
         } else {
             for (self.outputs.items) |*o| {
-                self.present(o.drm.backend(), o.plan);
+                self.present(DrmFrame{ .drm = o.drm, .ci = o.ci }, o.plan, &o.prev_damage);
             }
         }
         self.dirty = false;
@@ -1089,11 +1346,12 @@ const Console = struct {
     }
 
     /// Present the shadow canvas into one output's back buffer through its
-    /// viewport plan, then flip. The 1:1 unrotated full-canvas case uses the
-    /// fast blitFrom + exact damage; other viewports clear the letterbox and
-    /// use blitViewport with row-band physical damage (Plan.damage), or a full
-    /// frame on full_redraw.
-    fn present(self: *Console, backend: video.Backend, plan: layout.Plan) void {
+    /// viewport plan, then flip. `backend` is the fbdev video.Backend or a
+    /// DrmFrame selecting the connector (M5.4). The 1:1 unrotated full-canvas
+    /// case uses the fast blitFrom + exact damage; other viewports clear the
+    /// letterbox and use blitViewport with row-band physical damage
+    /// (Plan.damage), or a full frame on full_redraw.
+    fn present(self: *Console, backend: anytype, plan: layout.Plan, prev_damage: *sess.DamageList) void {
         const shadow = &self.shadow.?;
         const fb = backend.beginFrame() catch |err| {
             log.warn("beginFrame: {t}", .{err});
@@ -1104,7 +1362,7 @@ const Console = struct {
             plan.src.w == self.canvas.width and plan.src.h == self.canvas.height and
             plan.dst.x == 0 and plan.dst.y == 0;
         if (trivial) {
-            fb.blitFrom(shadow.*, 0, 0, .{ .x = 0, .y = 0, .w = shadow.width, .h = shadow.height });
+            self.blitShadowBands(fb, shadow, prev_damage);
             const dmg: []const video.Damage = if (self.full_redraw) &.{} else self.damage.items;
             backend.endFrame(dmg) catch |err| log.warn("endFrame: {t}", .{err});
             return;
@@ -1113,6 +1371,7 @@ const Console = struct {
         fb.fill(0);
         render.blitViewport(fb.*, shadow.*, plan);
         if (self.full_redraw) {
+            self.setPrevDamage(prev_damage, &.{.{ .x = 0, .y = 0, .w = shadow.width, .h = shadow.height }});
             backend.endFrame(&.{}) catch |err| log.warn("endFrame: {t}", .{err});
             return;
         }
@@ -1134,11 +1393,109 @@ const Console = struct {
             }
         }
         backend.endFrame(self.phys_damage.items) catch |err| log.warn("endFrame: {t}", .{err});
+        self.setPrevDamage(prev_damage, self.damage.items);
+    }
+
+    /// Copy only the shadow rows that changed since this back buffer was
+    /// last front. Double buffering makes the back buffer two frames
+    /// stale, so the blit covers this frame's damage plus the previous
+    /// frame's. The dumb-buffer mapping is write-combining: a full-canvas
+    /// memcpy costs milliseconds, so band-limited copies keep small-damage
+    /// frames cheap (M8.1). Full-width row bands merge on the stack;
+    /// full_redraw or unmergeable damage copies the whole canvas.
+    fn blitShadowBands(
+        self: *Console,
+        fb: *video.Framebuffer,
+        shadow: *const video.Framebuffer,
+        prev_damage: *sess.DamageList,
+    ) void {
+        const full = video.Damage{ .x = 0, .y = 0, .w = shadow.width, .h = shadow.height };
+        if (self.full_redraw) {
+            fb.blitFrom(shadow.*, 0, 0, full);
+            self.setPrevDamage(prev_damage, &.{full});
+            return;
+        }
+        var iv: [256][2]u32 = undefined;
+        var n: usize = 0;
+        var overflow = false;
+        for (self.damage.items) |d| {
+            if (!bandInsert(&iv, &n, d, shadow.width)) {
+                overflow = true;
+                break;
+            }
+        }
+        if (!overflow) {
+            for (prev_damage.items) |d| {
+                if (!bandInsert(&iv, &n, d, shadow.width)) {
+                    overflow = true;
+                    break;
+                }
+            }
+        }
+        if (overflow) {
+            fb.blitFrom(shadow.*, 0, 0, full);
+            self.setPrevDamage(prev_damage, &.{full});
+            return;
+        }
+        if (n == 0) {
+            prev_damage.clearRetainingCapacity();
+            return;
+        }
+        // Insertion sort by y0 (n is small), then merge in place.
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            const band = iv[i];
+            var j: usize = i;
+            while (j > 0 and iv[j - 1][0] > band[0]) : (j -= 1) {
+                iv[j] = iv[j - 1];
+            }
+            iv[j] = band;
+        }
+        var m: usize = 0;
+        for (iv[0..n]) |band| {
+            if (m > 0 and band[0] <= iv[m - 1][1]) {
+                iv[m - 1][1] = @max(iv[m - 1][1], band[1]);
+            } else {
+                iv[m] = band;
+                m += 1;
+            }
+        }
+        for (iv[0..m]) |band| {
+            fb.blitFrom(shadow.*, 0, 0, .{
+                .x = 0,
+                .y = band[0],
+                .w = shadow.width,
+                .h = band[1] - band[0],
+            });
+        }
+        self.setPrevDamage(prev_damage, self.damage.items);
+    }
+
+    /// Append one full-width row band to the merge buffer; false when the
+    /// damage is not a full-width band or the buffer is full (the caller
+    /// falls back to a full-canvas blit).
+    fn bandInsert(iv: *[256][2]u32, n: *usize, d: video.Damage, width: u32) bool {
+        if (d.isEmpty()) return true;
+        if (d.x != 0 or d.w != width) return false;
+        if (n.* == iv.len) return false;
+        iv[n.*] = .{ d.y, d.y + d.h };
+        n.* += 1;
+        return true;
+    }
+
+    /// Record this frame's damage as the next frame's staleness history.
+    /// On allocation failure force a full blit next frame (conservative).
+    fn setPrevDamage(self: *Console, prev: *sess.DamageList, items: []const video.Damage) void {
+        prev.clearRetainingCapacity();
+        prev.appendSlice(self.alloc, items) catch |err| {
+            log.warn("prev damage: {t}", .{err});
+            self.full_redraw = true;
+        };
     }
 
     fn wakeDpms(self: *Console) void {
         if (self.dpms_off) {
-            self.backend.setDpms(.on) catch |err| log.warn("dpms on: {t}", .{err});
+            _ = self.setDpmsAll(.on);
             self.dpms_off = false;
             self.full_redraw = true;
         }
@@ -1279,33 +1636,14 @@ const Console = struct {
         if (self.mgr) |*m| try m.resize(self.cols, self.rows);
     }
 
-    /// Re-probe connectors on every open card after a hotplug event, re-select
-    /// modes, drop cards that lost all connectors, pick up newly added cards,
-    /// then rebuild the layout and redraw (M5.5). Runs with master held.
+    /// Re-probe connectors on every open card after a hotplug event,
+    /// re-select modes, drop outputs that lost their connector, pick up
+    /// newly added connectors and cards, then rebuild the layout and
+    /// redraw (M5.4/M5.5). Runs with master held.
     fn reprobe(self: *Console) void {
-        var i: usize = self.outputs.items.len;
-        while (i > 0) {
-            i -= 1;
-            const o = &self.outputs.items[i];
-            const sel = self.selectForCard(o.drm) catch |err| blk: {
-                log.warn("reprobe {s}: {t}", .{ o.drm.cardName(), err });
-                break :blk null;
-            };
-            if (sel) |s| {
-                const changed = o.ci != s.ci or o.mode.width_px != s.mode.width_px or
-                    o.mode.height_px != s.mode.height_px or o.mode.refresh_mhz != s.mode.refresh_mhz;
-                if (changed) {
-                    o.drm.setMode(s.ci, s.mi) catch |err|
-                        log.warn("re-modeset {s}: {t}", .{ o.drm.cardName(), err });
-                }
-                o.ci = s.ci;
-                o.mode = s.mode;
-                o.rotation = s.rotation;
-                o.name = s.name;
-            } else {
-                self.removeOutput(i);
-            }
-        }
+        var cards: [max_outputs]DrmOutput = undefined;
+        const n = self.uniqueCards(&cards);
+        for (cards[0..n]) |drm| self.reprobeCard(drm);
         self.addNewCards();
         if (self.outputs.items.len == 0) {
             log.warn("hotplug: no connected displays remain", .{});
@@ -1322,8 +1660,81 @@ const Console = struct {
         self.markDirty();
     }
 
+    /// Re-probe one card: select every enabled connected connector, drop
+    /// outputs whose connector went away or was deselected, re-modeset
+    /// changed ones and pick up newly appeared connectors (M5.4/M5.5).
+    /// One connectors() call serves both the selection and the removal
+    /// diff: it invalidates previously borrowed names, so outputs are
+    /// matched by their owned connector name.
+    fn reprobeCard(self: *Console, drm: DrmOutput) void {
+        const conns = drm.connectors() catch |err| {
+            log.warn("reprobe {s}: {t}", .{ drm.cardName(), err });
+            return;
+        };
+        var sel_buf: [max_outputs]ModeSelection = undefined;
+        const sels = self.selectForCard(drm, conns, &sel_buf) catch |err| {
+            log.warn("reprobe {s}: {t}", .{ drm.cardName(), err });
+            return;
+        };
+        var i = self.outputs.items.len;
+        while (i > 0) {
+            i -= 1;
+            const o = &self.outputs.items[i];
+            if (o.drm.cardPtr() != drm.cardPtr()) continue;
+            if (selectionFor(sels, o.name) != null) continue;
+            // Still-connected dropped connectors are disabled by their
+            // current index (probe indices shift when connectors vanish).
+            const drop_ci: ?usize = for (conns, 0..) |c, ci| {
+                if (c.connected and std.mem.eql(u8, c.name, o.name)) break ci;
+            } else null;
+            self.removeOutput(i, drop_ci);
+        }
+        // The last output of the card may have been dropped above, which
+        // deinits the backend (conns/sels borrow it). addNewCards reopens
+        // the card when new connectors are present.
+        if (!self.hasCardDrm(drm)) return;
+        for (sels) |s| {
+            if (self.outputForName(drm, s.name)) |o| {
+                const changed = o.mode.width_px != s.mode.width_px or
+                    o.mode.height_px != s.mode.height_px or
+                    o.mode.refresh_mhz != s.mode.refresh_mhz;
+                if (changed) {
+                    drm.setMode(s.ci, s.mi) catch |err|
+                        log.warn("re-modeset {s}/{s}: {t}", .{ drm.cardName(), s.name, err });
+                }
+                o.ci = s.ci;
+                o.mode = s.mode;
+                o.rotation = s.rotation;
+            } else {
+                if (self.outputs.items.len >= max_outputs) {
+                    log.warn("{s}: output limit ({d}) reached, skipping {s}", .{ drm.cardName(), max_outputs, s.name });
+                    continue;
+                }
+                drm.setMode(s.ci, s.mi) catch |err| {
+                    log.warn("hotplug modeset {s}/{s}: {t}", .{ drm.cardName(), s.name, err });
+                    continue;
+                };
+                const name = self.alloc.dupe(u8, s.name) catch |err| {
+                    log.warn("hotplug name {s}/{s}: {t}", .{ drm.cardName(), s.name, err });
+                    continue;
+                };
+                self.outputs.append(self.alloc, .{
+                    .drm = drm,
+                    .ci = s.ci,
+                    .name = name,
+                    .mode = s.mode,
+                    .rotation = s.rotation,
+                }) catch |err| {
+                    self.alloc.free(name);
+                    log.warn("hotplug output {s}/{s}: {t}", .{ drm.cardName(), s.name, err });
+                };
+            }
+        }
+    }
+
     /// Open any newly appeared GPU that the policy selects and that is not
-    /// already driven (GPU hotplug, M5.5). Best effort.
+    /// already driven (GPU hotplug, M5.5). openCard modesets every enabled
+    /// connector. Best effort.
     fn addNewCards(self: *Console) void {
         const candidates = drm2d.enumerateGpus(self.alloc, self.io) catch return;
         defer drm2d.freeGpuCandidates(self.alloc, candidates);
@@ -1331,25 +1742,7 @@ const Console = struct {
         const sel = drm2d.selectGpus(candidates, gpuPolicy(self.cfg.gpus), &buf);
         for (sel) |g| {
             if (self.hasCard(g.path)) continue;
-            self.openCard(g.path) catch |err| {
-                log.warn("hotplug open {s}: {t}", .{ g.path, err });
-                continue;
-            };
-            const o = &self.outputs.items[self.outputs.items.len - 1];
-            const s = self.selectForCard(o.drm) catch |err| blk: {
-                log.warn("hotplug probe {s}: {t}", .{ g.path, err });
-                break :blk null;
-            };
-            if (s) |ss| {
-                o.drm.setMode(ss.ci, ss.mi) catch |err|
-                    log.warn("hotplug modeset {s}: {t}", .{ g.path, err });
-                o.ci = ss.ci;
-                o.mode = ss.mode;
-                o.rotation = ss.rotation;
-                o.name = ss.name;
-            } else {
-                self.removeOutput(self.outputs.items.len - 1);
-            }
+            self.openCard(g.path) catch |err| log.warn("hotplug open {s}: {t}", .{ g.path, err });
         }
     }
 
@@ -1448,14 +1841,16 @@ const Console = struct {
             self.requestQuit();
             return;
         }
-        // Every output's event fd shares this handler (userdata = Console);
-        // drain them all — readEvents is non-blocking and returns when empty.
-        for (self.outputs.items) |o| {
-            o.drm.readEvents() catch |err| {
+        // Every card's event fd shares this handler (userdata = Console);
+        // drain each card once — readEvents is non-blocking and returns
+        // when empty.
+        var cards: [max_outputs]DrmOutput = undefined;
+        for (cards[0..self.uniqueCards(&cards)]) |drm| {
+            drm.readEvents() catch |err| {
                 log.warn("drm readEvents: {t}", .{err});
                 continue;
             };
-            if (o.drm.needsFullRedraw()) self.full_redraw = true;
+            if (drm.needsFullRedraw()) self.full_redraw = true;
         }
         self.renderIfDirty();
     }
@@ -1466,8 +1861,9 @@ const Console = struct {
         _ = events;
         const self: *Console = @ptrFromInt(ud);
         var changed = false;
-        for (self.outputs.items) |o| {
-            const hit = o.drm.pollHotplug() catch |err| blk: {
+        var cards: [max_outputs]DrmOutput = undefined;
+        for (cards[0..self.uniqueCards(&cards)]) |drm| {
+            const hit = drm.pollHotplug() catch |err| blk: {
                 log.warn("hotplug poll: {t}", .{err});
                 break :blk false;
             };
@@ -1496,12 +1892,22 @@ const Console = struct {
         _ = events;
         const reg: *PtyReg = @ptrFromInt(ud);
         const self = current orelse return;
-        self.pumpTerminal(reg.ts);
+        self.pumpTerminal(reg);
     }
 
-    fn pumpTerminal(self: *Console, ts: *terminal.TerminalSession) void {
-        ts.onPtyReadable() catch |err| log.warn("pty pump: {t}", .{err});
+    fn pumpTerminal(self: *Console, reg: *PtyReg) void {
+        const more = reg.ts.onPtyReadable() catch |err| {
+            log.warn("pty pump: {t}", .{err});
+            return;
+        };
         self.markDirty();
+        if (more) {
+            // Budget exhausted: re-arm the edge-triggered source. MOD
+            // re-reports readiness, so data left in the pty wakes the
+            // loop again instead of stalling until the next write.
+            self.lp.modifySource(reg.token, loop.ev.in_ | loop.ev.edge_triggered) catch |err|
+                log.warn("pty rearm: {t}", .{err});
+        }
     }
 
     fn onLocale1Event(lp: *loop.Loop, token: loop.Token, ud: usize, events: loop.Events) void {
@@ -1526,10 +1932,7 @@ const Console = struct {
         _ = expirations;
         const self: *Console = @ptrFromInt(ud);
         if (self.dpms_off) return;
-        self.backend.setDpms(.off) catch |err| {
-            log.warn("dpms off: {t}", .{err});
-            return;
-        };
+        if (!self.setDpmsAll(.off)) return;
         self.dpms_off = true;
     }
 
@@ -1789,6 +2192,15 @@ fn autoFontSize(mode: video.Mode) u16 {
     if (mode.height_mm == 0) return 16;
     const px = (@as(u64, mode.height_px) * 254) / (@as(u64, mode.height_mm) * 60);
     return @intCast(std.math.clamp(px, 8, 72));
+}
+
+/// The selection for a connector name, or null: the reprobe diff matches
+/// outputs to fresh selections by owned connector name (M5.4).
+fn selectionFor(sels: []const ModeSelection, name: []const u8) ?ModeSelection {
+    for (sels) |s| {
+        if (std.mem.eql(u8, s.name, name)) return s;
+    }
+    return null;
 }
 
 /// Map the config `--screen` orientation to the layout rotation (M5.4).
@@ -2128,6 +2540,68 @@ test "multi-monitor wiring: mmMode + computeLayout shared grid for two outputs" 
     const largest = layout.computeLayout(&conns, cell, mmMode(.largest), &plans);
     try std.testing.expectEqual(@as(u32, 240), largest.cols);
     try std.testing.expectEqual(@as(u32, 67), largest.rows);
+}
+
+test "selectionFor: matches fresh selections by connector name" {
+    const mode = video.Mode{ .width_px = 1920, .height_px = 1080, .refresh_mhz = 60000, .width_mm = 530, .height_mm = 300 };
+    const sels = [_]ModeSelection{
+        .{ .ci = 0, .mi = 1, .mode = mode, .rotation = .normal, .name = "HDMI-A-1" },
+        .{ .ci = 2, .mi = 0, .mode = mode, .rotation = .left, .name = "DP-1" },
+    };
+    try std.testing.expectEqual(@as(usize, 2), selectionFor(&sels, "DP-1").?.ci);
+    try std.testing.expectEqual(layout.Rotation.left, selectionFor(&sels, "DP-1").?.rotation);
+    try std.testing.expect(selectionFor(&sels, "VGA-1") == null);
+    try std.testing.expect(selectionFor(&.{}, "DP-1") == null);
+}
+
+/// Bookkeeping-only console: the fake card pointers below are never
+/// dereferenced (identity comparisons only), so no DRM device is needed.
+fn testConsole() Console {
+    return .{ .alloc = std.testing.allocator, .io = undefined, .cfg = undefined };
+}
+
+test "uniqueCards: dedupes shared card backends in first-output order" {
+    var c = testConsole();
+    defer c.outputs.deinit(std.testing.allocator);
+    const card0: *drm2d.Drm2d = @ptrFromInt(0x1000);
+    const card1: *drm2d.Drm2d = @ptrFromInt(0x2000);
+    const card2: *drm3d.Drm3d = @ptrFromInt(0x3000);
+    try c.outputs.append(std.testing.allocator, .{ .drm = .{ .drm2d = card0 }, .name = "HDMI-A-1" });
+    try c.outputs.append(std.testing.allocator, .{ .drm = .{ .drm2d = card1 }, .name = "HDMI-A-1" });
+    try c.outputs.append(std.testing.allocator, .{ .drm = .{ .drm2d = card0 }, .name = "DP-1" });
+    try c.outputs.append(std.testing.allocator, .{ .drm = .{ .drm3d = card2 }, .name = "eDP-1" });
+    var cards: [max_outputs]DrmOutput = undefined;
+    const n = c.uniqueCards(&cards);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expect(cards[0].cardPtr() == @as(*anyopaque, card0));
+    try std.testing.expect(cards[1].cardPtr() == @as(*anyopaque, card1));
+    try std.testing.expect(cards[2].cardPtr() == @as(*anyopaque, card2));
+}
+
+test "outputForName: scoped to the card, matched by connector name" {
+    var c = testConsole();
+    defer c.outputs.deinit(std.testing.allocator);
+    const card0: *drm2d.Drm2d = @ptrFromInt(0x1000);
+    const card1: *drm2d.Drm2d = @ptrFromInt(0x2000);
+    try c.outputs.append(std.testing.allocator, .{ .drm = .{ .drm2d = card0 }, .name = "HDMI-A-1" });
+    try c.outputs.append(std.testing.allocator, .{ .drm = .{ .drm2d = card0 }, .name = "DP-1" });
+    try c.outputs.append(std.testing.allocator, .{ .drm = .{ .drm2d = card1 }, .name = "DP-1" });
+    const o = c.outputForName(.{ .drm2d = card0 }, "DP-1").?;
+    try std.testing.expectEqualStrings("DP-1", o.name);
+    try std.testing.expect(o.drm.cardPtr() == @as(*anyopaque, card0));
+    // The same connector name on another card is a different output.
+    const o1 = c.outputForName(.{ .drm2d = card1 }, "DP-1").?;
+    try std.testing.expect(o1 != o);
+    try std.testing.expect(c.outputForName(.{ .drm2d = card0 }, "VGA-1") == null);
+}
+
+test "hasCardDrm: tracks whether any output still references the card" {
+    var c = testConsole();
+    defer c.outputs.deinit(std.testing.allocator);
+    const card0: *drm2d.Drm2d = @ptrFromInt(0x1000);
+    try std.testing.expect(!c.hasCardDrm(.{ .drm2d = card0 }));
+    try c.outputs.append(std.testing.allocator, .{ .drm = .{ .drm2d = card0 }, .name = "HDMI-A-1" });
+    try std.testing.expect(c.hasCardDrm(.{ .drm2d = card0 }));
 }
 
 // ---------------------------------------------------------------------------

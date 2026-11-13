@@ -34,7 +34,7 @@ Last updated: 2026-11-13. This file is ticked as features land; `nix flake check
 | libinput keyboard, xkbcommon, key encoder | ✅ | M1.6 |
 | mouse selection/copy/paste/reporting, natural-scrolling, soft cursor | ✅ | M2.3 (545 tests) |
 | xkb-model/layout/variant/options/keymap/compose-file/repeat-* | ✅ | M6.5 |
-| locale1 live keymap follow | ✅ | M6.5; T4 m6-seats S1 |
+| locale1 live keymap follow + startup current layout | ✅ | M6.5; startup readCurrent/overlay wired in main.zig (cfg wins, locale1 fills unset), read-vs-subscribe race closed; T4 m6-seats S1 |
 | compose | ✅ | T4 m6-seats S2 |
 | graceful shutdown (SIGTERM teardown) | ✅ | libinput stores `struct libinput_interface` by pointer: `Real.udevCreateContext` now passes the static `interface` through instead of a stack copy that dangled until `libinput_unref` → `evdev_device_remove` → `close_restricted` jumped through the reused stack slot (segfault on `systemctl stop/restart`, SIGKILL "worked"); `Input.deinit` idempotent; T1 interface-lifetime/refcount/idempotency tests + T3 stop/start/restart VM repro (before: segfault, after: clean) |
 | absolute-pointer transform (tablets) | ⬜ | libinput _transformed getters (M5.7 note) |

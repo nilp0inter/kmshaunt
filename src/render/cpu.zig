@@ -31,11 +31,13 @@
 //!
 //! # Text pipeline (M3)
 //!
-//! Per dirty row, pass 1 paints backgrounds (and block cursors) exactly as
-//! in M1. Pass 2 collects the row into `RowCell`s: the FULL grapheme
-//! cluster from `GRAPHEMES_UTF8` is decoded into codepoints, colors are
-//! resolved once, and each base codepoint is assigned a face-table slot
-//! (style variant first, then the per-codepoint fontconfig fallback).
+//! The redraw set is collected ONCE per frame into a row-major snapshot
+//! (a single render-state cell walk): the FULL grapheme cluster from
+//! `GRAPHEMES_UTF8` is decoded into codepoints, colors are resolved once,
+//! and each base codepoint is assigned a face-table slot (style variant
+//! first, then the per-codepoint fontconfig fallback). Backgrounds paint
+//! from the snapshot and the text pass reuses it, so the per-cell C API
+//! is walked once per frame, not twice (M8.1).
 //! `shaper.groupRuns` splits the row into same-face/same-style runs with
 //! the cursor isolated; each run is shaped with HarfBuzz and the glyphs
 //! are mapped back to cells through their cluster values:
@@ -172,14 +174,27 @@ pub const CpuRenderer = struct {
     /// negative results. Discovery caches the fontconfig query itself;
     /// this cache avoids re-sizing and re-wrapping the handle per cell.
     fallback_faces: std.AutoHashMapUnmanaged(u21, ?discovery.Face) = .{},
-    /// Per-row scratch, sized to `cols` by resize.
+    /// Per-row collection scratch, sized to `cols` by resize. During the
+    /// text pass `row_cells`/`descs` point at the frame snapshot instead.
+    row_scratch: []RowCell = &.{},
+    desc_scratch: []shaper.CellDesc = &.{},
+    /// Current row view: the scratch while collecting, a `grid_cells` /
+    /// `grid_descs` row while drawing text. Never freed directly.
     row_cells: []RowCell = &.{},
     descs: []shaper.CellDesc = &.{},
     runs_buf: []shaper.Run = &.{},
-    /// Flat codepoint storage for the current row's clusters.
+    /// M8.1 frame snapshot: every redraw row collected once per frame,
+    /// row-major rows×cols; row_lens[y] is the collected cell count.
+    grid_cells: []RowCell = &.{},
+    grid_descs: []shaper.CellDesc = &.{},
+    row_lens: []u16 = &.{},
+    /// Flat codepoint storage for the whole frame's clusters (cleared once
+    /// per frame; RowCell.cps_start indexes into it).
     row_cps: std.ArrayListUnmanaged(u21) = .empty,
     /// Scratch CellDesc buffer for shaping one complex cluster.
     cluster_descs: std.ArrayListUnmanaged(shaper.CellDesc) = .empty,
+    /// M8.1: shaped complex clusters, reused across cells/frames.
+    cluster_cache: ClusterCache,
 
     // ---- M4 kitty image state ----
 
@@ -223,6 +238,7 @@ pub const CpuRenderer = struct {
     const RowCell = struct {
         style: vt.Style,
         fg: u32,
+        bg: u32,
         /// Offset of the cluster's codepoints in `row_cps`.
         cps_start: u32,
         /// Number of codepoints in the cluster (0 = empty cell).
@@ -248,6 +264,7 @@ pub const CpuRenderer = struct {
             .atlas = try atlas.GlyphAtlas.init(allocator, opts.atlas_width, opts.atlas_height),
             .image_cache = image.ImageCache.init(allocator, image_cache_limit_bytes),
             .shaper = shaper.Shaper.init(allocator),
+            .cluster_cache = ClusterCache.init(allocator),
             .style_faces = .{ face.*, null, null, null },
         };
         errdefer self.deinit();
@@ -267,12 +284,16 @@ pub const CpuRenderer = struct {
         if (self.scratch.len > 0) self.allocator.free(self.scratch);
         self.sprite_cps.deinit(self.allocator);
         self.shaper.deinit();
+        self.cluster_cache.deinit();
         self.features.deinit(self.allocator);
         self.faces.deinit(self.allocator);
         self.fallback_faces.deinit(self.allocator);
-        if (self.row_cells.len > 0) self.allocator.free(self.row_cells);
-        if (self.descs.len > 0) self.allocator.free(self.descs);
+        if (self.row_scratch.len > 0) self.allocator.free(self.row_scratch);
+        if (self.desc_scratch.len > 0) self.allocator.free(self.desc_scratch);
         if (self.runs_buf.len > 0) self.allocator.free(self.runs_buf);
+        if (self.grid_cells.len > 0) self.allocator.free(self.grid_cells);
+        if (self.grid_descs.len > 0) self.allocator.free(self.grid_descs);
+        if (self.row_lens.len > 0) self.allocator.free(self.row_lens);
         self.row_cps.deinit(self.allocator);
         self.cluster_descs.deinit(self.allocator);
         self.image_cache.deinit();
@@ -295,11 +316,21 @@ pub const CpuRenderer = struct {
             self.metrics.cell_w = cell_w;
             self.metrics.cell_h = cell_h;
         }
-        if (cols != self.row_cells.len) {
-            self.row_cells = try self.allocator.realloc(self.row_cells, cols);
-            self.descs = try self.allocator.realloc(self.descs, cols);
+        if (cols != self.row_scratch.len) {
+            self.row_scratch = try self.allocator.realloc(self.row_scratch, cols);
+            self.desc_scratch = try self.allocator.realloc(self.desc_scratch, cols);
             self.runs_buf = try self.allocator.realloc(self.runs_buf, cols);
         }
+        const grid_n = @as(usize, cols) * rows;
+        if (grid_n != self.grid_cells.len) {
+            self.grid_cells = try self.allocator.realloc(self.grid_cells, grid_n);
+            self.grid_descs = try self.allocator.realloc(self.grid_descs, grid_n);
+        }
+        if (rows != self.row_lens.len) {
+            self.row_lens = try self.allocator.realloc(self.row_lens, rows);
+        }
+        self.row_cells = self.row_scratch;
+        self.descs = self.desc_scratch;
         if (rows != self.redraw_rows.len) {
             self.redraw_rows = try self.allocator.realloc(self.redraw_rows, rows);
             self.blink_rows = try self.allocator.realloc(self.blink_rows, rows);
@@ -392,11 +423,13 @@ pub const CpuRenderer = struct {
         // Layer interleaving (ghostty-vt-api.md §9.6): below_background
         // -> cell backgrounds -> below_text -> text -> above_text. All
         // backgrounds land before any text, so a wide glyph can overflow
-        // into its continuation cell without being overpainted.
+        // into its continuation cell without being overpainted. The
+        // background pass collects the whole redraw set into the frame
+        // snapshot; the text pass draws from it (one cell walk, M8.1).
         try self.compositeImages(f, .below_background);
-        try self.drawRows(f, state, opts, cursor, .background);
+        try self.collectAndDrawBackgrounds(f, state, opts, cursor);
         try self.compositeImages(f, .below_text);
-        try self.drawRows(f, state, opts, cursor, .text);
+        try self.drawRowsText(f, opts, cursor);
         try self.compositeImages(f, .above_text);
 
         // Damage: one full-width band per redrawn row. Placements are
@@ -427,81 +460,73 @@ pub const CpuRenderer = struct {
     // Row walk
     // ------------------------------------------------------------------
 
-    /// One row pass over the redraw set. `next` visits clean rows too:
-    /// rows under kitty placements repaint even when the terminal state
-    /// is clean (animation frames, moved/deleted images).
-    fn drawRows(
+    /// Collect every redraw row into the frame snapshot and paint its
+    /// backgrounds + block cursors. This is the frame's ONLY render-state
+    /// cell walk: the text pass reads the snapshot, halving the per-cell
+    /// C API cost (M8.1). `next` visits clean rows too: rows under kitty
+    /// placements repaint even when the terminal state is clean.
+    fn collectAndDrawBackgrounds(
         self: *CpuRenderer,
         f: *Framebuffer,
         state: *vt.RenderState,
         opts: RenderOpts,
         cursor: CursorDraw,
-        pass: RowPass,
     ) !void {
+        // Collection writes into the per-row scratch; the text pass
+        // re-points row_cells/descs at the snapshot rows.
+        self.row_cells = self.row_scratch;
+        self.descs = self.desc_scratch;
+        self.row_cps.clearRetainingCapacity();
+        @memset(self.row_lens, 0);
+        const cw = self.metrics.cell_w;
+        const ch = self.metrics.cell_h;
         var rows = try state.rowsIter();
         while (try rows.next()) |row| {
             const vy = try row.viewportY();
             if (vy < 0 or vy >= self.rows) continue; // overscan row
             const y: u16 = @intCast(vy);
             if (!self.redraw_rows[y]) continue;
-            switch (pass) {
-                .background => try self.drawRowBackground(&row, y, f, opts, cursor),
-                .text => try self.drawRowTextPass(&row, y, f, opts, cursor),
+            const n = try self.collectRow(&row, y, opts, cursor);
+            self.row_lens[y] = @intCast(n);
+            const base = @as(usize, y) * self.cols;
+            @memcpy(self.grid_cells[base..][0..n], self.row_scratch[0..n]);
+            @memcpy(self.grid_descs[base..][0..n], self.desc_scratch[0..n]);
+            const y_px: i32 = @as(i32, y) * ch;
+            for (self.grid_cells[base..][0..n], 0..) |*rc, x| {
+                const x_px: i32 = @as(i32, @intCast(x)) * cw;
+                fillCell(f, x_px, y_px, cw, ch, rc.bg);
+                if (rc.is_cursor and cursor.style == .block)
+                    deco.drawCursor(f.*, x_px, y_px, cw, ch, .block, cursor.color, true);
             }
         }
     }
 
-    const RowPass = enum { background, text };
-
-    /// Backgrounds + block cursors (a block cursor sits under the glyph).
-    fn drawRowBackground(
+    /// Draw shaped text, decorations and bar/underline cursors for every
+    /// redraw row from the frame snapshot (no render-state access).
+    fn drawRowsText(
         self: *CpuRenderer,
-        row: *const vt.Row,
-        y: u16,
         f: *Framebuffer,
         opts: RenderOpts,
         cursor: CursorDraw,
     ) !void {
         const cw = self.metrics.cell_w;
         const ch = self.metrics.cell_h;
-        const y_px: i32 = @as(i32, y) * ch;
-        var cells = try row.cells();
-        var x: u16 = 0;
-        while (try cells.next()) |cell| {
-            if (x >= self.cols) break;
-            const x_px: i32 = @as(i32, x) * cw;
-            const cc = resolveColors(&cell, opts);
-            fillCell(f, x_px, y_px, cw, ch, cc.bg);
-            if (cursor.active and cursor.style == .block and
-                x == cursor.x and y == cursor.y)
-            {
-                deco.drawCursor(f.*, x_px, y_px, cw, ch, .block, cursor.color, true);
+        for (self.redraw_rows, 0..) |redraw, yi| {
+            if (!redraw) continue;
+            const y: u16 = @intCast(yi);
+            const n = self.row_lens[y];
+            const base = @as(usize, y) * self.cols;
+            self.row_cells = self.grid_cells[base..][0..self.cols];
+            self.descs = self.grid_descs[base..][0..self.cols];
+            const y_px: i32 = @as(i32, y) * ch;
+            try self.drawRowText(f, y_px, n);
+            for (self.row_cells[0..n], 0..) |*rc, x| {
+                const x_px: i32 = @as(i32, @intCast(x)) * cw;
+                if (!rc.invisible)
+                    self.drawDecorations(f, x_px, y_px, rc.style, rc.fg, opts);
+                if (rc.is_cursor and cursor.style != .block)
+                    deco.drawCursor(f.*, x_px, y_px, cw, ch, cursorStyle(cursor.style), cursor.color, true);
             }
-            x += 1;
-        }
-    }
-
-    /// Collect the row, draw shaped text, then decorations and
-    /// bar/underline cursors (per cell, text first, as in M1).
-    fn drawRowTextPass(
-        self: *CpuRenderer,
-        row: *const vt.Row,
-        y: u16,
-        f: *Framebuffer,
-        opts: RenderOpts,
-        cursor: CursorDraw,
-    ) !void {
-        const cw = self.metrics.cell_w;
-        const ch = self.metrics.cell_h;
-        const y_px: i32 = @as(i32, y) * ch;
-        const n = try self.collectRow(row, y, opts, cursor);
-        try self.drawRowText(f, y_px, n);
-        for (self.row_cells[0..n], 0..) |*rc, x| {
-            const x_px: i32 = @as(i32, @intCast(x)) * cw;
-            if (!rc.invisible)
-                self.drawDecorations(f, x_px, y_px, rc.style, rc.fg, opts);
-            if (rc.is_cursor and cursor.style != .block)
-                deco.drawCursor(f.*, x_px, y_px, cw, ch, cursorStyle(cursor.style), cursor.color, true);
         }
     }
 
@@ -706,10 +731,11 @@ pub const CpuRenderer = struct {
         return true;
     }
 
-    /// Snapshot the row's cells into `row_cells`/`descs`, decoding every
-    /// full grapheme cluster into `row_cps` (the render state's borrowed
-    /// text dies on the next `cells.next`). Colors resolve once per cell;
-    /// the block-cursor overlay applies to the glyph foreground.
+    /// Snapshot the row's cells into `row_cells`/`descs`, appending every
+    /// full grapheme cluster's codepoints to the frame-global `row_cps`
+    /// (the render state's borrowed text dies on the next `cells.next`;
+    /// the caller clears `row_cps` once per frame). Colors resolve once
+    /// per cell; the block-cursor overlay applies to the glyph foreground.
     fn collectRow(
         self: *CpuRenderer,
         row: *const vt.Row,
@@ -717,7 +743,6 @@ pub const CpuRenderer = struct {
         opts: RenderOpts,
         cursor: CursorDraw,
     ) !usize {
-        self.row_cps.clearRetainingCapacity();
         const blink_off = if (opts.cursor_blink_on) |on| !on else false;
         var row_blink = false;
         var cells = try row.cells();
@@ -762,6 +787,7 @@ pub const CpuRenderer = struct {
             self.row_cells[x] = .{
                 .style = cell.style,
                 .fg = fg,
+                .bg = cc.bg,
                 .cps_start = cps_start,
                 .n_cps = n_cps,
                 .face_id = face_id,
@@ -930,6 +956,13 @@ pub const CpuRenderer = struct {
         const cps = self.row_cps.items[rc.cps_start..][0..rc.n_cps];
         const style_flags = @as(u8, @intFromBool(rc.style.flags.bold)) |
             (@as(u8, @intFromBool(rc.style.flags.italic)) << 1);
+        const max_w = @as(u32, rc.width) * self.metrics.cell_w;
+        // M8.1: complex clusters repeat heavily (emoji, flags, marks);
+        // reuse the shaped glyphs instead of re-shaping per cell.
+        if (self.cluster_cache.get(rc.face_id, style_flags, cps)) |e| {
+            try self.drawClusterGlyphs(f, x_px, y_px, rc, e.glyphs, e.direction, max_w);
+            return;
+        }
         self.cluster_descs.clearRetainingCapacity();
         for (cps) |cp| {
             try self.cluster_descs.append(self.allocator, .{
@@ -942,15 +975,28 @@ pub const CpuRenderer = struct {
         const slot = &self.faces.items[rc.face_id];
         const shaped = try self.shaper.shape(@ptrCast(slot.face.ft_face), self.cluster_descs.items, self.features.items);
         defer self.allocator.free(shaped.glyphs);
-        const max_w = @as(u32, rc.width) * self.metrics.cell_w;
-        // RTL clusters arrive in visual order: the pen starts at the right
-        // edge and each advance moves it left before the glyph is drawn.
-        var pen: f32 = if (shaped.direction == .rtl) @floatFromInt(max_w) else 0;
-        for (shaped.glyphs) |g| {
-            if (shaped.direction == .rtl) pen -= g.x_advance;
+        self.cluster_cache.put(rc.face_id, style_flags, cps, shaped.glyphs, shaped.direction) catch |err|
+            log.warn("cluster cache: {t}", .{err});
+        try self.drawClusterGlyphs(f, x_px, y_px, rc, shaped.glyphs, shaped.direction, max_w);
+    }
+
+    /// Pen-walk a shaped cluster's glyphs inside the cell (LTR or RTL).
+    fn drawClusterGlyphs(
+        self: *CpuRenderer,
+        f: *Framebuffer,
+        x_px: i32,
+        y_px: i32,
+        rc: *const RowCell,
+        glyphs: []const shaper.ShapedGlyph,
+        direction: shaper.Direction,
+        max_w: u32,
+    ) !void {
+        var pen: f32 = if (direction == .rtl) @floatFromInt(max_w) else 0;
+        for (glyphs) |g| {
+            if (direction == .rtl) pen -= g.x_advance;
             const gx = x_px + roundI32(pen);
             try self.drawGlyph(f, gx, y_px, rc.face_id, g, max_w, rc.fg);
-            if (shaped.direction != .rtl) pen += g.x_advance;
+            if (direction != .rtl) pen += g.x_advance;
         }
     }
 
@@ -1337,6 +1383,90 @@ pub const CpuRenderer = struct {
         // it has already update()d (module comment).
         const rs: *vt.RenderState = @ptrCast(@alignCast(@constCast(state)));
         return cast(ptr).renderFrame(rs, f, damage, opts);
+    }
+};
+
+/// M8.1 shaped-cluster cache: complex grapheme clusters (emoji ZWJ
+/// sequences, flags, combining marks) repeat heavily in terminal output;
+/// shaping each occurrence with HarfBuzz dominated unicode frame cost.
+/// Entries own copies of the codepoints and shaped glyphs, keyed by a
+/// (face, style, codepoints) content hash with full verification on hit.
+/// Bounded: cleared wholesale when full — a terminal's distinct-cluster
+/// working set is small. Valid for the renderer's lifetime (face table
+/// and features are stable; setFontSize re-initializes the renderer).
+const ClusterCache = struct {
+    const Entry = struct {
+        face_id: u16,
+        style_flags: u8,
+        cps: []u21,
+        glyphs: []shaper.ShapedGlyph,
+        direction: shaper.Direction,
+    };
+    const cap = 1024;
+
+    allocator: std.mem.Allocator,
+    map: std.AutoHashMap(u64, u32),
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+
+    fn init(allocator: std.mem.Allocator) ClusterCache {
+        return .{
+            .allocator = allocator,
+            .map = std.AutoHashMap(u64, u32).init(allocator),
+        };
+    }
+
+    fn deinit(self: *ClusterCache) void {
+        self.clear();
+        self.map.deinit();
+        self.entries.deinit(self.allocator);
+    }
+
+    fn clear(self: *ClusterCache) void {
+        for (self.entries.items) |e| {
+            self.allocator.free(e.cps);
+            self.allocator.free(e.glyphs);
+        }
+        self.entries.clearRetainingCapacity();
+        self.map.clearRetainingCapacity();
+    }
+
+    fn get(self: *const ClusterCache, face_id: u16, style_flags: u8, cps: []const u21) ?*const Entry {
+        const idx = self.map.get(hash(face_id, style_flags, cps)) orelse return null;
+        const e = &self.entries.items[idx];
+        if (e.face_id != face_id or e.style_flags != style_flags or
+            !std.mem.eql(u21, e.cps, cps)) return null;
+        return e;
+    }
+
+    fn put(
+        self: *ClusterCache,
+        face_id: u16,
+        style_flags: u8,
+        cps: []const u21,
+        glyphs: []const shaper.ShapedGlyph,
+        direction: shaper.Direction,
+    ) !void {
+        if (self.entries.items.len >= cap) self.clear();
+        const cps_copy = try self.allocator.dupe(u21, cps);
+        errdefer self.allocator.free(cps_copy);
+        const glyphs_copy = try self.allocator.dupe(shaper.ShapedGlyph, glyphs);
+        errdefer self.allocator.free(glyphs_copy);
+        try self.entries.append(self.allocator, .{
+            .face_id = face_id,
+            .style_flags = style_flags,
+            .cps = cps_copy,
+            .glyphs = glyphs_copy,
+            .direction = direction,
+        });
+        try self.map.put(hash(face_id, style_flags, cps), @intCast(self.entries.items.len - 1));
+    }
+
+    fn hash(face_id: u16, style_flags: u8, cps: []const u21) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&face_id));
+        h.update(std.mem.asBytes(&style_flags));
+        h.update(std.mem.sliceAsBytes(cps));
+        return h.final();
     }
 };
 
@@ -2128,7 +2258,7 @@ test "cpu: color emoji renders premultiplied BGRA (M3.5)" {
     var damage2: DamageList = .empty;
     defer damage2.deinit(a);
     try env.renderNoCursor(&damage2);
-    const rc1 = env.cpu.row_cells[0]; // row scratch now holds row 1
+    const rc1 = env.cpu.row_cells[0]; // row view now holds row 1
     try testing.expectEqual(@as(u32, 1), rc1.n_cps);
     try testing.expectEqual(@as(u8, 2), rc1.width);
     try testing.expectEqual(@as(u21, 0x1F1EA), env.cpu.row_cps.items[rc1.cps_start]);

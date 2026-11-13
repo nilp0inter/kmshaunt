@@ -83,7 +83,10 @@ const CInterop = struct {
         // ship; static linking keeps the binary standalone.
         var vt_c: ?*std.Build.Module = null;
         var ghostty_vt: ?*std.Build.Step.Compile = null;
-        if (b.lazyDependency("ghostty", .{})) |dep| {
+        // Propagate target/optimize: ghostty reads its own -Doptimize
+        // (Config.zig standardOptimizeOption), so an empty options struct
+        // builds libghostty-vt in Debug — ~30x slower vt.write (M8.1).
+        if (b.lazyDependency("ghostty", .{ .target = target, .optimize = optimize })) |dep| {
             const vt = translateC(b, target, optimize, "src/vt-c.h", &.{});
             vt.addIncludePath(dep.path("include"));
             vt_c = vt.createModule();

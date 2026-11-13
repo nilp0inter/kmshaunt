@@ -152,11 +152,17 @@ completes (119.8 s; previously it did not finish within 900 s):
 | unicode | 61.3 | 4.6 | 0.08 |
 
 Grid 50x160 on both consoles this run. All scrolling benchmarks are at
-parity or better; the line-scrolling case that exposed the 33x gap is at
-parity. The remaining gaps are render/present efficiency, not loop
-blocking: the cell benchmarks are bounded by the write-combining
-back-buffer blit (~7 ms/frame), and unicode by per-cluster shaping
-(the shaped-cluster cache above targets it; verification pending).
+parity (0.94-1.11x across runs); the line-scrolling case that exposed
+the 33x gap is at parity. The remaining gaps are render/present
+efficiency, not loop blocking: the cell benchmarks are bounded by the
+write-combining back-buffer blit (~7 ms/frame), and unicode by glyph
+rasterization/compositing of color emoji. The shaped-cluster cache was
+verified on a re-run: unicode moved only 4.6 -> 5.3 MiB/s, so the
+synthetic unicode payload is rasterization-bound, not shaping-bound
+(the cache still removes repeat shaping for real-world repeating
+clusters). Closing the cell/unicode gaps fully needs a faster
+back-buffer copy (non-temporal stores) and emoji raster caching —
+follow-up render-efficiency work, separate from the M8.1 blocking fix.
 Peak RSS after seq: kmscon 59,088 kB, kmshaunt 38,756 kB.
 
 Raw data: test output `kmscon.dat` (221 lines of per-sample ms),

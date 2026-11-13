@@ -694,3 +694,146 @@ test "init failure paths clean up" {
         try expectEqual(Call.unref, fake.calls.items[2]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Startup one-shot read (Locale1.readCurrent) and config overlay
+// ---------------------------------------------------------------------------
+
+test "readCurrent returns the current properties without installing a match" {
+    const fake = try Fake.create(std.testing.allocator);
+    defer fake.destroy();
+    fake.prop_values = .{ "pc105", "de", "nodeadkeys", "ctrl:nocaps" };
+    current_fake = fake;
+
+    var current = try Locale1.readCurrent(std.testing.allocator, fake.ops());
+    defer current.deinit();
+
+    const opts = current.options();
+    try expectEqualStrings("pc105", opts.model);
+    try expectEqualStrings("de", opts.layout);
+    try expectEqualStrings("nodeadkeys", opts.variant);
+    try expectEqualStrings("ctrl:nocaps", opts.options);
+
+    // One-shot: connect, read the four properties, drop the bus. No match.
+    try expectEqual(@as(usize, 6), fake.calls.items.len);
+    try expectEqual(Call.default_system, fake.calls.items[0]);
+    for (fake.calls.items[1..5]) |call| try expectEqual(Call.get_property, call);
+    try expectEqual(Call.unref, fake.calls.items[5]);
+    try expect(fake.match_cb == null);
+    try expect(fake.match_string == null);
+    for (fake.prop_reads) |count| try expectEqual(@as(usize, 1), count);
+}
+
+test "readCurrent: absent localed yields empty options, not an error" {
+    const fake = try Fake.create(std.testing.allocator);
+    defer fake.destroy();
+    // null = every property read fails (e.g. localed not running).
+    fake.prop_values = .{ null, null, null, null };
+    current_fake = fake;
+
+    var current = try Locale1.readCurrent(std.testing.allocator, fake.ops());
+    defer current.deinit();
+
+    const opts = current.options();
+    try expectEqual(@as(usize, 0), opts.model.len);
+    try expectEqual(@as(usize, 0), opts.layout.len);
+    try expectEqual(@as(usize, 0), opts.variant.len);
+    try expectEqual(@as(usize, 0), opts.options.len);
+    // Still a clean one-shot: the bus reference is dropped.
+    try expectEqual(Call.unref, fake.calls.items[fake.calls.items.len - 1]);
+}
+
+test "readCurrent: empty properties yield empty options" {
+    const fake = try Fake.create(std.testing.allocator);
+    defer fake.destroy();
+    fake.prop_values = .{ "", "", "", "" };
+    current_fake = fake;
+
+    var current = try Locale1.readCurrent(std.testing.allocator, fake.ops());
+    defer current.deinit();
+
+    const opts = current.options();
+    try expectEqual(@as(usize, 0), opts.model.len);
+    try expectEqual(@as(usize, 0), opts.layout.len);
+    try expectEqual(@as(usize, 0), opts.variant.len);
+    try expectEqual(@as(usize, 0), opts.options.len);
+}
+
+test "readCurrent: partial properties keep unset fields empty" {
+    const fake = try Fake.create(std.testing.allocator);
+    defer fake.destroy();
+    fake.prop_values = .{ null, "de", "", "ctrl:nocaps" };
+    current_fake = fake;
+
+    var current = try Locale1.readCurrent(std.testing.allocator, fake.ops());
+    defer current.deinit();
+
+    const opts = current.options();
+    try expectEqualStrings("", opts.model);
+    try expectEqualStrings("de", opts.layout);
+    try expectEqualStrings("", opts.variant);
+    try expectEqualStrings("ctrl:nocaps", opts.options);
+}
+
+test "readCurrent: bus unavailable is an error and installs nothing" {
+    const fake = try Fake.create(std.testing.allocator);
+    defer fake.destroy();
+    fake.default_system_rc = -1;
+    current_fake = fake;
+
+    try expectError(error.BusUnavailable, Locale1.readCurrent(std.testing.allocator, fake.ops()));
+    try expectEqual(@as(usize, 1), fake.calls.items.len);
+    try expectEqual(Call.default_system, fake.calls.items[0]);
+    try expect(fake.match_cb == null);
+}
+
+test "overlay: explicit config wins, unset fields take locale1, keymap_file preserved" {
+    const TestOptions = struct {
+        model: ?[]const u8 = null,
+        layout: ?[]const u8 = null,
+        variant: ?[]const u8 = null,
+        options: ?[]const u8 = null,
+        keymap_file: ?[]const u8 = null,
+    };
+    const loc = locale1.KeymapOptions{
+        .model = "pc105",
+        .layout = "de",
+        .variant = "nodeadkeys",
+        .options = "ctrl:nocaps",
+    };
+
+    // All-unset config: every field takes locale1; keymap_file carried through.
+    const filled = loc.overlay(TestOptions, .{ .keymap_file = "/path/keymap.xkb" });
+    try expectEqualStrings("pc105", filled.model.?);
+    try expectEqualStrings("de", filled.layout.?);
+    try expectEqualStrings("nodeadkeys", filled.variant.?);
+    try expectEqualStrings("ctrl:nocaps", filled.options.?);
+    try expectEqualStrings("/path/keymap.xkb", filled.keymap_file.?);
+
+    // Explicit config wins over locale1.
+    const explicit = loc.overlay(TestOptions, .{ .layout = "us", .options = "terminate:ctrl_alt_bksp" });
+    try expectEqualStrings("pc105", explicit.model.?);
+    try expectEqualStrings("us", explicit.layout.?);
+    try expectEqualStrings("nodeadkeys", explicit.variant.?);
+    try expectEqualStrings("terminate:ctrl_alt_bksp", explicit.options.?);
+
+    // Empty-string config counts as unset and is filled from locale1.
+    const empty_cfg = loc.overlay(TestOptions, .{ .layout = "" });
+    try expectEqualStrings("de", empty_cfg.layout.?);
+
+    // Empty locale1 fields leave an unset config unset (xkbcommon default).
+    const empty_loc = locale1.KeymapOptions{};
+    const untouched = empty_loc.overlay(TestOptions, .{});
+    try expectEqual(@as(?[]const u8, null), untouched.model);
+    try expectEqual(@as(?[]const u8, null), untouched.layout);
+    try expectEqual(@as(?[]const u8, null), untouched.variant);
+    try expectEqual(@as(?[]const u8, null), untouched.options);
+
+    // Partial locale1: only the set fields fill.
+    const partial = locale1.KeymapOptions{ .layout = "fr" };
+    const partial_cfg = partial.overlay(TestOptions, .{ .model = "pc104" });
+    try expectEqualStrings("pc104", partial_cfg.model.?);
+    try expectEqualStrings("fr", partial_cfg.layout.?);
+    try expectEqual(@as(?[]const u8, null), partial_cfg.variant);
+    try expectEqual(@as(?[]const u8, null), partial_cfg.options);
+}

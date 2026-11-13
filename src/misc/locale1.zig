@@ -88,6 +88,17 @@
 //! per-thread and shared; `deinit` removes the match slot and drops the
 //! reference (`sd_bus_slot_unref` then `sd_bus_unref`).
 //!
+//! # Startup one-shot read
+//!
+//! `Locale1.readCurrent(allocator, ops)` performs the same four property
+//! reads *without* installing a match and *without* keeping the bus
+//! reference: it returns an owned `CurrentKeymap` for callers that need
+//! locale1's current layout before the live follower exists (e.g. to seed
+//! the initial keymap, kmscon parity). `CurrentKeymap.options()` borrows the
+//! values until `deinit`. A missing localed or a failed read surfaces as
+//! `""`, exactly like `init`; only bus-open and allocation failures are
+//! returned as errors.
+//!
 //! All C access goes through the `SdBusOps` function-pointer seam. The
 //! production table `real` is the only user of the translate-c module
 //! `sd-bus-c`; it is analyzed lazily, so the hermetic tests below compile
@@ -256,6 +267,26 @@ pub const KeymapOptions = struct {
     fn optionalSlice(value: []const u8) ?[]const u8 {
         return if (value.len == 0) null else value;
     }
+
+    /// Overlay these locale1 values onto an explicit RMLVO config `cfg`
+    /// (kmscon `useXkbConfig` parity): a config field that is set (non-null
+    /// and non-empty) always wins; an unset field takes the locale1 value
+    /// when it is non-empty, and stays unset otherwise. `T` must expose the
+    /// four nullable fields `model`/`layout`/`variant`/`options` (e.g.
+    /// `xkb.Keymap.Options`); any other field (such as `keymap_file`) is
+    /// carried through unchanged.
+    pub fn overlay(self: KeymapOptions, comptime T: type, cfg: T) T {
+        var result = cfg;
+        inline for (.{ "model", "layout", "variant", "options" }) |name| {
+            const locale_value = @field(self, name);
+            const config_value = @field(result, name);
+            const config_unset = if (config_value) |v| v.len == 0 else true;
+            if (config_unset and locale_value.len > 0) {
+                @field(result, name) = locale_value;
+            }
+        }
+        return result;
+    }
 };
 
 /// Result of `process`: one or more of the four values changed (or were
@@ -263,6 +294,32 @@ pub const KeymapOptions = struct {
 /// the `Locale1`; it is valid until the next `process`/`deinit`.
 pub const KeymapChange = struct {
     options: KeymapOptions,
+};
+
+/// Owned snapshot of locale1's current X11 properties, produced by
+/// `Locale1.readCurrent` for the startup read. The strings live until
+/// `deinit`; `options()` borrows them. Unlike a live `Locale1`, no match is
+/// installed and no bus reference is kept after the read.
+pub const CurrentKeymap = struct {
+    allocator: std.mem.Allocator,
+    values: [property_count]?[]u8 = @splat(null),
+
+    pub fn deinit(self: *CurrentKeymap) void {
+        for (self.values) |value| {
+            if (value) |owned| self.allocator.free(owned);
+        }
+        self.* = undefined;
+    }
+
+    /// Borrowed RMLVO view; `""` means unset (fall back to config/default).
+    pub fn options(self: *const CurrentKeymap) KeymapOptions {
+        return .{
+            .model = self.values[@intFromEnum(Property.model)] orelse "",
+            .layout = self.values[@intFromEnum(Property.layout)] orelse "",
+            .variant = self.values[@intFromEnum(Property.variant)] orelse "",
+            .options = self.values[@intFromEnum(Property.options)] orelse "",
+        };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -497,6 +554,33 @@ pub const Locale1 = struct {
         // The initial snapshot is the baseline, not a change.
         state.dirty = false;
         return self;
+    }
+
+    /// One-shot startup read (kmscon parity, `libseat-sdlogin.md` §5.2):
+    /// open the default system bus, read the four X11 properties, drop the
+    /// bus reference. No match is installed, so this can run before (or
+    /// without) the live follower and never leaves a subscription behind.
+    ///
+    /// A missing localed or a failed property read is not an error: the
+    /// affected field is `""` and the caller falls back to its config. Only
+    /// `sd_bus_default_system` and allocation failures are returned
+    /// (`error.BusUnavailable`, `error.OutOfMemory`); the caller treats them
+    /// as "no locale1" too.
+    pub fn readCurrent(allocator: std.mem.Allocator, ops: SdBusOps) !CurrentKeymap {
+        var bus: ?*Bus = null;
+        const rc = ops.default_system(&bus);
+        if (rc < 0) return error.BusUnavailable;
+        const connection = bus orelse return error.BusUnavailable;
+        defer ops.unref(connection);
+
+        var state: CallbackState = .{ .allocator = allocator, .ops = ops };
+        defer state.deinit();
+        try state.refreshAll(connection);
+
+        var result: CurrentKeymap = .{ .allocator = allocator };
+        result.values = state.values;
+        state.values = @splat(null); // ownership moved to the result
+        return result;
     }
 
     /// Remove the match and drop the shared bus reference, then free all
