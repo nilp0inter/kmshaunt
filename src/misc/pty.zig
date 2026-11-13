@@ -50,6 +50,11 @@ pub const Pty = struct {
     pub const Winsize = struct {
         cols: u16,
         rows: u16,
+        /// Pixel dimensions reported by TIOCGWINSZ (ws_xpixel/ws_ypixel).
+        /// `kitten icat` and friends refuse to run when these are 0; they
+        /// stay 0 only while the cell metrics are unknown.
+        xpixel: u16 = 0,
+        ypixel: u16 = 0,
     };
 
     pub const OpenError = std.posix.OpenError || error{
@@ -167,7 +172,7 @@ pub const Pty = struct {
             self.slave_path[written.len] = 0;
 
         if (cols != 0 or rows != 0)
-            try setWinsizeFd(self.master_fd, cols, rows);
+            try setWinsizeFd(self.master_fd, .{ .cols = cols, .rows = rows });
 
         return self;
     }
@@ -204,7 +209,7 @@ pub const Pty = struct {
         if (self.child_pid > 0) return error.AlreadySpawned;
 
         if (opts.winsize) |ws|
-            try setWinsizeFd(self.master_fd, ws.cols, ws.rows);
+            try setWinsizeFd(self.master_fd, ws);
 
         // Pre-validate and NUL-terminate cwd on the parent stack so the child
         // never runs formatting or validation code.
@@ -415,18 +420,21 @@ pub const Pty = struct {
 
     /// Update the pty window size via `TIOCSWINSZ` on `master_fd`; the kernel
     /// delivers `SIGWINCH` to the foreground process group on the slave.
-    pub fn resize(self: *Pty, cols: u16, rows: u16) WinsizeError!void {
-        return setWinsizeFd(self.master_fd, cols, rows);
+    /// The pixel fields travel with the grid so `TIOCGWINSZ` on either side
+    /// reports real pixel dimensions (kmscon parity; `kitten icat` needs
+    /// non-zero ws_xpixel/ws_ypixel).
+    pub fn resize(self: *Pty, ws: Winsize) WinsizeError!void {
+        return setWinsizeFd(self.master_fd, ws);
     }
 
-    fn setWinsizeFd(fd: std.posix.fd_t, cols: u16, rows: u16) WinsizeError!void {
-        const ws = std.posix.winsize{
-            .row = rows,
-            .col = cols,
-            .xpixel = 0,
-            .ypixel = 0,
+    fn setWinsizeFd(fd: std.posix.fd_t, ws: Winsize) WinsizeError!void {
+        const kws = std.posix.winsize{
+            .row = ws.rows,
+            .col = ws.cols,
+            .xpixel = ws.xpixel,
+            .ypixel = ws.ypixel,
         };
-        if (linux.errno(linux.ioctl(fd, TIOCSWINSZ, @intFromPtr(&ws))) != .SUCCESS)
+        if (linux.errno(linux.ioctl(fd, TIOCSWINSZ, @intFromPtr(&kws))) != .SUCCESS)
             return error.WinsizeFailed;
     }
 
@@ -435,7 +443,7 @@ pub const Pty = struct {
         var ws: std.posix.winsize = undefined;
         if (linux.errno(linux.ioctl(self.master_fd, TIOCGWINSZ, @intFromPtr(&ws))) != .SUCCESS)
             return error.WinsizeFailed;
-        return .{ .cols = ws.col, .rows = ws.row };
+        return .{ .cols = ws.col, .rows = ws.row, .xpixel = ws.xpixel, .ypixel = ws.ypixel };
     }
 
     /// Non-blocking `waitpid(2)` wrapper (`W.NOHANG | W.UNTRACED` by default),
@@ -626,18 +634,26 @@ test "(c) env passing: MYVAR=kmshaunt replaces child environment" {
     try testing.expectEqual(Pty.ReapStatus{ .exited = 0 }, res.status);
 }
 
-test "(d) resize(120, 40) reflected in getWinsize and child stty size" {
+test "(d) resize carries grid + pixels into getWinsize and child stty size" {
     var pty = try Pty.open(80, 24);
     defer pty.deinit();
 
     const initial = try pty.getWinsize();
     try testing.expectEqual(@as(u16, 80), initial.cols);
     try testing.expectEqual(@as(u16, 24), initial.rows);
+    // open() carries no pixel dimensions: they stay 0 until a resize or
+    // spawn-time winsize supplies them.
+    try testing.expectEqual(@as(u16, 0), initial.xpixel);
+    try testing.expectEqual(@as(u16, 0), initial.ypixel);
 
-    try pty.resize(120, 40);
+    // 120x40 grid of 8x16 cells -> 960x640 pixels, read back through
+    // TIOCGWINSZ exactly as `kitten icat` reads them.
+    try pty.resize(.{ .cols = 120, .rows = 40, .xpixel = 960, .ypixel = 640 });
     const updated = try pty.getWinsize();
     try testing.expectEqual(@as(u16, 120), updated.cols);
     try testing.expectEqual(@as(u16, 40), updated.rows);
+    try testing.expectEqual(@as(u16, 960), updated.xpixel);
+    try testing.expectEqual(@as(u16, 640), updated.ypixel);
 
     const stty_bin = findTool("stty") orelse "stty";
     try pty.spawn(.{
@@ -706,4 +722,40 @@ test "(f) SIGCHLD-driven WNOHANG reap loop + write/kill roundtrip" {
     // Subsequent reaps after terminal status return null cleanly.
     try testing.expect((try pty.reap(default_reap_flags)) == null);
     try testing.expectError(error.NoChild, pty.kill(.TERM));
+}
+
+test "(g) spawn-time winsize carries pixels; unknown cells report 0" {
+    var pty = try Pty.open(80, 24);
+    defer pty.deinit();
+
+    // The spawn-time winsize overrides open(): grid and pixels both land
+    // in TIOCGWINSZ before the child's first read.
+    const stty_bin = findTool("stty") orelse "stty";
+    try pty.spawn(.{
+        .allocator = testing.allocator,
+        .argv = &.{ stty_bin, "size" },
+        .env = &.{test_path_env},
+        .winsize = .{ .cols = 100, .rows = 30, .xpixel = 800, .ypixel = 480 },
+    });
+
+    const ws = try pty.getWinsize();
+    try testing.expectEqual(@as(u16, 100), ws.cols);
+    try testing.expectEqual(@as(u16, 30), ws.rows);
+    try testing.expectEqual(@as(u16, 800), ws.xpixel);
+    try testing.expectEqual(@as(u16, 480), ws.ypixel);
+
+    var buf: [128]u8 = undefined;
+    const got = try readAllFromMaster(&pty, &buf);
+    const res = try reapWithRetry(&pty);
+    try testing.expectEqual(Pty.ReapStatus{ .exited = 0 }, res.status);
+    try testing.expectEqualStrings("30 100", std.mem.trim(u8, got, " \t\r\n"));
+
+    // Unknown cell metrics (Winsize pixel fields default to 0): pixels
+    // drop back to 0 while the grid stays correct.
+    try pty.resize(.{ .cols = 100, .rows = 30 });
+    const zeroed = try pty.getWinsize();
+    try testing.expectEqual(@as(u16, 100), zeroed.cols);
+    try testing.expectEqual(@as(u16, 30), zeroed.rows);
+    try testing.expectEqual(@as(u16, 0), zeroed.xpixel);
+    try testing.expectEqual(@as(u16, 0), zeroed.ypixel);
 }

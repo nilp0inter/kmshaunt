@@ -425,7 +425,12 @@ pub const TerminalSession = struct {
         try p.spawn(.{
             .argv = self.cfg.login_argv,
             .env = env,
-            .winsize = .{ .cols = self.cols, .rows = self.rows },
+            .winsize = .{
+                .cols = self.cols,
+                .rows = self.rows,
+                .xpixel = pixelExtent(self.cols, self.cell_w),
+                .ypixel = pixelExtent(self.rows, self.cell_h),
+            },
             .allocator = self.allocator,
         });
         self.pty = p;
@@ -470,7 +475,12 @@ pub const TerminalSession = struct {
         self.cell_w = cell_w;
         self.cell_h = cell_h;
         try self.vt.resize(cols, rows, cell_w, cell_h);
-        if (self.active) try self.pty.resize(cols, rows);
+        if (self.active) try self.pty.resize(.{
+            .cols = cols,
+            .rows = rows,
+            .xpixel = pixelExtent(cols, cell_w),
+            .ypixel = pixelExtent(rows, cell_h),
+        });
         if (self.renderer) |r| try r.resize(cols, rows, cell_w, cell_h);
         try self.updateMouseSize();
     }
@@ -1033,6 +1043,15 @@ pub const TerminalSession = struct {
     }
 };
 
+/// Pixel extent for TIOCSWINSZ: grid cells times cell pixels, saturated
+/// at the u16 winsize field width. 0 while the cell metric is unknown
+/// (cell_px == 0), so pre-first-render spawns report pixels 0 rather than
+/// a bogus size.
+fn pixelExtent(cells: u16, cell_px: u16) u16 {
+    const px: u32 = @as(u32, cells) * cell_px;
+    return @intCast(@min(px, std.math.maxInt(u16)));
+}
+
 fn packRgb(c: vt.Rgb) u32 {
     return (@as(u32, c.r) << 16) | (@as(u32, c.g) << 8) | c.b;
 }
@@ -1344,6 +1363,79 @@ test "terminal: resize propagates to vt and pty winsize" {
     try testing.expectEqual(@as(u16, 30), ws.rows);
     try testing.expectEqual(@as(u16, 100), try ts.vt.cols());
     try testing.expectEqual(@as(u16, 30), try ts.vt.rows());
+}
+
+test "terminal: pty winsize reports pixel dimensions (kitten icat parity)" {
+    var cfg = testCfg(&.{"/bin/sh"});
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    const s = ts.session();
+
+    // Spawn before any render: cell metrics unknown -> pixels 0, grid set.
+    try s.start();
+    const spawned = try ts.pty.getWinsize();
+    try testing.expectEqual(@as(u16, 80), spawned.cols);
+    try testing.expectEqual(@as(u16, 24), spawned.rows);
+    try testing.expectEqual(@as(u16, 0), spawned.xpixel);
+    try testing.expectEqual(@as(u16, 0), spawned.ypixel);
+
+    // The first render carries real cell metrics: pixels = grid * cell
+    // size, visible to the child through TIOCGWINSZ (plain `kitten icat`
+    // reads exactly these fields).
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    ts.setRenderer(mock.renderer());
+    var fb = try render.Framebuffer.create(testing.allocator, 640, 384, .xrgb8888, null);
+    defer fb.destroy(testing.allocator);
+    var damage: render.DamageList = .empty;
+    defer damage.deinit(testing.allocator);
+    const ctx = sess.RenderContext{
+        .fb = &fb,
+        .damage = &damage,
+        .cell_w = 8,
+        .cell_h = 16,
+        .cols = 80,
+        .rows = 24,
+    };
+    try s.render(&ctx);
+    const rendered = try ts.pty.getWinsize();
+    try testing.expectEqual(@as(u16, 640), rendered.xpixel);
+    try testing.expectEqual(@as(u16, 384), rendered.ypixel);
+
+    // A session resize keeps the cell metrics and recomputes the pixels.
+    try s.resize(100, 30);
+    const resized = try ts.pty.getWinsize();
+    try testing.expectEqual(@as(u16, 100), resized.cols);
+    try testing.expectEqual(@as(u16, 30), resized.rows);
+    try testing.expectEqual(@as(u16, 800), resized.xpixel);
+    try testing.expectEqual(@as(u16, 480), resized.ypixel);
+}
+
+test "terminal: spawn-time winsize carries known cell pixels" {
+    var cfg = testCfg(&.{"/bin/sh"});
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    // Metrics known before start (e.g. a respawn after a mode change):
+    // the spawn-time winsize must carry them, not just the grid.
+    ts.cell_w = 8;
+    ts.cell_h = 16;
+    const s = ts.session();
+    try s.start();
+    const ws = try ts.pty.getWinsize();
+    try testing.expectEqual(@as(u16, 80), ws.cols);
+    try testing.expectEqual(@as(u16, 24), ws.rows);
+    try testing.expectEqual(@as(u16, 640), ws.xpixel);
+    try testing.expectEqual(@as(u16, 384), ws.ypixel);
+}
+
+test "terminal: pixelExtent saturates at u16 and yields 0 for unknown cells" {
+    try testing.expectEqual(@as(u16, 640), pixelExtent(80, 8));
+    try testing.expectEqual(@as(u16, 384), pixelExtent(24, 16));
+    try testing.expectEqual(@as(u16, 0), pixelExtent(80, 0));
+    try testing.expectEqual(@as(u16, 0), pixelExtent(0, 16));
+    try testing.expectEqual(@as(u16, 65535), pixelExtent(65535, 2));
+    try testing.expectEqual(@as(u16, 65535), pixelExtent(4096, 16));
 }
 
 test "terminal: mode-change resize reflows the terminal grid (M2.5)" {
