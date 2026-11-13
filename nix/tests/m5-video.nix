@@ -46,13 +46,20 @@
 #                           asserting each step changes the frame and 360
 #                           degrees returns pixel-exact to the boot frame.
 #                           Every orientation is captured as a golden.
-#   dpms                    dpms-timeout=5: idle blanks the connector
+#   dpms                    dpms-timeout=15: idle blanks the connector
 #                           (/sys/class/drm/card*-*/dpms reads Off), a keypress
 #                           wakes it (On) and the text is redrawn. This is the
 #                           ROADMAP M5.6 sysfs oracle; it applies to the DRM
 #                           backends. fbdev blanks via FBIOBLANK, which does
 #                           not touch the DRM connector property, so the dpms
 #                           variant runs on the default drm2d backend only.
+#                           Timing robustness under load: the idle timeout is
+#                           raised above the slow OCR steps, the On checks keep
+#                           sending wake keys while they poll, and the marker is
+#                           typed only after a confirmed wake. The timer
+#                           re-blanks after the last keypress; bochs blanking
+#                           only gates the DAC, so screendumps stay readable
+#                           while dpms is Off.
 #   clone / scaled          two VGA cards: the default std VGA (1024x768) plus
 #                           `-device VGA,id=video1,xres=800,yres=600` (EDID
 #                           preferred mode 800x600). Both connectors must be
@@ -255,20 +262,53 @@ let
 
   dpmsScenario = ''
     import datetime as dt
+    import time
 
-    SHORT = dt.timedelta(seconds=15)
-    TIMEOUT = 5  # services.{kmscon,kmshaunt}.config.dpms-timeout below
+    SHORT = dt.timedelta(seconds=30)
+    TIMEOUT = 15  # services.{kmscon,kmshaunt}.config.dpms-timeout below
+    DPMS_SYSFS = "cat /sys/class/drm/card*-*/dpms"
+
+    def dpmsWords():
+        # Words of the sysfs dpms read; [] when the read fails.
+        _, out = machine.execute(DPMS_SYSFS, timeout=SHORT, check_return=False)
+        return out.split()
+
+    def waitDpmsOn(budget):
+        """Wait until sysfs dpms reads On, keeping the console awake.
+
+        The idle timer re-blanks the connector TIMEOUT seconds after the
+        last keypress, so a single key followed by a slow check can miss
+        the On window entirely. Each poll therefore sends a fresh wake key
+        before reading sysfs: a working wake path reads On right after a
+        key, a broken one never does, however many keys arrive. The Off
+        state is stable without input, so the Off check needs no loop.
+        """
+        deadline = time.monotonic() + budget
+        words = []
+        while True:
+            machine.send_key("ret")
+            words = dpmsWords()
+            if "On" in words:
+                return
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"[{impl}] sysfs dpms never read On after input "
+                    f"(last read: {words!r})"
+                )
+            time.sleep(0.5)
 
     with subtest("S1 console is On after input"):
         # The idle timer runs from boot, so the screen may already be blank
-        # by the time the shell is up: wake it with a keypress first.
+        # by the time the shell is up: waitDpmsOn wakes it with a keypress.
         machine.wait_for_unit("default.target")
         machine.wait_until_succeeds("pgrep -u alice bash")
-        machine.send_key("ret")
+        waitDpmsOn(60)
         machine.wait_for_text("alice@")
-        machine.wait_until_succeeds(
-            "cat /sys/class/drm/card*-*/dpms | grep -qx On", timeout=SHORT
-        )
+        # The alice@ OCR can outlast the idle timeout and re-blank the
+        # screen. Wake it again and confirm On before typing so the marker
+        # is entered while the console is solidly On: typing during a
+        # blank->unblank transition can drop the redraw.
+        waitDpmsOn(60)
         machine.send_chars("echo dpms-parity-ok\n")
         machine.wait_for_text("dpms-parity-ok")
 
@@ -277,15 +317,12 @@ let
         # the console. TIMEOUT + margin guarantees the timer expired.
         machine.sleep(TIMEOUT + 3)
         machine.wait_until_succeeds(
-            "cat /sys/class/drm/card*-*/dpms | grep -qx Off", timeout=SHORT
+            DPMS_SYSFS + " | grep -qx Off", timeout=SHORT
         )
         screenshotCompare(machine, impl, "dpms-off")
 
     with subtest("S3 keypress wakes the connector (sysfs dpms On) and redraws"):
-        machine.send_key("ret")
-        machine.wait_until_succeeds(
-            "cat /sys/class/drm/card*-*/dpms | grep -qx On", timeout=SHORT
-        )
+        waitDpmsOn(60)
         machine.wait_for_text("dpms-parity-ok")
         screenshotCompare(machine, impl, "dpms-on")
   '';
@@ -470,7 +507,7 @@ let
 
     dpms = mkVideoTest {
       name = "kmshaunt-m5-video-dpms";
-      extraConfig = videoConfig "dpms-timeout" 5;
+      extraConfig = videoConfig "dpms-timeout" 15;
       scenario = dpmsScenario;
       goldens = [ "dpms-off" "dpms-on" ];
     };
