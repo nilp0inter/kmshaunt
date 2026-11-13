@@ -1115,10 +1115,10 @@ fn createTerminal(
     ts.* = try terminal.TerminalSession.init(alloc, cfg, cols, rows);
     errdefer ts.deinit();
 
-    // Kitty storage limit (M4.5): config.zig has no
-    // kitty-image-storage-limit option yet, so Vt.init's 10 MiB default
-    // (vt.default_kitty_storage_limit) applies.
-    //
+    // Kitty storage limit (M4.5): per-screen image storage budget comes
+    // from the config (default 10 MiB; 0 disables the protocol).
+    try ts.vt.setKittyStorageLimit(@as(u64, cfg.kitty_image_storage_limit));
+
     // R3 root hardening: the VT unit runs as root, and kitty file /
     // temp-file / shared-memory media could read root-only files. Keep
     // them disabled (a NULL value disables each; they are off by

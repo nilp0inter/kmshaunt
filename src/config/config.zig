@@ -133,6 +133,7 @@ pub const Option = enum {
     sb_size,
     bell,
     blink,
+    kitty_image_storage_limit,
     // Input
     xkb_model,
     xkb_layout,
@@ -252,6 +253,7 @@ const specs = [_]Spec{
     .{ .opt = .sb_size, .name = "sb-size", .kind = .uint },
     .{ .opt = .bell, .name = "bell", .kind = .bool },
     .{ .opt = .blink, .name = "blink", .kind = .bool },
+    .{ .opt = .kitty_image_storage_limit, .name = "kitty-image-storage-limit", .kind = .uint },
     .{ .opt = .xkb_model, .name = "xkb-model", .kind = .string },
     .{ .opt = .xkb_layout, .name = "xkb-layout", .kind = .string },
     .{ .opt = .xkb_variant, .name = "xkb-variant", .kind = .string },
@@ -369,6 +371,9 @@ pub const Config = struct {
     sb_size: u32 = 1000,
     bell: bool = false,
     blink: bool = true,
+    /// Per-screen kitty image storage budget in bytes; 0 disables the
+    /// protocol (ROADMAP M4.5/M7).
+    kitty_image_storage_limit: u32 = 10485760,
 
     // Input Options
     xkb_model: ?[]const u8 = null,
@@ -814,14 +819,15 @@ pub const Config = struct {
     fn copyFrom(self: *Config, src: *const Config) Error!void {
         const alloc = self.allocator();
         const value_fields = .{
-            "help",              "version",         "verbose",        "debug",
-            "silent",            "switchvt",        "libseat",        "session_max",
-            "session_control",   "issue",           "asciicast_loop", "login",
-            "oneshot",           "reset_env",       "backspace_delete", "sb_size",
-            "bell",              "blink",           "xkb_repeat_delay", "xkb_repeat_rate",
-            "mouse",             "natural_scrolling", "soft_cursor",  "dpms_timeout",
-            "drm",               "hwaccel",         "gpus",           "use_original_mode",
-            "multi_monitor",     "font_size",       "font_engine",    "palette",
+            "help",              "version",           "verbose",        "debug",
+            "silent",            "switchvt",          "libseat",        "session_max",
+            "session_control",   "issue",             "asciicast_loop", "login",
+            "oneshot",           "reset_env",         "backspace_delete", "sb_size",
+            "bell",              "blink",             "xkb_repeat_delay", "xkb_repeat_rate",
+            "mouse",             "natural_scrolling", "soft_cursor",    "dpms_timeout",
+            "drm",               "hwaccel",           "gpus",           "use_original_mode",
+            "multi_monitor",     "font_size",         "font_engine",    "palette",
+            "kitty_image_storage_limit",
         };
         inline for (value_fields) |f| @field(self, f) = @field(src, f);
 
@@ -1082,6 +1088,9 @@ const help_raw =
     \\\t                              Enable bell forwarding to the VT
     \\\t    --blink                 [on]
     \\\t                              Enable or disable cursor/text blinking
+    \\\t    --kitty-image-storage-limit <bytes>
+    \\\t                              Set the per-screen kitty image storage
+    \\\t                              budget in bytes; 0 disables the protocol
     \\
     \\Input Options:
     \\\t    --xkb-model <model>        [-]  Set XkbModel for input devices
@@ -1312,6 +1321,7 @@ test "defaults: every option at its documented kmscon default" {
     try testing.expectEqual(@as(u32, 1000), cfg.sb_size);
     try testing.expect(!cfg.bell);
     try testing.expect(cfg.blink);
+    try testing.expectEqual(@as(u32, 10485760), cfg.kitty_image_storage_limit);
     // Input
     try testing.expectEqual(@as(?[]const u8, null), cfg.xkb_model);
     try testing.expectEqual(@as(?[]const u8, null), cfg.xkb_layout);
@@ -1353,9 +1363,9 @@ test "defaults: every option at its documented kmscon default" {
     for (std.meta.tags(Option)) |o| try testing.expect(!cfg.locked.get(o));
 }
 
-test "registry: all 77 options, unique names, documented short forms" {
-    try testing.expectEqual(@as(usize, 77), specs.len);
-    try testing.expectEqual(@as(usize, 77), std.meta.tags(Option).len);
+test "registry: all 78 options, unique names, documented short forms" {
+    try testing.expectEqual(@as(usize, 78), specs.len);
+    try testing.expectEqual(@as(usize, 78), std.meta.tags(Option).len);
     for (specs, 0..) |s, i| {
         try testing.expectEqual(@as(Option, @enumFromInt(i)), s.opt);
         try testing.expectEqual(@as(?usize, i), name_map.get(s.name));
@@ -1399,6 +1409,7 @@ test "sample config file exercises every option type" {
         \\sb-size=2000
         \\bell
         \\no-blink
+        \\kitty-image-storage-limit=8388608
         \\xkb-model=pc105
         \\xkb-layout=de
         \\xkb-variant=nodeadkeys
@@ -1484,6 +1495,7 @@ test "sample config file exercises every option type" {
     try testing.expectEqual(@as(u32, 2000), cfg.sb_size);
     try testing.expect(cfg.bell);
     try testing.expect(!cfg.blink);
+    try testing.expectEqual(@as(u32, 8388608), cfg.kitty_image_storage_limit);
     try testing.expectEqualStrings("pc105", cfg.xkb_model.?);
     try testing.expectEqualStrings("de", cfg.xkb_layout.?);
     try testing.expectEqualStrings("nodeadkeys", cfg.xkb_variant.?);
@@ -1760,6 +1772,31 @@ test "uint bounds: sb-size 0 and max, dpms-timeout 0, overflow rejected" {
         try testing.expectError(error.InvalidValue, c.parseFileText(bad ++ "\n", &d));
         try testing.expect(std.mem.indexOf(u8, c.error_message.?, bad[0 .. std.mem.indexOfScalar(u8, bad, '=').?]) != null);
     }
+}
+
+test "kitty-image-storage-limit: default, CLI and file parse" {
+    var cfg = Config.init(testing.allocator);
+    defer cfg.deinit();
+    try testing.expectEqual(@as(u32, 10485760), cfg.kitty_image_storage_limit);
+
+    try cliOk(&cfg, &.{ "--kitty-image-storage-limit", "123" });
+    try testing.expectEqual(@as(u32, 123), cfg.kitty_image_storage_limit);
+    try testing.expect(cfg.locked.get(.kitty_image_storage_limit));
+
+    var file_cfg = Config.init(testing.allocator);
+    defer file_cfg.deinit();
+    try fileOk(&file_cfg, "kitty-image-storage-limit=456\n");
+    try testing.expectEqual(@as(u32, 456), file_cfg.kitty_image_storage_limit);
+
+    // 0 is valid and disables the protocol.
+    try fileOk(&file_cfg, "kitty-image-storage-limit=0\n");
+    try testing.expectEqual(@as(u32, 0), file_cfg.kitty_image_storage_limit);
+
+    var d = Diag{};
+    var bad_cfg = Config.init(testing.allocator);
+    defer bad_cfg.deinit();
+    try testing.expectError(error.InvalidValue, bad_cfg.parseFileText("kitty-image-storage-limit=4294967296\n", &d));
+    try testing.expect(std.mem.indexOf(u8, bad_cfg.error_message.?, "kitty-image-storage-limit") != null);
 }
 
 test "vt: numeric, name, path and base-0 quirks" {
