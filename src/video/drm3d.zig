@@ -49,7 +49,7 @@
 //!
 //!   beginFrame:  refuse if a flip is pending or no free GBM bo; make current;
 //!                return the CPU staging Framebuffer (see below).
-//!   endFrame:    [present staging via GL if the CPU renderer drew]
+//!   endFrame:    [present staging via GL: damage rects only, M8.2]
 //!                glFlush -> eglSwapBuffers -> lock_front_buffer
 //!                -> import bo as EGLImage (EGL_LINUX_DRM_FOURCC_EXT) and bind
 //!                   it to a GL texture (glEGLImageTargetTexture2DOES)
@@ -74,10 +74,11 @@
 //! render.zig's `Renderer.renderFrame` draws into a `*Framebuffer` through the
 //! CPU accessors. To keep that contract working unchanged, `beginFrame`
 //! returns a backend-owned CPU **staging** Framebuffer (xrgb8888, mode-sized).
-//! The CPU renderer draws into it; `endFrame` uploads it to a GL texture and
-//! draws it as a full-screen textured quad into the EGL window surface, then
-//! swaps/locks/flips. This is the "CPU staging buffer the renderer draws into
-//! then GL uploads" design the contract allows.
+//! The CPU renderer draws into it; `endFrame` uploads the damage rects to a
+//! GL texture and draws them as scissored textured quads into the EGL window
+//! surface, then swaps/locks/flips (damage-only presentation, M8.2; empty
+//! damage presents the whole frame). This is the "CPU staging buffer the
+//! renderer draws into then GL uploads" design the contract allows.
 //!
 //! A GL-native renderer (the M5 renderer layer) instead drives the GL hooks
 //! directly while the context is current:
@@ -94,6 +95,26 @@
 //!
 //! The cell shader is a basic textured quad (M5.1 is the backend + atlas/image
 //! texture plumbing); the full glyph renderer lands with the renderer layer.
+//!
+//! ## Damage-only presentation (M8.2)
+//!
+//! `endFrame(damage)` redraws only the damage rects: each rect is sub-uploaded
+//! from staging (glTexSubImage2D), then scissor-cleared and drawn as a quad,
+//! so clear/upload/draw touch only damaged pixels. Empty damage presents
+//! everything (the Backend contract), as do `full_redraw` (modeset, master
+//! take, DPMS wake) and any case the backend cannot prove partial-safe.
+//!
+//! GBM recycles scanout bos: with N buffers the back buffer holds the frame
+//! from N-1 swaps ago, not the previous frame. The backend therefore queries
+//! EGL_BUFFER_AGE_EXT and replays the union of the last `age` frames' logical
+//! damage (a fixed ring, no allocation). Unknown/zero age, missing history or
+//! an overflowing rect list fall back to a full frame. GL-drawn frames
+//! (drawCells/drawImage) present whole and record a full-history entry: their
+//! delta is the renderer's, not the backend's.
+//!
+//! beginFrame does not clear the target (a full clear would wipe the recycled
+//! back buffer outside the damage); the staging path scissor-clears its rects
+//! and the GL hooks clear lazily on the first draw of the frame.
 //!
 //! ## Cursor
 //!
@@ -218,6 +239,9 @@ pub const egl = struct {
     // EGL_EXT_image_dma_buf_import_modifiers
     pub const DMA_BUF_PLANE0_MODIFIER_LO_EXT: i32 = 0x3443;
     pub const DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
+    // EGL_EXT_buffer_age: age of the back buffer contents in frames
+    // (0 = undefined). Drives damage-only presentation (M8.2).
+    pub const BUFFER_AGE_EXT: i32 = 0x313D;
 };
 
 pub const gl = struct {
@@ -226,6 +250,7 @@ pub const gl = struct {
     pub const TRIANGLE_STRIP: u32 = 0x0005;
     pub const COLOR_BUFFER_BIT: u32 = 0x4000;
     pub const BLEND: u32 = 0x0BE2;
+    pub const SCISSOR_TEST: u32 = 0x0C11;
     pub const SRC_ALPHA: u32 = 0x0302;
     pub const ONE_MINUS_SRC_ALPHA: u32 = 0x0303;
     pub const TEXTURE_2D: u32 = 0x0DE1;
@@ -320,6 +345,9 @@ pub const EglOps = struct {
     swap_buffers: *const fn (ctx: ?*anyopaque, dpy: EglDisplay, surf: EglSurface) anyerror!void,
     create_image: *const fn (ctx: ?*anyopaque, dpy: EglDisplay, context: ?EglContext, target: u32, buffer: ?*anyopaque, attribs: []const i32) anyerror!EglImage,
     destroy_image: *const fn (ctx: ?*anyopaque, dpy: EglDisplay, image: EglImage) void,
+    /// EGL_BUFFER_AGE_EXT query: age of the back buffer in frames, or null
+    /// when the query fails / the extension is absent (present everything).
+    buffer_age: *const fn (ctx: ?*anyopaque, dpy: EglDisplay, surf: EglSurface) ?i32,
 };
 
 // ---------------------------------------------------------------------------
@@ -356,6 +384,7 @@ pub const GlOps = struct {
     viewport: *const fn (ctx: ?*anyopaque, x: i32, y: i32, w: i32, h: i32) void,
     clear_color: *const fn (ctx: ?*anyopaque, r: f32, g: f32, b: f32, a: f32) void,
     clear: *const fn (ctx: ?*anyopaque, mask: u32) void,
+    scissor: *const fn (ctx: ?*anyopaque, x: i32, y: i32, w: i32, h: i32) void,
     active_texture: *const fn (ctx: ?*anyopaque, unit: u32) void,
     gen_textures: *const fn (ctx: ?*anyopaque, n: usize, ids: []u32) void,
     delete_textures: *const fn (ctx: ?*anyopaque, n: usize, ids: []const u32) void,
@@ -365,6 +394,7 @@ pub const GlOps = struct {
     tex_parameteri: *const fn (ctx: ?*anyopaque, target: u32, pname: u32, param: i32) void,
     pixel_storei: *const fn (ctx: ?*anyopaque, pname: u32, param: i32) void,
     enable: *const fn (ctx: ?*anyopaque, cap: u32) void,
+    disable: *const fn (ctx: ?*anyopaque, cap: u32) void,
     blend_func: *const fn (ctx: ?*anyopaque, src: u32, dst: u32) void,
     /// glEGLImageTargetTexture2DOES: bind an imported EGLImage to a texture.
     image_target_texture_2d: *const fn (ctx: ?*anyopaque, target: u32, image: EglImage) void,
@@ -635,6 +665,21 @@ pub const Drm3d = struct {
     staging: ?Framebuffer = null,
     /// True when drawCells/drawImage rendered this frame (skip staging upload).
     gl_frame: bool = false,
+    /// True when drawCells/drawImage already cleared the target this frame
+    /// (beginFrame no longer clears; see presentStaging).
+    frame_cleared: bool = false,
+    /// Logical damage of the last frames, newest first (M8.2). GBM recycles
+    /// scanout bos: the back buffer holds the frame from `age` swaps ago
+    /// (EGL_EXT_buffer_age), so presenting it needs the union of the last
+    /// `age` frames' damage. Entries store the renderer's damage, not the
+    /// (possibly larger) region actually redrawn.
+    damage_history: [damage_history_len]DamageEntry = @splat(DamageEntry{}),
+    history_len: usize = 0,
+    /// Scratch for the merged present rects (effectiveDamage output).
+    present_rects: [present_rect_cap]Damage = undefined,
+    /// Tight row-copy scratch for sub-width staging uploads (GLES2 has no
+    /// UNPACK_ROW_LENGTH). Grows on demand, freed in deinit.
+    upload_scratch: []u8 = &.{},
 
     // GL objects.
     quad: ?QuadProgram = null,
@@ -646,6 +691,10 @@ pub const Drm3d = struct {
     atlas_generation: u64 = 0,
     atlas_have_gen: bool = false,
     staging_tex: u32 = 0,
+    /// Allocated size of staging_tex: partial uploads need a stable storage
+    /// allocation, reallocated only when the staging size changes.
+    staging_tex_w: u32 = 0,
+    staging_tex_h: u32 = 0,
     image_tex: u32 = 0,
     presented_tex: u32 = 0,
     presented_image: ?EglImage = null,
@@ -659,6 +708,18 @@ pub const Drm3d = struct {
         crtc_index: usize,
         mode: ModeInfo,
     };
+
+    /// One frame of logical damage, clipped + merged. `full` marks an unknown
+    /// delta (empty damage = present everything, or a GL-drawn frame).
+    const DamageEntry = struct {
+        full: bool = true,
+        n: usize = 0,
+        rects: [damage_entry_cap]Damage = undefined,
+    };
+
+    const damage_history_len = 8; // frames kept for buffer-age replay
+    const damage_entry_cap = 16; // merged rects per frame; more = full frame
+    const present_rect_cap = 64; // merged rects per present; more = full frame
 
     /// Open the card, enumerate read-only, create the GBM device and the EGL
     /// display/config/context. The GBM surface + window surface are created in
@@ -762,6 +823,7 @@ pub const Drm3d = struct {
         self.gbm_ops.destroy_device(self.gbm_ops.ctx, self.gbm_dev);
 
         if (self.staging) |*s| s.destroy(self.allocator);
+        if (self.upload_scratch.len > 0) self.allocator.free(self.upload_scratch);
         self.fb_cache.deinit();
         freeConns(self.allocator, self.conns);
         self.allocator.free(self.infos);
@@ -951,6 +1013,9 @@ pub const Drm3d = struct {
 
         // Prime: render a clear frame, swap, lock the first bo, AddFB. This
         // gives SetCrtc a valid fb before any page flip (constraint #5).
+        self.gl_ops.disable(self.gl_ops.ctx, gl.SCISSOR_TEST);
+        self.gl_ops.clear_color(self.gl_ops.ctx, 0, 0, 0, 1);
+        self.gl_ops.clear(self.gl_ops.ctx, gl.COLOR_BUFFER_BIT);
         const bo = try self.swapAndLock();
         const fb_id = try self.fbIdFor(bo);
         self.ops.set_crtc(self.ops.ctx, self.fd, crtc.id, fb_id, 0, 0, &.{conn.id}, &mode) catch |err| {
@@ -968,6 +1033,7 @@ pub const Drm3d = struct {
         };
         self.flip_pending = false;
         self.full_redraw = true;
+        self.history_len = 0;
         self.infos[connector_idx].current_mode = mode_idx;
 
         if (self.dpms != .on) try self.applyDpms(self.dpms);
@@ -1000,7 +1066,11 @@ pub const Drm3d = struct {
     // ------------------------------------------------------------------
 
     /// The CPU staging buffer to draw into (Renderer contract). error.Busy
-    /// while a flip is in flight or no GBM bo is free to render into.
+    /// while a flip is in flight or no GBM bo is free to render into. Does
+    /// NOT clear the target: the back buffer is a recycled GBM bo whose
+    /// contents outside the damage must survive (M8.2). The staging path
+    /// scissor-clears its rects in endFrame; the GL hooks clear lazily on
+    /// the first draw of the frame.
     pub fn beginFrame(self: *Drm3d) !*Framebuffer {
         if (self.active == null) return error.NoActiveDisplay;
         if (self.flip_pending) return error.Busy;
@@ -1008,25 +1078,39 @@ pub const Drm3d = struct {
         if (!self.gbm_ops.has_free_buffers(self.gbm_ops.ctx, surf)) return error.Busy;
         try self.egl_ops.make_current(self.egl_ops.ctx, self.egl_dpy, self.egl_surf, self.egl_surf, self.egl_ctx);
         self.gl_frame = false;
-        self.gl_ops.clear_color(self.gl_ops.ctx, 0, 0, 0, 1);
-        self.gl_ops.clear(self.gl_ops.ctx, gl.COLOR_BUFFER_BIT);
+        self.frame_cleared = false;
         return &self.staging.?;
     }
 
     /// Submit a page flip presenting the rendered frame (returns once
-    /// SUBMITTED). If the CPU renderer drew into staging, it is uploaded and
-    /// drawn to the target first; a GL-drawn frame is already on the target.
-    /// Then swap -> lock -> EGLImage -> AddFB -> flip. EBUSY keeps pending set
-    /// (constraint #4). Refuses while off (recipes §7.2.3).
+    /// SUBMITTED), restricted to `damage` (empty slice = present everything,
+    /// video.Backend contract). The CPU staging path redraws only the damage
+    /// rects plus the buffer-age replay (M8.2); a GL-drawn frame is already
+    /// on the target and presents whole. Then swap -> lock -> EGLImage ->
+    /// AddFB -> flip. EBUSY keeps pending set (constraint #4). Refuses while
+    /// off (recipes §7.2.3).
     pub fn endFrame(self: *Drm3d, damage: []const Damage) !void {
         const act = self.active orelse return error.NoActiveDisplay;
         if (self.flip_pending) return error.Busy;
         if (self.dpms != .on) return error.DisplayOff;
-        _ = damage; // GL presents the whole back buffer; damage paces redraws upstream.
 
-        if (!self.gl_frame) try self.presentStaging();
+        if (!self.gl_frame) {
+            const rects = self.effectiveDamage(damage, act);
+            self.presentStaging(rects) catch |err| {
+                // The back buffer may be partially drawn: go full next frame.
+                self.full_redraw = true;
+                return err;
+            };
+        }
 
-        const bo = try self.swapAndLock();
+        const bo = self.swapAndLock() catch |err| {
+            self.full_redraw = true;
+            return err;
+        };
+        // The swap landed: this frame's content is in the bo regardless of
+        // the flip outcome below (EBUSY keeps it locked for the retry).
+        // Record the logical delta: empty damage / GL frames are unknown.
+        self.pushDamageHistory(damage, self.gl_frame or damage.len == 0);
         try self.importPresentedBo(bo);
         const fb_id = try self.fbIdFor(bo);
 
@@ -1045,6 +1129,112 @@ pub const Drm3d = struct {
         self.flip_pending = true;
         self.flipping = bo;
         self.full_redraw = false;
+    }
+
+    // ------------------------------------------------------------------
+    // Damage-only presentation (M8.2)
+    // ------------------------------------------------------------------
+
+    /// The region endFrame must redraw, or null for a full frame. GBM
+    /// recycles scanout bos, so the back buffer holds the frame from `age`
+    /// swaps ago (EGL_EXT_buffer_age); presenting it needs the union of the
+    /// last `age` frames' logical damage (this frame + age-1 history).
+    /// Full frame when: full_redraw, empty damage (contract), unknown age,
+    /// insufficient history, or too many rects to merge. An empty result
+    /// means the back buffer is already current (present without drawing).
+    fn effectiveDamage(self: *Drm3d, damage: []const Damage, act: Active) ?[]const Damage {
+        if (self.full_redraw or damage.len == 0) return null;
+        const win = self.egl_surf orelse return null;
+        const age = self.egl_ops.buffer_age(self.egl_ops.ctx, self.egl_dpy, win) orelse return null;
+        if (age <= 0) return null; // undefined back buffer contents
+        const history: usize = @intCast(age - 1);
+        if (history > self.history_len) return null;
+
+        var n = collectClipped(damage, act.mode.hdisplay, act.mode.vdisplay, &self.present_rects);
+        if (n > present_rect_cap) return null;
+        for (self.damage_history[0..history]) |*e| {
+            if (e.full) return null;
+            if (n + e.n > present_rect_cap) return null;
+            @memcpy(self.present_rects[n..][0..e.n], e.rects[0..e.n]);
+            n += e.n;
+        }
+        n = coalesceRects(self.present_rects[0..n]);
+        return self.present_rects[0..n];
+    }
+
+    /// Record this frame's logical damage (the renderer's delta, NOT the
+    /// region actually redrawn) for future buffer-age replays. `full` marks
+    /// an unknown delta: empty damage presents everything, and GL-drawn
+    /// frames are composited by the renderer, not the backend.
+    fn pushDamageHistory(self: *Drm3d, damage: []const Damage, full: bool) void {
+        var i = @min(self.history_len, damage_history_len - 1);
+        while (i > 0) : (i -= 1) self.damage_history[i] = self.damage_history[i - 1];
+        self.history_len = @min(self.history_len + 1, damage_history_len);
+        var e = &self.damage_history[0];
+        e.* = .{};
+        if (full) return;
+        const act = self.active orelse return;
+        var n = collectClipped(damage, act.mode.hdisplay, act.mode.vdisplay, &self.present_rects);
+        if (n > present_rect_cap) return;
+        n = coalesceRects(self.present_rects[0..n]);
+        if (n > damage_entry_cap) return;
+        e.full = false;
+        e.n = n;
+        @memcpy(e.rects[0..n], self.present_rects[0..n]);
+    }
+
+    /// The first draw of a GL-drawn frame clears the whole target (the
+    /// beginFrame clear moved here so damage-only staging frames keep the
+    /// recycled back buffer outside their rects).
+    fn clearForGlFrame(self: *Drm3d) void {
+        if (self.frame_cleared) return;
+        self.frame_cleared = true;
+        const g = self.gl_ops;
+        g.disable(g.ctx, gl.SCISSOR_TEST);
+        g.clear_color(g.ctx, 0, 0, 0, 1);
+        g.clear(g.ctx, gl.COLOR_BUFFER_BIT);
+    }
+
+    /// Clip damage to the mode, dropping empty/out-of-bounds rects. Returns
+    /// the count, or out.len + 1 when the input does not fit.
+    fn collectClipped(damage: []const Damage, w: u32, h: u32, out: []Damage) usize {
+        var n: usize = 0;
+        for (damage) |d| {
+            const c = d.clipTo(w, h) orelse continue;
+            if (n == out.len) return out.len + 1;
+            out[n] = c;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Merge overlapping and edge-adjacent rects in place (half-open, like
+    /// drm2d's DirtyFB clips); returns the merged count.
+    fn coalesceRects(rects: []Damage) usize {
+        var n = rects.len;
+        var changed = true;
+        while (changed) {
+            changed = false;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                var j = i + 1;
+                while (j < n) {
+                    if (rectsTouch(rects[i], rects[j])) {
+                        rects[i] = rects[i].boundingBox(rects[j]);
+                        rects[j] = rects[n - 1];
+                        n -= 1;
+                        changed = true;
+                    } else j += 1;
+                }
+            }
+        }
+        return n;
+    }
+
+    /// Overlap or edge-adjacency for non-empty half-open rects.
+    fn rectsTouch(a: Damage, b: Damage) bool {
+        return a.x <= b.x + b.w and b.x <= a.x + a.w and
+            a.y <= b.y + b.h and b.y <= a.y + a.h;
     }
 
     pub fn flipPending(self: *const Drm3d) bool {
@@ -1280,6 +1470,7 @@ pub const Drm3d = struct {
     /// modeset; only the size-dependent objects are rebuilt.
     fn teardownDisplay(self: *Drm3d) void {
         self.releaseLockedBuffers();
+        self.history_len = 0;
         if (self.presented_image) |img| {
             self.egl_ops.destroy_image(self.egl_ops.ctx, self.egl_dpy, img);
             self.presented_image = null;
@@ -1502,6 +1693,7 @@ pub const Drm3d = struct {
         const q = self.quad orelse return error.NoActiveDisplay;
         if (cells.len == 0) return;
         self.gl_frame = true;
+        self.clearForGlFrame();
         const act = self.active.?;
         const g = self.gl_ops;
         const ctx = g.ctx;
@@ -1539,6 +1731,7 @@ pub const Drm3d = struct {
         if (img.width == 0 or img.height == 0) return error.InvalidImage;
         if (img.pixels.len < @as(usize, img.width) * img.height * 4) return error.InvalidImage;
         self.gl_frame = true;
+        self.clearForGlFrame();
         const act = self.active.?;
         const g = self.gl_ops;
         const ctx = g.ctx;
@@ -1564,18 +1757,31 @@ pub const Drm3d = struct {
         g.draw_arrays(ctx, gl.TRIANGLE_STRIP, 0, 4);
     }
 
-    /// Upload the CPU staging buffer and draw it full-screen into the target.
-    /// xrgb8888 memory is B,G,R,X, so it uploads as GL_BGRA (no swizzle).
-    fn presentStaging(self: *Drm3d) !void {
+    /// Present the CPU staging buffer into the target. `rects` null = full
+    /// frame: full upload, full clear, full-screen quad. Otherwise (M8.2)
+    /// damage-only: sub-upload each rect, then scissor-clear + draw a quad
+    /// per rect, so clear/upload/draw touch only damaged pixels. xrgb8888
+    /// memory is B,G,R,X, so it uploads as GL_BGRA (no swizzle); the clear
+    /// keeps the blend result independent of the undefined X byte.
+    fn presentStaging(self: *Drm3d, rects: ?[]const Damage) !void {
+        if (rects) |rs| {
+            if (rs.len == 0) return; // nothing changed: the back buffer is current
+        }
         const s = self.staging orelse return error.NoActiveDisplay;
         const q = self.quad orelse return error.NoActiveDisplay;
         const act = self.active.?;
         const g = self.gl_ops;
         const ctx = g.ctx;
+        const w: i32 = @intCast(s.width);
+        const h: i32 = @intCast(s.height);
 
         self.ensureTexture(&self.staging_tex);
         g.bind_texture(ctx, gl.TEXTURE_2D, self.staging_tex);
-        g.tex_image_2d(ctx, gl.TEXTURE_2D, 0, @intCast(gl.BGRA), @intCast(s.width), @intCast(s.height), 0, gl.BGRA, gl.UNSIGNED_BYTE, s.mem.ptr);
+        if (rects == null or self.staging_tex_w != s.width or self.staging_tex_h != s.height) {
+            g.tex_image_2d(ctx, gl.TEXTURE_2D, 0, @intCast(gl.BGRA), w, h, 0, gl.BGRA, gl.UNSIGNED_BYTE, s.mem.ptr);
+            self.staging_tex_w = s.width;
+            self.staging_tex_h = s.height;
+        }
 
         g.use_program(ctx, q.program);
         g.bind_buffer(ctx, gl.ARRAY_BUFFER, self.quad_vbo);
@@ -1586,12 +1792,60 @@ pub const Drm3d = struct {
         g.uniform1i(ctx, q.u_tex, 0);
         g.uniform2f(ctx, q.u_viewport, @floatFromInt(act.mode.hdisplay), @floatFromInt(act.mode.vdisplay));
         g.uniform2f(ctx, q.u_texsize, @floatFromInt(s.width), @floatFromInt(s.height));
-        g.uniform4f(ctx, q.u_dst, 0, 0, @floatFromInt(s.width), @floatFromInt(s.height));
-        g.uniform4f(ctx, q.u_src, 0, 0, @floatFromInt(s.width), @floatFromInt(s.height));
         g.uniform1i(ctx, q.u_coverage, 0);
         g.uniform4f(ctx, q.u_color, 1, 1, 1, 1);
         g.uniform1f(ctx, q.u_opacity, 1.0);
-        g.draw_arrays(ctx, gl.TRIANGLE_STRIP, 0, 4);
+        g.clear_color(ctx, 0, 0, 0, 1);
+
+        if (rects) |rs| {
+            for (rs) |r| {
+                const pixels = try self.stagingRectPixels(s, r);
+                g.pixel_storei(ctx, gl.UNPACK_ALIGNMENT, 1);
+                g.tex_sub_image_2d(ctx, gl.TEXTURE_2D, 0, @intCast(r.x), @intCast(r.y), @intCast(r.w), @intCast(r.h), gl.BGRA, gl.UNSIGNED_BYTE, pixels);
+            }
+            g.enable(ctx, gl.SCISSOR_TEST);
+            for (rs) |r| {
+                const rx: i32 = @intCast(r.x);
+                const ry: i32 = @intCast(r.y);
+                const rw: i32 = @intCast(r.w);
+                const rh: i32 = @intCast(r.h);
+                // GL's scissor origin is bottom-left; the quad shader maps
+                // top-left framebuffer pixels, so flip the rect vertically.
+                g.scissor(ctx, rx, h - ry - rh, rw, rh);
+                g.clear(ctx, gl.COLOR_BUFFER_BIT);
+                g.uniform4f(ctx, q.u_dst, @floatFromInt(r.x), @floatFromInt(r.y), @floatFromInt(r.w), @floatFromInt(r.h));
+                g.uniform4f(ctx, q.u_src, @floatFromInt(r.x), @floatFromInt(r.y), @floatFromInt(r.w), @floatFromInt(r.h));
+                g.draw_arrays(ctx, gl.TRIANGLE_STRIP, 0, 4);
+            }
+            g.disable(ctx, gl.SCISSOR_TEST);
+        } else {
+            g.clear(ctx, gl.COLOR_BUFFER_BIT);
+            g.uniform4f(ctx, q.u_dst, 0, 0, @floatFromInt(s.width), @floatFromInt(s.height));
+            g.uniform4f(ctx, q.u_src, 0, 0, @floatFromInt(s.width), @floatFromInt(s.height));
+            g.draw_arrays(ctx, gl.TRIANGLE_STRIP, 0, 4);
+        }
+    }
+
+    /// Upload source for a staging rect: full-width rects upload in place
+    /// (tight rows); sub-width rects are row-copied into the tight scratch,
+    /// because GLES2 has no UNPACK_ROW_LENGTH.
+    fn stagingRectPixels(self: *Drm3d, s: Framebuffer, r: Damage) ![*]const u8 {
+        const row_bytes = @as(usize, r.w) * 4;
+        if (r.w == s.width and s.pitch == s.width * 4) {
+            return s.mem.ptr + @as(usize, r.y) * s.pitch;
+        }
+        const need = row_bytes * r.h;
+        if (self.upload_scratch.len < need) {
+            if (self.upload_scratch.len > 0) self.allocator.free(self.upload_scratch);
+            self.upload_scratch = try self.allocator.alloc(u8, need);
+        }
+        var y: u32 = 0;
+        while (y < r.h) : (y += 1) {
+            const src = s.mem.ptr + (@as(usize, r.y + y) * s.pitch + @as(usize, r.x) * 4);
+            const dst = self.upload_scratch.ptr + @as(usize, y) * row_bytes;
+            @memcpy(dst[0..row_bytes], src[0..row_bytes]);
+        }
+        return self.upload_scratch.ptr;
     }
 
     // ------------------------------------------------------------------
@@ -1731,6 +1985,7 @@ pub const libegl = struct {
             .swap_buffers = swapBuffers,
             .create_image = createImage,
             .destroy_image = destroyImage,
+            .buffer_age = bufferAge,
         };
     }
 
@@ -1810,6 +2065,11 @@ pub const libegl = struct {
         }
         if (p_destroy_image) |f| _ = f(@ptrCast(dpy), @ptrCast(image));
     }
+    fn bufferAge(_: ?*anyopaque, dpy: EglDisplay, surf: EglSurface) ?i32 {
+        var age: c.EGLint = 0;
+        if (c.eglQuerySurface(@ptrCast(dpy), @ptrCast(surf), egl.BUFFER_AGE_EXT, &age) == c.EGL_FALSE) return null;
+        return age;
+    }
 };
 
 pub const libgl = struct {
@@ -1845,6 +2105,7 @@ pub const libgl = struct {
             .viewport = viewport,
             .clear_color = clearColor,
             .clear = clear,
+            .scissor = scissor,
             .active_texture = activeTexture,
             .gen_textures = genTextures,
             .delete_textures = deleteTextures,
@@ -1854,6 +2115,7 @@ pub const libgl = struct {
             .tex_parameteri = texParameteri,
             .pixel_storei = pixelStorei,
             .enable = enable,
+            .disable = disable,
             .blend_func = blendFunc,
             .image_target_texture_2d = imageTargetTexture2D,
             .flush = flush,
@@ -1946,6 +2208,9 @@ pub const libgl = struct {
     fn clear(_: ?*anyopaque, mask: u32) void {
         c.glClear(mask);
     }
+    fn scissor(_: ?*anyopaque, x: i32, y: i32, w: i32, h: i32) void {
+        c.glScissor(x, y, w, h);
+    }
     fn activeTexture(_: ?*anyopaque, unit: u32) void {
         c.glActiveTexture(unit);
     }
@@ -1972,6 +2237,9 @@ pub const libgl = struct {
     }
     fn enable(_: ?*anyopaque, cap: u32) void {
         c.glEnable(cap);
+    }
+    fn disable(_: ?*anyopaque, cap: u32) void {
+        c.glDisable(cap);
     }
     fn blendFunc(_: ?*anyopaque, src: u32, dst: u32) void {
         c.glBlendFunc(src, dst);
@@ -2321,6 +2589,9 @@ const FakeSurface = struct {
     flags: u32,
     bos: [3]FakeBo,
     front: usize = 0,
+    /// Mesa-style buffer ages: 0 = never presented, else frames since the
+    /// bo was last front (incremented for every presented bo on each swap).
+    ages: [3]i32 = .{ 0, 0, 0 },
     destroyed: bool = false,
 };
 
@@ -2332,7 +2603,13 @@ const TexUpload = struct {
     w: i32,
     h: i32,
     format: u32,
+    /// First word of row 0 and row 1 of the uploaded pixels (4-byte formats
+    /// only), so tests can verify sub-width row-copy uploads.
+    sample: [2]u32 = .{ 0, 0 },
 };
+
+const ScissorBox = struct { x: i32, y: i32, w: i32, h: i32 };
+const ClearRec = struct { mask: u32, scissor: ?ScissorBox };
 
 const FakeGpu = struct {
     allocator: Allocator,
@@ -2363,10 +2640,18 @@ const FakeGpu = struct {
     textures_alive: std.ArrayList(u32) = .empty,
     uploads: std.ArrayList(TexUpload) = .empty,
     draw_count: usize = 0,
+    scissor_enabled: bool = false,
+    scissor_boxes: std.ArrayList(ScissorBox) = .empty,
+    clears: std.ArrayList(ClearRec) = .empty,
+    /// Scissor box active at each draw (null = scissor disabled).
+    draw_boxes: std.ArrayList(?ScissorBox) = .empty,
+    /// Every u_dst uniform value (quad destination rects), in order.
+    dst_rects: std.ArrayList([4]f32) = .empty,
     image_target_count: usize = 0,
     program_linked: bool = false,
     fail_lock: bool = false,
     fail_create_image: bool = false,
+    fail_buffer_age: bool = false,
     // ordering across all three seams
     calls: std.ArrayList(GpuCall) = .empty,
 
@@ -2390,6 +2675,10 @@ const FakeGpu = struct {
         gl_tex_image,
         gl_tex_sub_image,
         gl_draw,
+        gl_scissor,
+        gl_enable,
+        gl_disable,
+        gl_clear,
         gl_image_target,
         gl_delete_program,
     };
@@ -2398,6 +2687,10 @@ const FakeGpu = struct {
         self.last_image_attribs.deinit(self.allocator);
         self.textures_alive.deinit(self.allocator);
         self.uploads.deinit(self.allocator);
+        self.scissor_boxes.deinit(self.allocator);
+        self.clears.deinit(self.allocator);
+        self.draw_boxes.deinit(self.allocator);
+        self.dst_rects.deinit(self.allocator);
         self.calls.deinit(self.allocator);
     }
     fn record(self: *FakeGpu, call: GpuCall) void {
@@ -2453,6 +2746,7 @@ const FakeGpu = struct {
             .swap_buffers = swapBuffers,
             .create_image = createImage,
             .destroy_image = destroyImage,
+            .buffer_age = bufferAge,
         };
     }
     fn glOps(self: *FakeGpu) GlOps {
@@ -2485,6 +2779,7 @@ const FakeGpu = struct {
             .viewport = viewport,
             .clear_color = clearColor,
             .clear = clear,
+            .scissor = scissor,
             .active_texture = activeTexture,
             .gen_textures = genTextures,
             .delete_textures = deleteTextures,
@@ -2494,6 +2789,7 @@ const FakeGpu = struct {
             .tex_parameteri = texParameteri,
             .pixel_storei = pixelStorei,
             .enable = enable,
+            .disable = disable,
             .blend_func = blendFunc,
             .image_target_texture_2d = imageTargetTexture2D,
             .flush = flush,
@@ -2615,8 +2911,23 @@ const FakeGpu = struct {
         const self = cast(ctx);
         self.record(.egl_swap);
         self.swap_count += 1;
-        // Promote the next bo to front (models EGL/GBM back->front).
-        self.surface.?.front = (self.surface.?.front + 1) % self.surface.?.bos.len;
+        // Promote the next bo to front (models EGL/GBM back->front) and
+        // track mesa-style ages: every presented bo ages one frame per
+        // swap; the newly presented bo starts at age 1.
+        const s = &self.surface.?;
+        const idx = (s.front + 1) % s.bos.len;
+        for (&s.ages) |*a| {
+            if (a.* > 0) a.* += 1;
+        }
+        s.ages[idx] = 1;
+        s.front = idx;
+    }
+    fn bufferAge(ctx: ?*anyopaque, _: EglDisplay, _: EglSurface) ?i32 {
+        const self = cast(ctx);
+        if (self.fail_buffer_age) return null;
+        const s = &self.surface.?;
+        // The back buffer is the bo the next swap will present.
+        return s.ages[(s.front + 1) % s.bos.len];
     }
     fn createImage(ctx: ?*anyopaque, _: EglDisplay, _: ?EglContext, _: u32, _: ?*anyopaque, attribs: []const i32) !EglImage {
         const self = cast(ctx);
@@ -2663,7 +2974,10 @@ const FakeGpu = struct {
     fn getAttribLocation(_: ?*anyopaque, _: u32, _: [*:0]const u8) i32 {
         return 0;
     }
-    fn getUniformLocation(_: ?*anyopaque, _: u32, _: [*:0]const u8) i32 {
+    fn getUniformLocation(_: ?*anyopaque, _: u32, name: [*:0]const u8) i32 {
+        const s = std.mem.span(name);
+        if (std.mem.eql(u8, s, "u_dst")) return 1;
+        if (std.mem.eql(u8, s, "u_src")) return 2;
         return 0;
     }
     fn enableVertexAttribArray(_: ?*anyopaque, _: u32) void {}
@@ -2681,15 +2995,27 @@ const FakeGpu = struct {
     fn uniform1i(_: ?*anyopaque, _: i32, _: i32) void {}
     fn uniform1f(_: ?*anyopaque, _: i32, _: f32) void {}
     fn uniform2f(_: ?*anyopaque, _: i32, _: f32, _: f32) void {}
-    fn uniform4f(_: ?*anyopaque, _: i32, _: f32, _: f32, _: f32, _: f32) void {}
+    fn uniform4f(ctx: ?*anyopaque, loc: i32, x: f32, y: f32, z: f32, w: f32) void {
+        const self = cast(ctx);
+        if (loc == 1) self.dst_rects.append(self.allocator, .{ x, y, z, w }) catch @panic("fake: oom");
+    }
     fn drawArrays(ctx: ?*anyopaque, _: u32, _: i32, _: i32) void {
         const self = cast(ctx);
         self.record(.gl_draw);
         self.draw_count += 1;
+        self.draw_boxes.append(self.allocator, self.currentScissor()) catch @panic("fake: oom");
+    }
+    fn currentScissor(self: *const FakeGpu) ?ScissorBox {
+        if (!self.scissor_enabled or self.scissor_boxes.items.len == 0) return null;
+        return self.scissor_boxes.items[self.scissor_boxes.items.len - 1];
     }
     fn viewport(_: ?*anyopaque, _: i32, _: i32, _: i32, _: i32) void {}
     fn clearColor(_: ?*anyopaque, _: f32, _: f32, _: f32, _: f32) void {}
-    fn clear(_: ?*anyopaque, _: u32) void {}
+    fn clear(ctx: ?*anyopaque, mask: u32) void {
+        const self = cast(ctx);
+        self.record(.gl_clear);
+        self.clears.append(self.allocator, .{ .mask = mask, .scissor = self.currentScissor() }) catch @panic("fake: oom");
+    }
     fn activeTexture(_: ?*anyopaque, _: u32) void {}
     fn genTextures(ctx: ?*anyopaque, n: usize, ids: []u32) void {
         const self = cast(ctx);
@@ -2713,19 +3039,46 @@ const FakeGpu = struct {
         }
     }
     fn bindTexture(_: ?*anyopaque, _: u32, _: u32) void {}
-    fn texImage2D(ctx: ?*anyopaque, _: u32, _: i32, _: i32, w: i32, h: i32, _: i32, format: u32, _: u32, _: ?*const anyopaque) void {
+    fn texImage2D(ctx: ?*anyopaque, _: u32, _: i32, _: i32, w: i32, h: i32, _: i32, format: u32, _: u32, pixels: ?*const anyopaque) void {
         const self = cast(ctx);
         self.record(.gl_tex_image);
-        self.uploads.append(self.allocator, .{ .tex = 0, .sub = false, .x = 0, .y = 0, .w = w, .h = h, .format = format }) catch @panic("fake: oom");
+        self.uploads.append(self.allocator, .{ .tex = 0, .sub = false, .x = 0, .y = 0, .w = w, .h = h, .format = format, .sample = uploadSample(pixels, w, h, format) }) catch @panic("fake: oom");
     }
-    fn texSubImage2D(ctx: ?*anyopaque, _: u32, _: i32, x: i32, y: i32, w: i32, h: i32, format: u32, _: u32, _: ?*const anyopaque) void {
+    fn texSubImage2D(ctx: ?*anyopaque, _: u32, _: i32, x: i32, y: i32, w: i32, h: i32, format: u32, _: u32, pixels: ?*const anyopaque) void {
         const self = cast(ctx);
         self.record(.gl_tex_sub_image);
-        self.uploads.append(self.allocator, .{ .tex = 0, .sub = true, .x = x, .y = y, .w = w, .h = h, .format = format }) catch @panic("fake: oom");
+        self.uploads.append(self.allocator, .{ .tex = 0, .sub = true, .x = x, .y = y, .w = w, .h = h, .format = format, .sample = uploadSample(pixels, w, h, format) }) catch @panic("fake: oom");
+    }
+    /// First word of rows 0 and 1 of an upload (4-byte formats only).
+    fn uploadSample(pixels: ?*const anyopaque, w: i32, h: i32, format: u32) [2]u32 {
+        var sample: [2]u32 = .{ 0, 0 };
+        const p = pixels orelse return sample;
+        if (format != gl.BGRA and format != gl.RGBA) return sample;
+        const base: [*]const u8 = @ptrCast(p);
+        sample[0] = std.mem.readInt(u32, base[0..4], .little);
+        if (h >= 2) {
+            const off: usize = @intCast(w * 4);
+            sample[1] = std.mem.readInt(u32, base[off..][0..4], .little);
+        }
+        return sample;
     }
     fn texParameteri(_: ?*anyopaque, _: u32, _: u32, _: i32) void {}
     fn pixelStorei(_: ?*anyopaque, _: u32, _: i32) void {}
-    fn enable(_: ?*anyopaque, _: u32) void {}
+    fn enable(ctx: ?*anyopaque, cap: u32) void {
+        const self = cast(ctx);
+        self.record(.gl_enable);
+        if (cap == gl.SCISSOR_TEST) self.scissor_enabled = true;
+    }
+    fn disable(ctx: ?*anyopaque, cap: u32) void {
+        const self = cast(ctx);
+        self.record(.gl_disable);
+        if (cap == gl.SCISSOR_TEST) self.scissor_enabled = false;
+    }
+    fn scissor(ctx: ?*anyopaque, x: i32, y: i32, w: i32, h: i32) void {
+        const self = cast(ctx);
+        self.record(.gl_scissor);
+        self.scissor_boxes.append(self.allocator, .{ .x = x, .y = y, .w = w, .h = h }) catch @panic("fake: oom");
+    }
     fn blendFunc(_: ?*anyopaque, _: u32, _: u32) void {}
     fn imageTargetTexture2D(ctx: ?*anyopaque, _: u32, _: EglImage) void {
         const self = cast(ctx);
@@ -3115,4 +3468,319 @@ test "mode: selectModeIndex honours mode= spec and preferred (M5.3 parity)" {
     // The fake seam has no get_crtc: current mode unknown, so
     // use-original-mode falls back to the preferred mode.
     try testing.expectEqual(@as(?usize, 1), try d.selectModeIndex(1, null, true));
+}
+
+// ---------------------------------------------------------------------------
+// Damage-only presentation (M8.2). The fake models mesa's buffer ages with 3
+// bos: after the prime + two frames the back buffer is 3 swaps old, so a
+// partial present replays the current damage + the previous two frames'.
+// ---------------------------------------------------------------------------
+
+/// One begin/end/flip-complete cycle on the fake (HDMI-A-1, CRTC 41).
+fn presentFrame(d: *Drm3d, drm: *FakeDrm, damage: []const Damage) !void {
+    _ = try d.beginFrame();
+    try d.endFrame(damage);
+    drm.queueFlipEvent(41, Drm3d.flip_cookie);
+    try d.readEvents();
+}
+
+test "damage: empty damage presents the full frame (M8.2 contract)" {
+    const a = testing.allocator;
+    var drm: FakeDrm = .{ .allocator = a };
+    defer drm.deinit();
+    var gpu: FakeGpu = .{ .allocator = a };
+    defer gpu.deinit();
+    const d = try setupActive(a, &drm, &gpu);
+    defer d.deinit();
+
+    _ = try d.beginFrame();
+    try d.endFrame(&.{});
+
+    // Full staging upload, unscissored clear, full-screen quad.
+    const up = gpu.uploads.items[gpu.uploads.items.len - 1];
+    try testing.expect(!up.sub);
+    try testing.expectEqual(@as(i32, 1920), up.w);
+    try testing.expectEqual(@as(i32, 1080), up.h);
+    try testing.expectEqual(gl.BGRA, up.format);
+    try testing.expectEqual(@as(usize, 0), gpu.scissor_boxes.items.len);
+    try testing.expect(!gpu.scissor_enabled);
+    const clr = gpu.clears.items[gpu.clears.items.len - 1];
+    try testing.expectEqual(gl.COLOR_BUFFER_BIT, clr.mask);
+    try testing.expect(clr.scissor == null);
+    try testing.expectEqual([4]f32{ 0, 0, 1920, 1080 }, gpu.dst_rects.items[gpu.dst_rects.items.len - 1]);
+    try testing.expect(d.flipPending());
+}
+
+test "damage: endFrame restricts upload, clear and draw to the damage rect" {
+    const a = testing.allocator;
+    var drm: FakeDrm = .{ .allocator = a };
+    defer drm.deinit();
+    var gpu: FakeGpu = .{ .allocator = a };
+    defer gpu.deinit();
+    const d = try setupActive(a, &drm, &gpu);
+    defer d.deinit();
+
+    const r = Damage{ .x = 100, .y = 200, .w = 300, .h = 50 };
+    try presentFrame(d, &drm, &.{}); // f1: full (empty damage)
+    try presentFrame(d, &drm, &.{r}); // f2: age 0 -> full present, logical entry r
+    try presentFrame(d, &drm, &.{r}); // f3: history holds full f1 -> full
+    const tex_images = gpu.count(.gl_tex_image);
+    const uploads = gpu.uploads.items.len;
+    const clears = gpu.clears.items.len;
+    const draws = gpu.draw_count;
+    const flips = drm.flip_calls.items.len;
+
+    _ = try d.beginFrame();
+    try d.endFrame(&.{r}); // f4: age 3, history r+r -> damage only
+
+    // Exactly one sub-upload of the rect; no full re-upload.
+    try testing.expectEqual(tex_images, gpu.count(.gl_tex_image));
+    try testing.expectEqual(uploads + 1, gpu.uploads.items.len);
+    const up = gpu.uploads.items[gpu.uploads.items.len - 1];
+    try testing.expect(up.sub);
+    try testing.expectEqual(@as(i32, 100), up.x);
+    try testing.expectEqual(@as(i32, 200), up.y);
+    try testing.expectEqual(@as(i32, 300), up.w);
+    try testing.expectEqual(@as(i32, 50), up.h);
+    try testing.expectEqual(gl.BGRA, up.format);
+    // Scissor box in GL bottom-left coords: y = 1080 - 200 - 50 = 830.
+    const box = ScissorBox{ .x = 100, .y = 830, .w = 300, .h = 50 };
+    try testing.expectEqual(box, gpu.scissor_boxes.items[gpu.scissor_boxes.items.len - 1]);
+    try testing.expect(!gpu.scissor_enabled); // disabled after the present
+    try testing.expectEqual(clears + 1, gpu.clears.items.len);
+    try testing.expectEqual(@as(?ScissorBox, box), gpu.clears.items[gpu.clears.items.len - 1].scissor);
+    try testing.expectEqual(draws + 1, gpu.draw_count);
+    try testing.expectEqual(@as(?ScissorBox, box), gpu.draw_boxes.items[gpu.draw_boxes.items.len - 1]);
+    try testing.expectEqual([4]f32{ 100, 200, 300, 50 }, gpu.dst_rects.items[gpu.dst_rects.items.len - 1]);
+    // Still a real flip.
+    try testing.expectEqual(flips + 1, drm.flip_calls.items.len);
+}
+
+test "damage: buffer age replays exactly the aged frames' damage" {
+    const a = testing.allocator;
+    var drm: FakeDrm = .{ .allocator = a };
+    defer drm.deinit();
+    var gpu: FakeGpu = .{ .allocator = a };
+    defer gpu.deinit();
+    const d = try setupActive(a, &drm, &gpu);
+    defer d.deinit();
+
+    const ra = Damage{ .x = 10, .y = 10, .w = 20, .h = 20 };
+    const rb = Damage{ .x = 100, .y = 200, .w = 300, .h = 50 };
+    const rc = Damage{ .x = 500, .y = 400, .w = 60, .h = 70 };
+    const rd = Damage{ .x = 700, .y = 600, .w = 40, .h = 40 };
+    try presentFrame(d, &drm, &.{}); // f1: full
+    try presentFrame(d, &drm, &.{ra}); // f2: age 0 -> full
+    try presentFrame(d, &drm, &.{rb}); // f3: history holds full f1 -> full
+
+    // f4: age 3 -> rc + rb + ra (the back buffer holds f1's content).
+    var uploads = gpu.uploads.items.len;
+    _ = try d.beginFrame();
+    try d.endFrame(&.{rc});
+    try testing.expectEqual(uploads + 3, gpu.uploads.items.len);
+    try testing.expectEqual(@as(i32, 500), gpu.uploads.items[gpu.uploads.items.len - 3].x); // rc
+    try testing.expectEqual(@as(i32, 100), gpu.uploads.items[gpu.uploads.items.len - 2].x); // rb
+    try testing.expectEqual(@as(i32, 10), gpu.uploads.items[gpu.uploads.items.len - 1].x); // ra
+    drm.queueFlipEvent(41, Drm3d.flip_cookie);
+    try d.readEvents();
+
+    // f5: age 3 -> rd + rc + rb; ra fell out of the age window.
+    uploads = gpu.uploads.items.len;
+    _ = try d.beginFrame();
+    try d.endFrame(&.{rd});
+    try testing.expectEqual(uploads + 3, gpu.uploads.items.len);
+    for (gpu.uploads.items[uploads..]) |u| {
+        try testing.expect(u.sub);
+        try testing.expect(u.x != 10); // ra is NOT replayed
+    }
+    try testing.expectEqual(@as(i32, 700), gpu.uploads.items[gpu.uploads.items.len - 3].x); // rd
+    try testing.expectEqual(@as(i32, 500), gpu.uploads.items[gpu.uploads.items.len - 2].x); // rc
+    try testing.expectEqual(@as(i32, 100), gpu.uploads.items[gpu.uploads.items.len - 1].x); // rb
+}
+
+test "damage: rects are clipped to the mode and merged" {
+    const a = testing.allocator;
+    var drm: FakeDrm = .{ .allocator = a };
+    defer drm.deinit();
+    var gpu: FakeGpu = .{ .allocator = a };
+    defer gpu.deinit();
+    const d = try setupActive(a, &drm, &gpu);
+    defer d.deinit();
+
+    const dmg = [_]Damage{
+        .{ .x = 0, .y = 0, .w = 100, .h = 100 },
+        .{ .x = 50, .y = 50, .w = 100, .h = 100 }, // overlaps -> {0,0,150,150}
+        .{ .x = 1900, .y = 1000, .w = 200, .h = 200 }, // clips -> {1900,1000,20,80}
+        .{ .x = 5000, .y = 5000, .w = 10, .h = 10 }, // fully outside -> dropped
+    };
+    try presentFrame(d, &drm, &.{});
+    try presentFrame(d, &drm, &dmg);
+    try presentFrame(d, &drm, &dmg);
+    const uploads = gpu.uploads.items.len;
+    _ = try d.beginFrame();
+    try d.endFrame(&dmg);
+
+    try testing.expectEqual(uploads + 2, gpu.uploads.items.len);
+    const up_a = gpu.uploads.items[gpu.uploads.items.len - 2];
+    const up_b = gpu.uploads.items[gpu.uploads.items.len - 1];
+    try testing.expectEqual(@as(i32, 0), up_a.x);
+    try testing.expectEqual(@as(i32, 0), up_a.y);
+    try testing.expectEqual(@as(i32, 150), up_a.w);
+    try testing.expectEqual(@as(i32, 150), up_a.h);
+    try testing.expectEqual(@as(i32, 1900), up_b.x);
+    try testing.expectEqual(@as(i32, 1000), up_b.y);
+    try testing.expectEqual(@as(i32, 20), up_b.w);
+    try testing.expectEqual(@as(i32, 80), up_b.h);
+    // Scissor y flips: 1080-150=930 and 1080-1000-80=0.
+    try testing.expectEqual(@as(usize, 2), gpu.scissor_boxes.items.len);
+    try testing.expectEqual(ScissorBox{ .x = 0, .y = 930, .w = 150, .h = 150 }, gpu.scissor_boxes.items[0]);
+    try testing.expectEqual(ScissorBox{ .x = 1900, .y = 0, .w = 20, .h = 80 }, gpu.scissor_boxes.items[1]);
+}
+
+test "damage: no visible change presents without drawing but still flips" {
+    const a = testing.allocator;
+    var drm: FakeDrm = .{ .allocator = a };
+    defer drm.deinit();
+    var gpu: FakeGpu = .{ .allocator = a };
+    defer gpu.deinit();
+    const d = try setupActive(a, &drm, &gpu);
+    defer d.deinit();
+
+    const out = Damage{ .x = 5000, .y = 5000, .w = 10, .h = 10 };
+    try presentFrame(d, &drm, &.{}); // f1: full
+    try presentFrame(d, &drm, &.{out}); // f2: age 0 -> full, empty logical entry
+    try presentFrame(d, &drm, &.{out}); // f3: history holds full f1 -> full
+    const uploads = gpu.uploads.items.len;
+    const clears = gpu.clears.items.len;
+    const draws = gpu.draw_count;
+    const flips = drm.flip_calls.items.len;
+
+    _ = try d.beginFrame();
+    try d.endFrame(&.{out}); // f4: aged damage all empty -> nothing to draw
+    try testing.expectEqual(uploads, gpu.uploads.items.len);
+    try testing.expectEqual(clears, gpu.clears.items.len);
+    try testing.expectEqual(draws, gpu.draw_count);
+    try testing.expectEqual(flips + 1, drm.flip_calls.items.len);
+}
+
+test "damage: full_redraw after modeset presents everything" {
+    const a = testing.allocator;
+    var drm: FakeDrm = .{ .allocator = a };
+    defer drm.deinit();
+    var gpu: FakeGpu = .{ .allocator = a };
+    defer gpu.deinit();
+    const d = try setupActive(a, &drm, &gpu);
+    defer d.deinit();
+
+    try testing.expect(d.needsFullRedraw());
+    _ = try d.beginFrame();
+    try d.endFrame(&.{.{ .x = 10, .y = 10, .w = 20, .h = 20 }});
+    const up = gpu.uploads.items[gpu.uploads.items.len - 1];
+    try testing.expect(!up.sub);
+    try testing.expectEqual(@as(i32, 1920), up.w);
+    try testing.expectEqual(@as(usize, 0), gpu.scissor_boxes.items.len);
+    try testing.expect(!d.needsFullRedraw());
+}
+
+test "damage: GL-drawn frames clear lazily and force the next frame full" {
+    const a = testing.allocator;
+    var drm: FakeDrm = .{ .allocator = a };
+    defer drm.deinit();
+    var gpu: FakeGpu = .{ .allocator = a };
+    defer gpu.deinit();
+    const d = try setupActive(a, &drm, &gpu);
+    defer d.deinit();
+
+    var atlas = try GlyphAtlas.init(a, 64, 64);
+    defer atlas.deinit();
+    try d.uploadAtlas(&atlas);
+    const r = Damage{ .x = 100, .y = 200, .w = 300, .h = 50 };
+    try presentFrame(d, &drm, &.{}); // f1: staging full
+
+    // f2: GL frame. The first draw clears the whole target; the second does not.
+    _ = try d.beginFrame();
+    const clears = gpu.clears.items.len;
+    const cell = Cell{ .x = 0, .y = 0, .w = 8, .h = 16, .sx = 0, .sy = 0, .sw = 8, .sh = 16, .page = 0, .fg = 0xFF0000 };
+    try d.drawCells(&.{cell});
+    try testing.expectEqual(clears + 1, gpu.clears.items.len);
+    try testing.expect(gpu.clears.items[gpu.clears.items.len - 1].scissor == null);
+    try d.drawCells(&.{cell});
+    try testing.expectEqual(clears + 1, gpu.clears.items.len);
+    const tex_images = gpu.count(.gl_tex_image);
+    try d.endFrame(&.{r}); // GL frame: no staging upload
+    try testing.expectEqual(tex_images, gpu.count(.gl_tex_image));
+    drm.queueFlipEvent(41, Drm3d.flip_cookie);
+    try d.readEvents();
+
+    // f3: staging frame; the GL frame's delta is unknown -> full present.
+    _ = try d.beginFrame();
+    try d.endFrame(&.{r});
+    const up = gpu.uploads.items[gpu.uploads.items.len - 1];
+    try testing.expect(!up.sub);
+    try testing.expectEqual(@as(i32, 1920), up.w);
+}
+
+test "damage: sub-width rects upload tight rows, full-width rects in place" {
+    const a = testing.allocator;
+    var drm: FakeDrm = .{ .allocator = a };
+    defer drm.deinit();
+    var gpu: FakeGpu = .{ .allocator = a };
+    defer gpu.deinit();
+    const d = try setupActive(a, &drm, &gpu);
+    defer d.deinit();
+
+    const r = Damage{ .x = 100, .y = 200, .w = 3, .h = 2 };
+    try presentFrame(d, &drm, &.{});
+    try presentFrame(d, &drm, &.{r});
+    try presentFrame(d, &drm, &.{r});
+
+    // f4: sub-width rect -> row-copied scratch upload.
+    const f = try d.beginFrame();
+    f.set(100, 200, 0xFF112233);
+    f.set(102, 200, 0xFF445566);
+    f.set(100, 201, 0xFF778899);
+    f.set(102, 201, 0xFFAABBCC);
+    try d.endFrame(&.{r});
+    const up = gpu.uploads.items[gpu.uploads.items.len - 1];
+    try testing.expect(up.sub);
+    try testing.expectEqual(@as(u32, 0xFF112233), up.sample[0]);
+    // Row 1 starts at (100,201), not at the next word of row 0.
+    try testing.expectEqual(@as(u32, 0xFF778899), up.sample[1]);
+    drm.queueFlipEvent(41, Drm3d.flip_cookie);
+    try d.readEvents();
+
+    // f5: full-width rect uploads in place; the aged sub-width rect replays.
+    const r2 = Damage{ .x = 0, .y = 300, .w = 1920, .h = 2 };
+    const f2 = try d.beginFrame();
+    f2.set(0, 300, 0xFF010203);
+    f2.set(0, 301, 0xFF040506);
+    try d.endFrame(&.{r2});
+    const ups = gpu.uploads.items[gpu.uploads.items.len - 2 ..];
+    try testing.expectEqual(@as(i32, 0), ups[0].x); // r2 (current, full width)
+    try testing.expectEqual(@as(u32, 0xFF010203), ups[0].sample[0]);
+    try testing.expectEqual(@as(u32, 0xFF040506), ups[0].sample[1]);
+    try testing.expectEqual(@as(i32, 100), ups[1].x); // r (replayed)
+}
+
+test "damage: unknown buffer age falls back to a full frame" {
+    const a = testing.allocator;
+    var drm: FakeDrm = .{ .allocator = a };
+    defer drm.deinit();
+    var gpu: FakeGpu = .{ .allocator = a };
+    defer gpu.deinit();
+    const d = try setupActive(a, &drm, &gpu);
+    defer d.deinit();
+
+    const r = Damage{ .x = 100, .y = 200, .w = 300, .h = 50 };
+    try presentFrame(d, &drm, &.{});
+    try presentFrame(d, &drm, &.{r});
+    try presentFrame(d, &drm, &.{r});
+
+    // f4 would be partial; a failing age query must present everything.
+    gpu.fail_buffer_age = true;
+    const tex_images = gpu.count(.gl_tex_image);
+    _ = try d.beginFrame();
+    try d.endFrame(&.{r});
+    try testing.expectEqual(tex_images + 1, gpu.count(.gl_tex_image));
+    try testing.expectEqual(@as(usize, 0), gpu.scissor_boxes.items.len);
 }

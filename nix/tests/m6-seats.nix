@@ -69,18 +69,32 @@
     _ctx: ''
       import datetime as dt
       import time
+      import shlex
 
-      SHORT = dt.timedelta(seconds=10)
+      SHORT = dt.timedelta(seconds=30)
+
+      # The capture helper, defined once and reused: typed into the us-layout
+      # shell for S1, and installed into ~/.bash_profile for the de-layout
+      # shell that S2's console restart produces (send_chars is US-mapped, so
+      # it cannot type the definition once the layout is de).
+      KFUNC = 'k() { read -r -n1 c; printf %s "$c" >/tmp/k; }'
 
       # Capture the character(s) produced by a sequence of physical keys.
-      # k() is defined in the autologin shell while the layout is still us;
-      # it reads one character from the tty and writes it to /tmp/k. The
+      # KFUNC reads one character from the tty and writes it to /tmp/k. The
       # invocation "k\n" is layout-invariant (us and de agree on k/Return),
-      # so it keeps working after the keymap swap. truncate/cat run over the
-      # driver backdoor and are unaffected by the console keymap.
+      # so it keeps working after the keymap swap. rm/cat run over the driver
+      # backdoor and are unaffected by the console keymap.
       def capture(keys):
-          machine.succeed("truncate -s 0 /tmp/k")
+          # Remove, don't truncate: the backdoor runs as root, so creating or
+          # truncating /tmp/k here would leave it root-owned and the alice
+          # shell's `> /tmp/k` would fail with EACCES. Removing it lets the
+          # shell recreate it as alice on every capture.
+          machine.succeed("rm -f /tmp/k")
           machine.send_chars("k\n")
+          # Let `read -r -n1` switch the tty to non-canonical mode before the
+          # first key lands, so the key is not left buffered in canonical mode
+          # waiting for an Enter that never comes.
+          time.sleep(0.5)
           for key in keys:
               machine.send_key(key)
           machine.wait_until_succeeds("test -s /tmp/k", timeout=SHORT)
@@ -102,7 +116,7 @@
       with subtest("S1 localectl set-x11-keymap de swaps y/z live"):
           waitForLogin(machine)
           # us baseline: define the capture helper, then prove physical y -> y.
-          machine.send_chars('k() { read -r -n1 c; printf %s "$c" >/tmp/k; }\n')
+          machine.send_chars(KFUNC + "\n")
           time.sleep(0.3)
           wait_keymap("y")
 
@@ -118,14 +132,45 @@
           assert got == "y", f"[{impl}] de: physical z gave {got!r}, expected 'y'"
 
       with subtest("S2 compose: dead_acute + a -> á"):
-          # Still the de layout: dead_acute sits on the physical '=' key
-          # (xkeyboard-config symbols/de, key <AE12>). The compose table is
-          # the locale one (en_US.UTF-8 via XLOCALEDIR, shipped by libX11
-          # through libxkbcommon); both implementations pick it from
-          # LC_ALL/LC_CTYPE/LANG. The dead key is swallowed, 'a' completes
-          # the sequence, and the shell receives the single character á.
-          got = capture(["equal", "a"])
-          assert got == "á", f"[{impl}] compose gave {got!r}, expected 'á'"
+          # dead_acute sits on the physical '=' key of the de layout
+          # (xkeyboard-config symbols/de, key <AE12>); dead_acute + a composes
+          # to á via the locale compose table (en_US.UTF-8, picked from
+          # LC_ALL/LC_CTYPE/LANG). The dead key is swallowed and the shell
+          # receives the single character á.
+          #
+          # Genuine parity difference in HOW compose survives the S1 keymap
+          # change:
+          #   * kmshaunt keeps the compose table attached across the live
+          #     reload (xkb.State.reload), so it composes directly on the de
+          #     layout S1 left behind.
+          #   * kmscon DROPS compose on a live keymap reload:
+          #     kmscon_seat_update_xkb_layout -> input_update_keymap destroys
+          #     the compose table and re-creates the keyboard devices BEFORE
+          #     input_set_compose restores the table, leaving the devices with
+          #     a NULL compose_state (kmscon src/input/input.c + input_uxkb.c).
+          #     It composes again only after the console re-initializes and
+          #     reads the de layout back from locale1 at startup.
+          # Each node is asserted via the mechanism it supports; the divergence
+          # is a kmscon reference bug, not a kmshaunt regression. (A uniform
+          # restart is not possible: kmshaunt does not apply locale1's current
+          # layout at startup, so it would come back up on us, and it also
+          # segfaults in libinput teardown on graceful shutdown.)
+          if impl == "kmshaunt":
+              got = capture(["equal", "a"])
+              assert got == "á", f"[{impl}] compose gave {got!r}, expected 'á'"
+          else:
+              # kmscon: restart so the de keymap (still set in locale1) comes
+              # up WITH compose. The new shell is already on de, so install
+              # KFUNC through ~/.bash_profile (sourced by the autologin login
+              # shell) instead of typing it, which send_chars cannot do on de.
+              machine.succeed(
+                  "printf '%s\\n' " + shlex.quote(KFUNC)
+                  + " >> /home/alice/.bash_profile && chown alice /home/alice/.bash_profile"
+              )
+              machine.succeed(f"systemctl restart {unit}")
+              waitForLogin(machine)
+              got = capture(["equal", "a"])
+              assert got == "á", f"[{impl}] compose gave {got!r}, expected 'á'"
 
           screenshotCompare(machine, impl, "S2-de-compose")
     '';

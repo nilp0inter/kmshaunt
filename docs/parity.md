@@ -9,24 +9,24 @@ Last updated: 2026-11-13. This file is ticked as features land; `nix flake check
 | Feature | Status | Evidence / gap |
 |---|---|---|
 | `kmshaunt-vt@.service` as autovt@, getty fallback | ✅ | M1.7/M1.8; T4 m1-login green |
-| Multi-seat `kmshaunt.service` (sd-login) | 🟡 | M6.2 daemon; skips seats without a fake VT worker |
+| Multi-seat `kmshaunt.service` (sd-login) | 🟡 | M6.2 daemon; skips seats without a fake VT worker; T4 m6-seats in flight (S1 timeout being fixed) |
 | PAM service, locale1 xkb | ✅ | M1.7, M6.5 |
-| `session-max`, `session-control` | 🟡 | M6.3 manager; real-VT gate being added |
-| `libseat` backend | ✅ | Startup segfault fixed: `setCallbacks` no longer fires queued enable, `activate()` delivers it; T1 real-ops regression + T3 m6-libseat-startup green on tensor (unit active, no segfault, logind greeter seat, autologin shell) |
+| `session-max`, `session-control` | ✅ | M6.3 manager; real-VT gate added |
+| `libseat` backend | ✅ | Startup crash fixed: `setCallbacks` no longer fires queued enable, `activate()` delivers it; T1 real-ops regression + T3 m6-libseat-startup green on tensor (unit active, no segfault, logind greeter seat, autologin shell) |
 
 ## Terminal
 | Feature | Status | Evidence / gap |
 |---|---|---|
-| pty replies DA/DSR/size, bell, OSC52, private OSC setBackground/setForeground | ✅ | M2.1 |
-| `sb-size`, grab-scroll-*/page-* | ✅ | M2.2 |
+| pty replies DA/DSR/size, bell, OSC52, private OSC setBackground/setForeground | ✅ | M2.1; T4 m2-terminal green (both nodes) |
+| `sb-size`, grab-scroll-*/page-* | ✅ | M2.2; sb-size byte budget fixed |
 | `term`, `reset-env`, `login`, `oneshot` | ✅ | M1.4, M2.4 |
 | `issue`/`issue-path` agetty escapes | ✅ | M2.4 |
 | `backspace-delete` | ✅ | M2.4 |
 | `blink` (cursor) | ✅ | timer wired, repaint verified |
 | SGR text blink (attr 5) | ✅ | attr-5 blink wired; repaint verified |
 | palettes (presets + custom + palette-*) | ✅ | applied to terminal via `applyPalette`; presets, custom, xterm256 |
-| `asciicast`/`asciicast-loop` | 🟡 | semantics = playback (kmscon §5.2); recording→playback cutover in flight |
-| resize on mode change + reflow | 🟡 | zoom/rotate wired; mode-change resize wiring in flight |
+| `asciicast`/`asciicast-loop` | ✅ | playback semantics, kmscon parity (kmscon §5.2); stop-on-key + loop verified |
+| resize on mode change + reflow | ✅ | zoom/rotate wired; mode-change resize + reflow verified |
 
 ## Input
 | Feature | Status | Evidence / gap |
@@ -36,25 +36,26 @@ Last updated: 2026-11-13. This file is ticked as features land; `nix flake check
 | xkb-model/layout/variant/options/keymap/compose-file/repeat-* | ✅ | M6.5 |
 | locale1 live keymap follow | ✅ | M6.5; T4 m6-seats S1 |
 | compose | ✅ | T4 m6-seats S2 |
+| graceful shutdown (SIGTERM teardown) | ✅ | libinput stores `struct libinput_interface` by pointer: `Real.udevCreateContext` now passes the static `interface` through instead of a stack copy that dangled until `libinput_unref` → `evdev_device_remove` → `close_restricted` jumped through the reused stack slot (segfault on `systemctl stop/restart`, SIGKILL "worked"); `Input.deinit` idempotent; T1 interface-lifetime/refcount/idempotency tests + T3 stop/start/restart VM repro (before: segfault, after: clean) |
 | absolute-pointer transform (tablets) | ⬜ | libinput _transformed getters (M5.7 note) |
 
 ## Grabs
 | Feature | Status | Evidence / gap |
 |---|---|---|
 | scroll/page/zoom/session/terminal-new | ✅ | M2.2, M3.8, M6.3 |
-| grab-rotate-cw/ccw | 🟡 | rotation helper ready; VideoWiring wiring in flight |
-| grab-reboot | 🟡 | ctrl-alt-del semantics in flight (writes kernel ctrl-alt-del flag + sync) |
+| grab-rotate-cw/ccw | ✅ | rotation helper wired; grab-rotate verified |
+| grab-reboot | ✅ | reads `/proc/sys/kernel/ctrl-alt-del`: 0 = soft reboot, 1 = hard reboot + sync |
 
 ## Video
 | Feature | Status | Evidence / gap |
 |---|---|---|
 | drm2d modeset + dumb buffers + flip | ✅ | M1.3 |
-| drm3d GBM+EGL+GLES2, hwaccel | ✅ | M5.1 |
+| drm3d GBM+EGL+GLES2, hwaccel | ✅ | M5.1; hwaccel now selects drm3d; GBM/EGL/GLESv2 linked |
 | fbdev (no-drm) | ✅ | M5.2 |
 | gpus/use-original-mode/mode= | ✅ | backend + VideoWiring main.zig |
-| multi-monitor clone/largest/scaled, screen= | 🟡 | multi-card done; same-card multi-connector scanout in flight |
+| multi-monitor clone/largest/scaled, screen= | 🟡 | multi-card done; same-card multi-connector backend done, main.zig scanout wiring in flight; T4 m5-video written, run pending |
 | udev hotplug | ✅ | event source + VideoWiring wired |
-| dpms-timeout | 🟡 | primary connector done; all-connector idle/wake in flight |
+| dpms-timeout | 🟡 | all-connector idle/wake backend done; per-card wiring in flight |
 | hardware cursor plane + soft-cursor force | ✅ | backend + gate wiring |
 
 ## Font / text (R1)
@@ -69,20 +70,20 @@ Last updated: 2026-11-13. This file is ticked as features land; `nix flake check
 | decorations + cursor styles | ✅ | M3.7 |
 | atlas LRU, font-size auto, grab-zoom | ✅ | M3.8 |
 | psf/unifont/8x16 engines | ✅ | M3.9 |
-| T2 goldens + T3 VM golden | 🟡 | 19 goldens byte-exact, nix check in flight; T3 VM golden pending |
+| T2 goldens + T3 VM golden | 🟡 | T2 ✅ 20 goldens byte-exact; T3 VM golden in flight (run pending) |
 
 ## Kitty graphics (R2)
 | Feature | Status | Evidence / gap |
 |---|---|---|
 | libspng decoder, image cache, CPU compositor | ✅ | M4.1-M4.3 |
 | animation, storage-limit, R3 root media off | ✅ | M4.4/M4.5 (551+16 tests) |
-| T2 kitty goldens + T3 kitten icat | 🟡 | fixtures generated; nix check in flight; T3 kitten icat pending |
+| T2 kitty goldens + T3 kitten icat | 🟡 | T2 ✅ kitty goldens byte-exact; T3 kitten icat in flight |
 
 ## Performance (M8)
 | Feature | Status | Evidence / gap |
 |---|---|---|
-| vtebench throughput vs kmscon | 🟡 | M8.1; benchmark running on tensor |
-| damage-only presentation | 🟡 | M8.2; analysis done, implementation in flight |
-| memory @10k scrollback | 🟡 | M8.3; measurement in flight |
-| T5 real-hardware checklist | ⬜ | M8.4 (needs ≥2 GPU vendors; assess) |
-| docs/perf.md | 🟡 | M8.5; being written |
+| vtebench throughput vs kmscon | 🟡 | M8.1; 33x gap CLOSED (debug libghostty + loop pacing): seq parity 1.06s, suite completes, scrolling ≥ parity; cell/unicode render-efficiency gaps remain (docs/perf.md) |
+| damage-only presentation | 🟡 | M8.2; drm2d DirtyFB done, drm3d partial-redraw in flight |
+| memory @10k scrollback | 🟡 | M8.3; sb-size byte budget fixed, re-measure pending |
+| T5 real-hardware checklist | ❌ | M8.4 HARDWARE-BLOCKED: host has only Intel i915, needs ≥2 GPU vendors |
+| docs/perf.md | ✅ | M8.5; docs/perf.md written |

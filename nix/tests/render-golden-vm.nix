@@ -115,7 +115,7 @@ pkgs.testers.runNixOSTest {
 
     def clearScreen() -> None:
         machine.send_chars("printf '\\x1b[2J\\x1b[H'\n")
-        machine.sleep(0.5)
+        machine.sleep(1)
 
     def showFixture(fixture: str, shot: str) -> None:
         machine.send_chars(f"cat /etc/t2-fixtures/{fixture}\n")

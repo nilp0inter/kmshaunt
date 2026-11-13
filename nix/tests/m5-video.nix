@@ -73,14 +73,12 @@
 #     them a centered clipped viewport (deliberate divergence,
 #     src/video/layout.zig header). No common assertion exists yet.
 #
-# Known parity gap (reported, not fixed here):
-#   * kmshaunt --hwaccel currently falls back to drm2d with a warning:
-#     src/main.zig setupVideo logs "Drm3d not available in this build" because
-#     the GBM/EGL/GL bindings are not wired into build.zig yet. The drm3d
-#     variant still passes on both nodes (the console renders), and the
-#     libEGL-mapped evidence line in the test output shows which node actually
-#     brought up EGL. kmscon dlopens its drm3d backend, so libEGL appears in
-#     its maps only when drm3d is live.
+# hwaccel status: kmshaunt --hwaccel now selects drm3d (GBM/EGL/GLESv2 wired
+#   in build.zig; src/main.zig openDrmBackend tries Drm3d.init and falls back
+#   to drm2d only on error.Unsupported/NoConnectedDisplay). The drm3d variant
+#   asserts the libEGL-mapped evidence line, which shows which node actually
+#   brought up EGL. kmscon dlopens its drm3d backend, so libEGL appears in its
+#   maps only when drm3d is live.
 #
 # Goldens: nix/tests/goldens/<variant>/<impl>/<shot>.png, same stub contract
 # as nix/tests/lib.nix — while a golden is missing the compare only saves the

@@ -8,8 +8,8 @@ Status of the M8 items:
 | Item | Status |
 |---|---|
 | M8.1 vtebench throughput vs kmscon | kmscon measured (full suite); kmshaunt suite did not finish in 900 s — GAP, see below |
-| M8.2 damage-only presentation | drm2d implemented; drm3d GAP (evidence below) |
-| M8.3 memory @ 10k scrollback | measured: kmscon 57.7 MiB, kmshaunt 34.7 MiB peak RSS; sb-size byte-cap GAP found (below) |
+| M8.2 damage-only presentation | drm2d + drm3d implemented (evidence below) |
+| M8.3 memory @ 10k scrollback | measured: kmscon 57.7 MiB, kmshaunt 34.7 MiB peak RSS; sb-size byte-cap fixed (setScrollbackMaxBytes), re-measure pending |
 | M8.4 T5 real hardware | HARDWARE-BLOCKED for the ≥2-vendor exit criterion (assessment below) |
 | M8.5 this document | written with the 2026-11-13 measured numbers |
 
@@ -85,6 +85,79 @@ evidence of the gap from the same VM:
   every benchmark") is NOT met by the current build — closing the gap is
   follow-up work (likely the per-chunk render/flip pacing in the
   renderIfDirty loop, src/main.zig).
+
+### Root cause and fix (2026-11-13, PerfFix)
+
+The 33x gap was NOT render/flip pacing. Loop instrumentation (pump vs
+render vs present timers) showed one `onPtyReadable` drain running
+**40.7 s** straight through the whole `seq` burst while render averaged
+129 us and present 8.8 ms: the bottleneck was `vt.write` (libghostty
+parse) at ~3 KiB/s. The build summary gave the cause:
+`compile lib ghostty-vt-static debug native` — kmshaunt's build.zig
+called `b.lazyDependency("ghostty", .{})` with no options, and ghostty
+reads its OWN `-Doptimize` (Config.zig `standardOptimizeOption`), so the
+C library defaulted to **Debug** (runtime safety + `assertIntegrity` on
+every PageList grow) while kmshaunt itself was ReleaseFast. kmscon's
+optimized C parse is ~30x faster than a debug libghostty.
+
+Fixes applied:
+
+1. **build.zig**: propagate `.target`/`.optimize` into the ghostty
+   dependency so libghostty-vt builds ReleaseFast (the decisive fix).
+2. **Frame pacing (src/main.zig)**: `markDirty` no longer renders
+   synchronously in the pty/input hot path. A one-shot frame timer (one
+   display refresh, 4..50 ms clamp) coalesces damage into one render;
+   flip completion (`onDrmEvent`) presents damage accumulated while a
+   flip was in flight. Flips were already non-blocking submits.
+3. **Bounded drain (src/session/terminal.zig)**: `onPtyReadable` drains
+   at most 128 KiB per pump and returns "more pending"; the console
+   re-arms the edge-triggered pty source (`epoll_ctl MOD` re-reports
+   readiness), so a sustained burst can no longer monopolize the loop.
+4. **Single-pass collection (src/render/cpu.zig)**: the redraw set is
+   collected once per frame into a row-major snapshot; backgrounds and
+   text both draw from it (the per-cell render-state C API was walked
+   twice per frame before). Pixel-identical, halves the FFI cell cost.
+5. **Band-limited present (src/main.zig)**: the trivial 1:1 path blits
+   only the union of this frame's and the previous frame's damage bands
+   (the back buffer is two frames stale under double buffering) instead
+   of the whole canvas; the dumb-buffer mapping is write-combining, so a
+   full-canvas memcpy costs milliseconds. full_redraw / unmergeable
+   damage still copies everything.
+6. **Shaped-cluster cache (src/render/cpu.zig)**: complex grapheme
+   clusters (emoji ZWJ sequences, flags, combining marks) are shaped once
+   and reused, keyed by (face, style, codepoints). Per-cluster HarfBuzz
+   shaping dominated unicode frames (~290 ms/frame measured); the cache
+   removes the repeat shaping.
+
+The sb-size byte-cap gap (M8.3 below) was fixed in parallel
+(terminal.zig `setScrollbackMaxBytes(sb_size * cols * 16)`).
+
+### Results after the fix (same VM, same harness)
+
+`seq 1 20000`: kmscon **1.06 s**, kmshaunt **1.06 s** — parity
+(was 34.83 s, a **32.9x** speedup). The full vtebench suite now
+completes (119.8 s; previously it did not finish within 900 s):
+
+| benchmark | kmscon MiB/s | kmshaunt MiB/s | ratio |
+|---|---|---|---|
+| cursor_motion | 33.1 | 23.9 | 0.72 |
+| dense_cells | 37.0 | 24.6 | 0.67 |
+| light_cells | 72.5 | 34.0 | 0.47 |
+| scrolling | 3.1 | 3.7 | 1.20 |
+| scrolling_bottom_region | 4.6 | 5.1 | 1.10 |
+| scrolling_bottom_small_region | 3.9 | 5.2 | 1.34 |
+| scrolling_fullscreen | 23.8 | 18.3 | 0.77 |
+| scrolling_top_region | 4.6 | 5.2 | 1.11 |
+| scrolling_top_small_region | 5.0 | 5.1 | 1.02 |
+| unicode | 61.3 | 4.6 | 0.08 |
+
+Grid 50x160 on both consoles this run. All scrolling benchmarks are at
+parity or better; the line-scrolling case that exposed the 33x gap is at
+parity. The remaining gaps are render/present efficiency, not loop
+blocking: the cell benchmarks are bounded by the write-combining
+back-buffer blit (~7 ms/frame), and unicode by per-cluster shaping
+(the shaped-cluster cache above targets it; verification pending).
+Peak RSS after seq: kmscon 59,088 kB, kmshaunt 38,756 kB.
 
 Raw data: test output `kmscon.dat` (221 lines of per-sample ms),
 screenshots `m8-{kmscon,kmshaunt}-login.png`,
@@ -181,30 +254,31 @@ Caveats (legacy KMS semantics, not gaps against M8.2's wording):
 - DirtyFB only saves panel-side work on drivers that implement it (e.g.
   PSR/manual-update panels); on bochs it is a no-op after the probe.
 
-### drm3d: GAP — no partial redraw at presentation
+### drm3d: implemented (scissor + sub-upload + buffer-age replay)
 
-- `src/video/drm3d.zig:1021-1048` — `endFrame` discards damage:
-  line 1025 `_ = damage; // GL presents the whole back buffer; damage paces
-  redraws upstream.` Every frame swaps/locks/flips a full GBM bo.
-- `src/video/drm3d.zig:1011-1012` — `beginFrame` clears the whole GL color
-  buffer every frame.
-- `src/video/drm3d.zig:1569-1595` — `presentStaging` re-uploads the entire
-  CPU staging buffer (`glTexImage2D`, line 1578) and draws a full-screen
-  quad (dst = whole staging size, lines 1589-1590). No scissor, no damage
-  clipping anywhere in the file (no `glScissor` in the GL ops vtable).
-- The GL-native hooks `drawCells` (1500-1531) / `drawImage` (1536-1565)
-  could carry a partial redraw, but they have no caller: the only wired
-  renderer is `CpuRenderer` (`src/main.zig:305, 694`), and `--hwaccel`
-  falls back to drm2d because the GBM/EGL/GL bindings are not wired into
-  build.zig (`src/main.zig:539-543`; VideoWiring owns that integration).
-- Atlas uploads ARE damage-driven (`uploadAtlas`, 1452-1497: generation +
-  dirtyRects sub-uploads), but that is texture maintenance, not frame
-  presentation.
+- `src/video/drm3d.zig` `endFrame(damage)` now computes the effective present
+  region and passes it to `presentStaging(rects)`: each rect is sub-uploaded
+  via `glTexSubImage2D` (no full `glTexImage2D` per frame), then
+  `glScissor` + scissored `glClear` + a quad sized to the rect. Empty damage
+  = full frame (contract); also full on `full_redraw`, unknown buffer age,
+  or rect overflow. Rects are clipped to the mode and merged like drm2d.
+- GBM buffer recycling is handled via `EGL_BUFFER_AGE_EXT`: the backend
+  replays the union of the last `age` frames' logical damage from a fixed
+  8-frame ring (mesa `platform_drm.c` age semantics). Missing history/age →
+  full frame. `beginFrame` no longer full-clears the recycled back buffer.
+- Sub-width rects are row-copied into a tight scratch (GLES2 has no
+  `UNPACK_ROW_LENGTH`); full-width rects upload in place.
+- Verified: 21 drm3d tests (12 pre-existing + 9 new: empty=full, damage
+  restricts upload/clear/draw, buffer-age replay, clip+merge, no-change zero
+  work, full_redraw, GL-frame lazy clear, sub-width upload, age-query
+  fallback). Tensor check phase green.
+- `--hwaccel` now selects drm3d (GBM/EGL/GLESv2 wired in build.zig;
+  `openDrmBackend` in main.zig). The GL-native renderer hooks still have no
+  production caller; the backend conservatively forces full frames after
+  GL-drawn frames until a GL renderer replays aged damage itself.
 
-Conclusion: M8.2 is satisfied for drm2d (the backend the benchmark and the
-current build actually use); drm3d partial redraw is unimplemented and
-additionally unreachable until the hwaccel wiring lands. No src/ edits were
-made (out of scope for this task).
+Conclusion: M8.2 is satisfied for BOTH backends — drm2d (DirtyFB + dirty-row
+redraw) and drm3d (scissor + sub-upload + buffer-age replay).
 
 ## M8.4 — T5 real-hardware checklist: assessment
 
