@@ -215,9 +215,17 @@ pub const Device = opaque {};
 pub const Udev = opaque {};
 
 /// `struct libinput_interface` (libinput.h:3617). Signatures match the
-/// translate-c output exactly so `Real` can copy the members. libinput
-/// calls open_restricted for every device node it needs; the return is
-/// the fd or a negative errno.
+/// translate-c output exactly so `Real` can pass the pointer through.
+/// libinput calls open_restricted for every device node it needs; the
+/// return is the fd or a negative errno.
+///
+/// LIFETIME: libinput stores this struct BY POINTER (libinput.c
+/// `libinput->interface = interface`) and calls through it for the whole
+/// context lifetime, including close_restricted from evdev_device_remove
+/// during libinput_unref. The instance handed to udev_create_context must
+/// therefore outlive the context (the module-level `interface` below is
+/// static); a stack copy dangles and graceful shutdown jumps through the
+/// reused stack slot.
 pub const Interface = extern struct {
     open_restricted: *const fn (path: [*c]const u8, flags: c_int, user_data: ?*anyopaque) callconv(.c) c_int,
     close_restricted: *const fn (fd: c_int, user_data: ?*anyopaque) callconv(.c) void,
@@ -294,6 +302,8 @@ pub const GrabId = enum(u16) {
 pub const LibinputOps = struct {
     udev_new: *const fn () callconv(.c) ?*Udev,
     udev_unref: *const fn (udev: *Udev) callconv(.c) ?*Udev,
+    /// The interface is stored by pointer, NOT copied: it must stay valid
+    /// until `unref` (see `Interface`).
     udev_create_context: *const fn (interface: *const Interface, user_data: ?*anyopaque, udev: *Udev) callconv(.c) ?*Libinput,
     udev_assign_seat: *const fn (li: *Libinput, seat_id: [*:0]const u8) callconv(.c) c_int,
     unref: *const fn (li: *Libinput) callconv(.c) ?*Libinput,
@@ -361,11 +371,18 @@ const Real = struct {
     }
 
     fn udevCreateContext(intf: *const Interface, user_data: ?*anyopaque, udev: *Udev) callconv(.c) ?*Libinput {
-        const iface = c.struct_libinput_interface{
-            .open_restricted = intf.open_restricted,
-            .close_restricted = intf.close_restricted,
-        };
-        return @ptrCast(c.libinput_udev_create_context(&iface, user_data, @ptrCast(udev)));
+        // Pass the caller's pointer straight through: libinput keeps it for
+        // the context lifetime (see `Interface`). Copying into a local here
+        // left libinput holding a dangling stack pointer; the first
+        // close_restricted during libinput_unref (evdev_device_remove ->
+        // evdev_device_suspend) then jumped through the reused stack slot
+        // and segfaulted graceful shutdown. `Interface` is layout-identical
+        // to the translate-c struct (two C function pointers, extern).
+        comptime {
+            std.debug.assert(@sizeOf(Interface) == @sizeOf(c.struct_libinput_interface));
+            std.debug.assert(@alignOf(Interface) == @alignOf(c.struct_libinput_interface));
+        }
+        return @ptrCast(c.libinput_udev_create_context(@ptrCast(intf), user_data, @ptrCast(udev)));
     }
 
     fn udevAssignSeat(li: *Libinput, seat_id: [*:0]const u8) callconv(.c) c_int {
@@ -551,6 +568,10 @@ pub const Input = struct {
     repeat_cfg: xkb.RepeatConfig,
     repeat: ?RepeatKey = null,
 
+    /// Set by `deinit`; the only field left readable after the undefined
+    /// poisoning, so a second deinit is a no-op.
+    deinited: bool = false,
+
     /// Create the udev context, assign seat "seat0" and build the xkb
     /// state (+ optional Compose from cfg). `keymap` and `cfg` are
     /// borrowed and must outlive the Input.
@@ -593,9 +614,13 @@ pub const Input = struct {
         };
     }
 
-    /// Release everything. The repeat timer is owned by the caller
+    /// Release everything, idempotently: a second call is a no-op. Device
+    /// references are dropped first, then the libinput context (which
+    /// removes the devices and closes their fds through the interface),
+    /// then the udev context. The repeat timer is owned by the caller
     /// (deinit it after this call; the Loop outlives both).
     pub fn deinit(self: *Input) void {
+        if (self.deinited) return;
         self.repeat = null;
         for (self.devices.items) |d| _ = self.ops.device_unref(d.device);
         self.devices.deinit(self.allocator);
@@ -607,6 +632,7 @@ pub const Input = struct {
         _ = self.ops.unref(self.li);
         _ = self.ops.udev_unref(self.udev);
         self.* = undefined;
+        self.deinited = true;
     }
 
     /// The epoll-ready fd (libinput_get_fd). Register EPOLLIN and call
@@ -911,8 +937,9 @@ pub const Input = struct {
 
 /// Passed to every udev_create_context call; libinput opens device nodes
 /// through it. Plain syscalls, no libc symbols — safe to analyze in
-/// hermetic builds.
-const interface = Interface{
+/// hermetic builds. Static storage: libinput stores the pointer for the
+/// context lifetime (see `Interface`), so this must never become a local.
+pub const interface = Interface{
     .open_restricted = openRestricted,
     .close_restricted = closeRestricted,
 };

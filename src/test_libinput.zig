@@ -79,7 +79,15 @@ const Fake = struct {
     queue: std.ArrayListUnmanaged(*FakeEvent) = .empty,
     dispatch_calls: usize = 0,
     destroyed: usize = 0,
+    unref_calls: usize = 0,
+    udev_unref_calls: usize = 0,
     poll_fd: c_int = 77,
+    /// A real fd that fakeUnref closes through the stored interface, the
+    /// way libinput closes device fds during unref. -1: nothing to close.
+    device_fd: c_int = -1,
+    /// libinput stores the interface BY POINTER for the context lifetime;
+    /// the fake does the same so tests can prove the pointer outlives init.
+    interface: ?*const libinput.Interface = null,
     seat: [16]u8 = undefined,
     seat_len: usize = 0,
     udev_fails: bool = false,
@@ -189,15 +197,15 @@ fn fakeUdevNew() callconv(.c) ?*libinput.Udev {
 }
 
 fn fakeUdevUnref(udev: *libinput.Udev) callconv(.c) ?*libinput.Udev {
-    _ = fromUdev(udev);
+    fromUdev(udev).udev_unref_calls += 1;
     return null;
 }
 
 fn fakeUdevCreateContext(interface: *const libinput.Interface, user_data: ?*anyopaque, udev: *libinput.Udev) callconv(.c) ?*libinput.Libinput {
-    _ = interface;
     _ = user_data;
     const f = fromUdev(udev);
     if (f.context_fails) return null;
+    f.interface = interface;
     return @ptrCast(f);
 }
 
@@ -210,7 +218,16 @@ fn fakeAssignSeat(li: *libinput.Libinput, seat_id: [*:0]const u8) callconv(.c) c
 }
 
 fn fakeUnref(li: *libinput.Libinput) callconv(.c) ?*libinput.Libinput {
-    _ = fromLi(li);
+    const f = fromLi(li);
+    f.unref_calls += 1;
+    // libinput removes every device during unref and closes its fd through
+    // the STORED interface pointer (evdev_device_remove ->
+    // evdev_device_suspend -> close_restricted). Mirror that here: a
+    // dangling interface faults in this call, exactly like real teardown.
+    if (f.device_fd >= 0) {
+        if (f.interface) |intf| intf.close_restricted(f.device_fd, null);
+        f.device_fd = -1;
+    }
     return null;
 }
 
@@ -1096,4 +1113,118 @@ test "LibinputOps.real binds the translate-c surface (analyzed, never called)" {
     try testing.expect(@intFromPtr(ops.device_ref) != 0);
     try testing.expect(@intFromPtr(ops.device_unref) != 0);
     try testing.expect(@intFromPtr(ops.device_get_name) != 0);
+}
+
+// ---------------------------------------------------------------------------
+// Teardown: interface lifetime, refcount balance, idempotent deinit
+// ---------------------------------------------------------------------------
+
+/// Overwrite the stack region a dangling interface pointer would occupy.
+/// noinline + an explicit memset so the write survives every optimize mode
+/// (ReleaseFast does not fill `undefined`).
+noinline fn scribbleStack() u8 {
+    var buf: [8192]u8 = undefined;
+    @memset(&buf, 0xaa);
+    return buf[4096];
+}
+
+test "deinit: idempotent; libinput and udev unreffed exactly once" {
+    const h = try Harness.init(.{});
+    defer h.deinit(); // a third deinit: still a no-op
+    h.input.deinit();
+    h.input.deinit();
+    try testing.expectEqual(@as(usize, 1), h.fake.unref_calls);
+    try testing.expectEqual(@as(usize, 1), h.fake.udev_unref_calls);
+}
+
+test "deinit: tracked device references released exactly once" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    var kbd = FakeDevice{ .name = "testkbd", .caps = 1 };
+    h.fake.pushDevice(libinput.event.device_added, &kbd);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 1), kbd.refs);
+    h.input.deinit();
+    try testing.expectEqual(@as(usize, 0), kbd.refs);
+    h.input.deinit(); // idempotent: a double unref would underflow refs
+    try testing.expectEqual(@as(usize, 0), kbd.refs);
+}
+
+test "interface: pointer passed to udev_create_context survives stack reuse until unref" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    // libinput stores the interface by pointer and calls close_restricted
+    // through it during unref. Give the fake a real fd to close, then reuse
+    // the stack between init and deinit: a stack-local interface copy would
+    // now jump through 0xaa garbage (the graceful-shutdown segfault).
+    const rc = linux.openat(linux.AT.FDCWD, "/dev/null", .{}, 0);
+    try testing.expect(linux.errno(rc) == .SUCCESS);
+    h.fake.device_fd = @intCast(rc);
+    try testing.expectEqual(@as(u8, 0xaa), scribbleStack());
+    try testing.expectEqual(@as(u8, 0xaa), scribbleStack());
+    h.input.deinit();
+    // close_restricted ran through the stored pointer: the fd is closed.
+    const probe = linux.fcntl(@intCast(rc), linux.F.GETFD, 0);
+    try testing.expect(linux.errno(probe) == .BADF);
+    try testing.expectEqual(@as(usize, 1), h.fake.unref_calls);
+}
+
+test "real: udev context create/unref cycle through LibinputOps.real (headless)" {
+    // Exercises the Real.udevCreateContext pointer pass-through against the
+    // linked libinput. No seat is assigned, so no device is opened; the
+    // static interface must simply survive the create/unref cycle.
+    const ops = libinput.LibinputOps.real;
+    const udev = ops.udev_new() orelse return error.SkipZigTest;
+    defer _ = ops.udev_unref(udev);
+    const li = ops.udev_create_context(&libinput.interface, null, udev) orelse
+        return error.SkipZigTest;
+    try testing.expectEqual(@as(u8, 0xaa), scribbleStack());
+    _ = ops.unref(li);
+}
+
+// Real libinput, path backend: proves libinput stores the interface by
+// pointer and calls open_restricted through it later (after stack reuse),
+// and that `Interface` is ABI-compatible with struct libinput_interface.
+// The callback refuses to open anything (-ENOENT), so no device is touched.
+var path_open_calls: usize = 0;
+var path_open_matched: bool = false;
+const path_probe_node = "/dev/null";
+
+fn pathProbeOpen(path: [*c]const u8, flags: c_int, user_data: ?*anyopaque) callconv(.c) c_int {
+    _ = flags;
+    _ = user_data;
+    path_open_calls += 1;
+    const s: [*:0]const u8 = @ptrCast(path);
+    path_open_matched = std.mem.eql(u8, std.mem.span(s), path_probe_node);
+    return -2; // -ENOENT
+}
+
+fn pathProbeClose(fd: c_int, user_data: ?*anyopaque) callconv(.c) void {
+    _ = fd;
+    _ = user_data;
+}
+
+const path_probe_interface = libinput.Interface{
+    .open_restricted = pathProbeOpen,
+    .close_restricted = pathProbeClose,
+};
+
+test "real: libinput calls the stored interface after stack reuse (path backend)" {
+    const c = @import("libinput-c");
+    const li = c.libinput_path_create_context(@ptrCast(&path_probe_interface), null) orelse
+        return error.SkipZigTest;
+    defer _ = c.libinput_unref(li);
+    try testing.expectEqual(@as(u8, 0xaa), scribbleStack());
+    path_open_calls = 0;
+    path_open_matched = false;
+    // add_device stats the node, then opens it through the stored interface
+    // pointer. /dev/null always exists; the open callback refuses it, so
+    // add_device fails cleanly after the callback ran.
+    const dev = c.libinput_path_add_device(li, path_probe_node);
+    // No udev database (minimal container): the node never resolves and the
+    // interface is not reached — nothing to assert in that environment.
+    if (path_open_calls == 0) return error.SkipZigTest;
+    try testing.expect(dev == null);
+    try testing.expectEqual(@as(usize, 1), path_open_calls);
+    try testing.expect(path_open_matched);
 }
