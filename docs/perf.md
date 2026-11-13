@@ -376,6 +376,53 @@ those GPUs. Everything QEMU can cover (throughput, memory, DPMS sysfs
 states, VT switch, virtio-gpu hotplug/cursor) is covered by the T3/T4
 suite and the M8 harness.
 
+## M8.4 T5 — read-only real-hardware verification (2026-11-14)
+
+Follow-up to the assessment above: the achievable non-disruptive checks were
+run on the workstation while the user's Wayland session stayed active
+(read-only sysfs + GET-only DRM ioctls on `/dev/dri/card1`; no DRM master,
+no VT switch, no blanking, kmshaunt not run on the real device). Full
+checklist, evidence and reproduction: `docs/t5-hardware.md`.
+
+Verified read-only (Intel `8086:7D55` Meteor Lake-P, driver `i915`, kernel
+6.12.115 — the only GPU on the machine):
+
+- card1: 4 CRTCs, 5 connectors, 24 planes. eDP-1 connected/enabled,
+  2880x1800@120Hz (CRTC 82 active), DPMS On; eDP-2 carries the identical
+  EDID (second link of the same built-in panel), disabled, DPMS Off;
+  DP-1/DP-2/HDMI-A-1 disconnected.
+- Panel physical size: kernel 300x190 mm (EDID basic block 30x19 cm); EDID
+  DTD 302x189 mm — ~14.0-inch, ~242 DPI diagonal.
+- HiDPI `font-size=0` (auto): production formula `autoFontSize`
+  (src/main.zig) = `height_px * 254 / (height_mm * 60)`, clamped [8, 72] →
+  `1800*254/(190*60)` = **40 px** (same with the DTD's 189 mm; fallback
+  16 px when mm is absent). Computation only — real-panel rendering needs
+  a console run. (The atlas `computeAutoFontSize` diagonal-DPI helper is a
+  unit-test-only variant, ≈30.4 px at 12 pt; not the production path.)
+- Hardware cursor: with `DRM_CLIENT_CAP_UNIVERSAL_PLANES` (per-file cap, no
+  master), 24 planes = 4 Primary + 16 Overlay + **4 Cursor** (one per pipe,
+  ARGB8888-only, zpos 5). Without the cap only overlays are listed.
+  kmshaunt's `detectCursorPlanes` uses the same enumeration; the M5.7
+  hardware prerequisite is satisfied on i915.
+- DPMS capability: connector `DPMS` property present (On on the active
+  eDP-1). Actual panel power-off is not testable read-only.
+
+QEMU coverage, verified against the test sources: `nix/tests/m5-video.nix`
+(T4 parity, both nodes) covers drm2d/drm3d/fbdev boot, rotate-0/90/180/270,
+`dpms` (sysfs Off after idle / On after keypress — bochs only gates the DAC,
+so state transitions, not panel power) and clone/scaled two-card
+multi-monitor at boot. VT switch: `m1-login.nix` S2 and `m8-perf.nix`
+(master handoff between the two consoles). Runtime connector hotplug has
+no VM scenario; it is covered by fake-udev-queue unit tests in
+`src/video/drm2d.zig` (production: libudev `drm` monitor, HOTPLUG=1).
+
+Still HARDWARE-BLOCKED: the ≥2-vendor M8 exit (only Intel here;
+amdgpu/nouveau/nvidia-drm need other machines), and every real-panel test —
+DPMS power-off, VT handoff to/from the live Wayland session, kmshaunt's
+hardware cursor in situ, physical hotplug, input latency vs kmscon — all of
+which require running kmshaunt on the console and would disrupt the active
+session. The M8.1 numbers above are throughput, not input latency.
+
 ## Reproducing
 
     just m8-perf
