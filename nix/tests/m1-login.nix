@@ -1,7 +1,7 @@
 # M1 exit scenarios (ROADMAP §5, M1) as a T4 parity test: one scenario body, run
 # against services.kmscon and services.kmshaunt on identical guests.
 #
-# Once the flake's checks wiring (modules/) imports this file:
+# Wired into checks by modules/flake/packages.nix:
 #
 #   nix build .#checks.<system>.kmshaunt-m1-login.driver  # lint/type-check only
 #   nix build .#checks.<system>.kmshaunt-m1-login         # boots both VMs

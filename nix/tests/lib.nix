@@ -92,14 +92,27 @@ let
 
   # Identical for both nodes: a scenario failure can then only come from the
   # console implementation, not from the VM.
-  deterministicVm = {
-    imports = [ userAccount ];
-    hardware.graphics.enable = true;
-    fonts.fontconfig.enable = true;
-    fonts.packages = pinnedFonts;
-    virtualisation.resolution = resolution;
-    services.getty.autologinUser = "alice";
-  };
+  deterministicVm =
+    { config, ... }:
+    {
+      imports = [ userAccount ];
+      hardware.graphics.enable = true;
+      fonts.fontconfig.enable = true;
+      fonts.packages = pinnedFonts;
+      virtualisation.resolution = resolution;
+      services.getty.autologinUser = "alice";
+
+      # S3 contract: both consoles autologin (they read
+      # services.getty.autologinUser for their own login child), but the
+      # getty@ fallback must show a real login prompt. The getty module
+      # would add --autologin to the getty@ template itself, skipping the
+      # prompt after the console unit dies, so replace its ExecStart with
+      # the same agetty command minus the autologin flag.
+      systemd.services."getty@".serviceConfig.ExecStart = lib.mkForce [
+        ""
+        "${lib.getExe' pkgs.util-linux "agetty"} --login-program ${config.services.getty.loginProgram} --issue-file /etc/issue:/etc/issue.d:/run/issue:/run/issue.d --noclear --keep-baud %I 115200,38400,9600 $TERM"
+      ];
+    };
 
   # Console config keys both implementations understand (D5: kmshaunt accepts
   # kmscon's option names and file syntax). Blink off keeps screenshots
@@ -162,6 +175,9 @@ let
       extraConfig ? { },
       # Screenshots passed to screenshotCompare by the scenario.
       goldens ? [ ],
+      # Directory holding <name>/<impl>/<shot>.png. The default is lazy: it
+      # is only forced once a golden is listed, so the harness evaluates
+      # before nix/tests/goldens/ exists. Pass null to disable comparison.
       goldensDir ? ./goldens,
       extraPythonPackages ? (_: [ ]),
       skipLint ? false,
@@ -195,12 +211,12 @@ let
 
       # A golden is a build input only once it exists; missing goldens keep the
       # comparison a documented stub instead of a hard failure.
-      goldenPath = impl: shot: goldensDir + "/${name}/${impl}/${shot}.png";
+      goldenPath = impl: shot: if goldensDir == null then null else goldensDir + "/${name}/${impl}/${shot}.png";
       goldensFor =
         impl:
         lib.listToAttrs (
           map (shot: lib.nameValuePair shot "${goldenPath impl shot}") (
-            lib.filter (shot: builtins.pathExists (goldenPath impl shot)) goldens
+            lib.filter (shot: let p = goldenPath impl shot; in p != null && builtins.pathExists p) goldens
           )
         );
 
