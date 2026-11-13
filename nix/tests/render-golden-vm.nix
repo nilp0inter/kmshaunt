@@ -22,6 +22,14 @@
 #   its output must reach the console. TERM=xterm-kitty selects the kitty
 #   protocol without terminal autodetection; the exit status is asserted
 #   through a marker file.
+# * kitten icat needs the window size in pixels. kmshaunt's pty reports
+#   zero ws_xpixel/ws_ypixel (src/misc/pty.zig setWinsizeFd), and icat
+#   exits 1 without them ("Terminal does not support reporting screen
+#   sizes in pixels"), so the test passes --use-window-size: the grid
+#   from the guest's own stty, the pixels from the pinned VM resolution.
+#   Transfer stays auto-detect: libghostty answers the a=q support query
+#   (direct OK; file/shm media are off as root, R3), so icat streams the
+#   PNG. Drop the flag once the pty reports pixel sizes.
 #
 # While a golden is missing the compare only saves the screenshot into the
 # test output (same stub contract as nix/tests/lib.nix): run the test once,
@@ -144,11 +152,22 @@ pkgs.testers.runNixOSTest {
 
     with subtest("M4.6 kitten icat"):
         clearScreen()
+        # Grid geometry from the guest itself; pixels are the pinned VM
+        # resolution (see the determinism notes above for why icat needs
+        # --use-window-size).
+        machine.send_chars("stty size > /tmp/icat-geom\n")
+        machine.wait_until_succeeds("test -s /tmp/icat-geom", timeout=30)
+        rows, cols = machine.succeed("cat /tmp/icat-geom").split()
         machine.send_chars(
-            "TERM=xterm-kitty kitten icat /etc/t2-fixtures/kitty-icat.png; "
-            "echo icat-$? > /tmp/icat-status\n"
+            f"TERM=xterm-kitty kitten icat --use-window-size={cols},{rows},"
+            f"${toString harness.resolution.x},${toString harness.resolution.y} "
+            "/etc/t2-fixtures/kitty-icat.png; echo icat-$? > /tmp/icat-status\n"
         )
-        machine.wait_until_succeeds("grep -qx icat-0 /tmp/icat-status")
+        # Bounded wait + content assert: a failing icat reports its exit
+        # status instead of burning the global timeout on a grep retry.
+        machine.wait_until_succeeds("test -s /tmp/icat-status", timeout=60)
+        status = machine.succeed("cat /tmp/icat-status").strip()
+        assert status == "icat-0", f"kitten icat exited nonzero: {status!r}"
         machine.sleep(1)
         screenshotCompare("kitty-icat")
   '';
