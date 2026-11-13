@@ -32,6 +32,15 @@
         pkgs.libspng
         pkgs.seatd.dev # libseat
         pkgs.seatd.out
+        # drm3d backend (M5.1): the translate-c shims src/gbm-c.h, src/egl-c.h
+        # and src/gl-c.h pull gbm.h, EGL/egl*.h and GLES2/gl2*.h through
+        # pkg-config names gbm/egl/glesv2. libgbm (mesa) is a single output
+        # carrying include/gbm.h + lib/pkgconfig/gbm.pc + libgbm.so; libglvnd
+        # splits the EGL/GLES/KHR headers and .pc files into dev and
+        # libEGL.so/libGLESv2.so into out.
+        pkgs.libgbm
+        pkgs.libglvnd.dev
+        pkgs.libglvnd
         # Test data for `zig build test` (see the shellHook exports).
         pkgs.xkeyboard_config
         pkgs.libx11
