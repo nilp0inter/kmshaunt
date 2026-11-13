@@ -28,6 +28,18 @@
         };
       };
 
+      # M6.7 exit gate (ROADMAP M6, T3 exit + T4 parity): live locale1 keymap
+      # follow (localectl de swaps y/z) and compose (dead_acute+a -> á) run
+      # against both services.kmscon and services.kmshaunt on the real VT.
+      # Session grabs and the second seat are deferred; nix/tests/m6-seats.nix
+      # documents the blockers.
+      kmshaunt-m6-seats = pkgs.callPackage ../../nix/tests/m6-seats.nix {
+        kmshauntModule = {
+          imports = [ ../../nix/module.nix ];
+          services.kmshaunt.package = config.packages.kmshaunt;
+        };
+      };
+
       # The overlay must produce the hb-raster library (ROADMAP D7, R1).
       harfbuzz-raster =
         pkgs.runCommand "harfbuzz-raster-check"

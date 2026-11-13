@@ -430,6 +430,23 @@ pub const DisplayPattern = struct {
     }
 };
 
+/// kmscon MAX_DISPLAY_NAME_LEN (config.h:49) minus the NUL: the maximum
+/// length of a gpu or connector name in a `mode=`/`screen=` entry.
+pub const max_name_len = 63;
+
+/// Strict decimal unsigned integer: no sign, no trailing garbage, bounded
+/// by `T`. Null on any violation (kmscon rejects these with -EINVAL).
+fn parseUint(comptime T: type, s: []const u8) ?T {
+    if (s.len == 0) return null;
+    var v: u64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        v = v * 10 + (c - '0');
+        if (v > std.math.maxInt(T)) return null;
+    }
+    return @intCast(v);
+}
+
 /// A `--mode` entry: `[gpu][connector]WxH@R`. The rate is optional; a null
 /// rate means "not specified" (kmscon keeps the connector's current rate).
 pub const ModeSpec = struct {
@@ -437,6 +454,46 @@ pub const ModeSpec = struct {
     width: u32 = 0,
     height: u32 = 0,
     rate: ?u16 = null,
+
+    /// Parse the three grammar forms `gpu[connector]WxH[@R]`,
+    /// `[connector]WxH[@R]` and `WxH[@R]` (kmscon config.c:519-609). The gpu
+    /// and connector slices borrow `s`; no allocation. Returns null on a
+    /// syntax error, a zero dimension, an overlong name or an out-of-range
+    /// number.
+    pub fn parse(s: []const u8) ?ModeSpec {
+        var gpu: ?[]const u8 = null;
+        var connector: ?[]const u8 = null;
+        var dims = s;
+        if (std.mem.indexOfScalar(u8, s, '[')) |open| {
+            const close_rel = std.mem.indexOfScalar(u8, s[open + 1 ..], ']') orelse return null;
+            const close = open + 1 + close_rel;
+            const conn = s[open + 1 .. close];
+            if (conn.len == 0 or conn.len > max_name_len) return null;
+            connector = conn;
+            if (open > 0) {
+                const g = s[0..open];
+                if (g.len > max_name_len) return null;
+                gpu = g;
+            }
+            dims = s[close + 1 ..];
+        }
+        const x = std.mem.indexOfScalar(u8, dims, 'x') orelse return null;
+        const width = parseUint(u32, dims[0..x]) orelse return null;
+        var rest = dims[x + 1 ..];
+        var rate: ?u16 = null;
+        if (std.mem.indexOfScalar(u8, rest, '@')) |at| {
+            rate = parseUint(u16, rest[at + 1 ..]) orelse return null;
+            rest = rest[0..at];
+        }
+        const height = parseUint(u32, rest) orelse return null;
+        if (width == 0 or height == 0) return null;
+        return .{
+            .pattern = .{ .gpu = gpu, .connector = connector },
+            .width = width,
+            .height = height,
+            .rate = rate,
+        };
+    }
 };
 
 /// A `--screen` entry: `[gpu][connector]orientation`, where `disabled` is
@@ -445,6 +502,38 @@ pub const ScreenSpec = struct {
     pattern: DisplayPattern = .{},
     rotation: Rotation = .normal,
     disabled: bool = false,
+
+    /// Parse `gpu[connector]config`, `[connector]config` or `config`, where
+    /// config is `normal|left|right|upside-down|disabled` (kmscon
+    /// config.c:627-750). The name slices borrow `s`; no allocation. Returns
+    /// null on a syntax error, an overlong name or an unknown orientation.
+    pub fn parse(s: []const u8) ?ScreenSpec {
+        var gpu: ?[]const u8 = null;
+        var connector: ?[]const u8 = null;
+        var config = s;
+        if (std.mem.indexOfScalar(u8, s, '[')) |open| {
+            const close_rel = std.mem.indexOfScalar(u8, s[open + 1 ..], ']') orelse return null;
+            const close = open + 1 + close_rel;
+            const conn = s[open + 1 .. close];
+            if (conn.len == 0 or conn.len > max_name_len) return null;
+            connector = conn;
+            if (open > 0) {
+                const g = s[0..open];
+                if (g.len > max_name_len) return null;
+                gpu = g;
+            }
+            config = s[close + 1 ..];
+        }
+        var spec = ScreenSpec{ .pattern = .{ .gpu = gpu, .connector = connector } };
+        if (std.mem.eql(u8, config, "disabled")) {
+            spec.disabled = true;
+        } else if (Rotation.fromConfigString(config)) |rot| {
+            spec.rotation = rot;
+        } else {
+            return null;
+        }
+        return spec;
+    }
 };
 
 /// 3-pass lookup implementing "first match wins" precedence: exact
@@ -469,6 +558,51 @@ pub fn lookupMode(specs: []const ModeSpec, gpu: []const u8, conn: []const u8) ?M
 /// falls back to normal, enabled).
 pub fn lookupScreen(specs: []const ScreenSpec, gpu: []const u8, conn: []const u8) ?ScreenSpec {
     return lookupSpec(ScreenSpec, specs, gpu, conn);
+}
+
+/// A mode candidate for `selectMode`: resolution plus refresh in whole Hz
+/// (0 when unknown). The backend derives these from its probed mode list.
+pub const ModeCandidate = struct {
+    width: u32,
+    height: u32,
+    refresh_hz: u32 = 0,
+};
+
+/// Pick a mode index for a connector (kmscon drm_shared.c:1364-1390):
+///   1. a `mode=` spec matching width/height (and rate when given) wins;
+///   2. else `use-original-mode` keeps the current mode when one is bound;
+///   3. else the preferred mode;
+///   4. else mode 0.
+/// Returns null only when there are no candidates. `preferred`/`current` are
+/// indices into `candidates` (null when absent). A spec that matches no
+/// candidate falls through to the original/preferred default, matching
+/// kmscon's "no match -> default mode" rule.
+pub fn selectMode(
+    candidates: []const ModeCandidate,
+    spec: ?ModeSpec,
+    use_original: bool,
+    preferred: ?usize,
+    current: ?usize,
+) ?usize {
+    if (candidates.len == 0) return null;
+    if (spec) |m| {
+        for (candidates, 0..) |c, i| {
+            if (c.width != m.width or c.height != m.height) continue;
+            if (m.rate) |r| {
+                if (c.refresh_hz != r) continue;
+            }
+            return i;
+        }
+    }
+    if (use_original) {
+        if (current) |ci| {
+            if (ci < candidates.len) return ci;
+        }
+    }
+    if (preferred) |pi| {
+        if (pi < candidates.len) return pi;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -874,4 +1008,111 @@ test "damage: rotated output with non-integer scale" {
     // right edge (x 1347..1364).
     const d1 = plans[1].damage(canvas, 0, 1, cell).?;
     try assertRect(.{ .x = 1347, .y = 0, .w = 17, .h = 1080 }, d1);
+}
+
+test "ModeSpec.parse: three grammar forms, rate optional, borrowed names" {
+    const m = ModeSpec.parse("card0[HDMI-A-1]1920x1080@60").?;
+    try testing.expectEqualStrings("card0", m.pattern.gpu.?);
+    try testing.expectEqualStrings("HDMI-A-1", m.pattern.connector.?);
+    try testing.expectEqual(@as(u32, 1920), m.width);
+    try testing.expectEqual(@as(u32, 1080), m.height);
+    try testing.expectEqual(@as(?u16, 60), m.rate);
+    try testing.expectEqual(@as(u2, 2), m.pattern.tier());
+
+    const m2 = ModeSpec.parse("[DP-1]1280x720").?;
+    try testing.expect(m2.pattern.gpu == null);
+    try testing.expectEqualStrings("DP-1", m2.pattern.connector.?);
+    try testing.expectEqual(@as(?u16, null), m2.rate);
+    try testing.expectEqual(@as(u2, 1), m2.pattern.tier());
+
+    const m3 = ModeSpec.parse("800x600@75").?;
+    try testing.expect(m3.pattern.gpu == null);
+    try testing.expect(m3.pattern.connector == null);
+    try testing.expectEqual(@as(u32, 800), m3.width);
+    try testing.expectEqual(@as(u32, 600), m3.height);
+    try testing.expectEqual(@as(?u16, 75), m3.rate);
+    try testing.expectEqual(@as(u2, 0), m3.pattern.tier());
+
+    const m4 = ModeSpec.parse("1024x768").?;
+    try testing.expectEqual(@as(?u16, null), m4.rate);
+}
+
+test "ModeSpec.parse: rejects zero dims, bad syntax, overlong names, overflow" {
+    const bad = [_][]const u8{
+        "0x1080@60",  "1920x0@60",  "0x0",      "1920",
+        "1920x1080@", "1920x1080x", "axb",      "1920x1080@60Hz",
+        "card0[]1920x1080",        "[HDMI]1920x1080extra",
+        "card0[HDMI]1920x-1",      "1920x1080@-60",
+        "card0[HDMI]1920x1080@70000", // rate overflows u16
+        "[HDMI-A-1]1920x1080",     // valid, kept out of the bad list below
+    };
+    for (bad[0 .. bad.len - 1]) |s| {
+        try testing.expect(ModeSpec.parse(s) == null);
+    }
+    // 63-char names are the limit; 64 is rejected.
+    const long63 = comptime blk: {
+        var buf: [63]u8 = undefined;
+        @memset(&buf, 'a');
+        break :blk buf;
+    };
+    const long64 = comptime blk: {
+        var buf: [64]u8 = undefined;
+        @memset(&buf, 'a');
+        break :blk buf;
+    };
+    try testing.expect(ModeSpec.parse(long63 ++ "[HDMI]640x480") != null);
+    try testing.expect(ModeSpec.parse(long64 ++ "[HDMI]640x480") == null);
+    try testing.expect(ModeSpec.parse("[" ++ long64 ++ "]640x480") == null);
+}
+
+test "ScreenSpec.parse: orientations, disabled, three forms" {
+    const s = ScreenSpec.parse("card0[DP-1]right").?;
+    try testing.expectEqualStrings("card0", s.pattern.gpu.?);
+    try testing.expectEqualStrings("DP-1", s.pattern.connector.?);
+    try testing.expectEqual(Rotation.right, s.rotation);
+    try testing.expect(!s.disabled);
+
+    const s2 = ScreenSpec.parse("[HDMI-A-1]left").?;
+    try testing.expect(s2.pattern.gpu == null);
+    try testing.expectEqual(Rotation.left, s2.rotation);
+
+    const s3 = ScreenSpec.parse("disabled").?;
+    try testing.expect(s3.disabled);
+    try testing.expect(s3.pattern.connector == null);
+
+    const s4 = ScreenSpec.parse("upside-down").?;
+    try testing.expectEqual(Rotation.inverted, s4.rotation);
+
+    try testing.expect(ScreenSpec.parse("card0[DP-1]bogus") == null);
+    try testing.expect(ScreenSpec.parse("card0[]right") == null);
+    try testing.expect(ScreenSpec.parse("") == null);
+}
+
+test "selectMode: spec match, original mode, preferred, default" {
+    const cands = [_]ModeCandidate{
+        .{ .width = 1024, .height = 768, .refresh_hz = 60 },
+        .{ .width = 1920, .height = 1080, .refresh_hz = 60 },
+        .{ .width = 1920, .height = 1080, .refresh_hz = 50 },
+    };
+    // No spec, no original: preferred (index 1).
+    try testing.expectEqual(@as(?usize, 1), selectMode(&cands, null, false, 1, null));
+    // No preferred either: mode 0.
+    try testing.expectEqual(@as(?usize, 0), selectMode(&cands, null, false, null, null));
+    // use-original-mode keeps the bound current mode (index 2).
+    try testing.expectEqual(@as(?usize, 2), selectMode(&cands, null, true, 1, 2));
+    // use-original-mode with no current mode falls back to preferred.
+    try testing.expectEqual(@as(?usize, 1), selectMode(&cands, null, true, 1, null));
+    // A matching spec wins over original/preferred; rate disambiguates.
+    const spec = ModeSpec.parse("1920x1080@50").?;
+    try testing.expectEqual(@as(?usize, 2), selectMode(&cands, spec, true, 1, 0));
+    // Spec without rate matches the first 1920x1080 (index 1).
+    const spec_norate = ModeSpec.parse("1920x1080").?;
+    try testing.expectEqual(@as(?usize, 1), selectMode(&cands, spec_norate, false, 0, null));
+    // A spec that matches nothing falls through to preferred.
+    const spec_miss = ModeSpec.parse("640x480").?;
+    try testing.expectEqual(@as(?usize, 1), selectMode(&cands, spec_miss, false, 1, null));
+    // No candidates: null.
+    try testing.expectEqual(@as(?usize, null), selectMode(&.{}, null, false, 0, 0));
+    // Out-of-range preferred/current are ignored.
+    try testing.expectEqual(@as(?usize, 0), selectMode(&cands, null, true, 99, 99));
 }

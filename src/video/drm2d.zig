@@ -121,6 +121,12 @@ pub const drm = struct {
     // DRM_FORMAT_* (drm_fourcc.h)
     pub const FORMAT_XRGB8888: u32 = 0x34325258;
     pub const FORMAT_ARGB8888: u32 = 0x34324152;
+    // DRM_MODE_OBJECT_* (drm_mode.h:624-633)
+    pub const OBJECT_PLANE: u32 = 0xeeeeeeee;
+    // DRM_PLANE_TYPE_* (xf86drmMode.h:225-227)
+    pub const PLANE_TYPE_OVERLAY: u32 = 0;
+    pub const PLANE_TYPE_PRIMARY: u32 = 1;
+    pub const PLANE_TYPE_CURSOR: u32 = 2;
 };
 
 /// `drmModeModeInfo` (drm_mode.h:221-244), copied verbatim from the connector
@@ -230,6 +236,48 @@ pub const Property = struct {
     }
 };
 
+/// Snapshot of `drmModeCrtc` (recipes §2.4): enough to recover the mode a
+/// connector is currently driven at (`use-original-mode`). `buffer_id` 0
+/// means no fb is bound (off / disconnected).
+pub const CrtcState = struct {
+    crtc_id: u32,
+    buffer_id: u32,
+    width: u32,
+    height: u32,
+    mode_valid: bool,
+    mode: ModeInfo,
+};
+
+/// Snapshot of `drmModePlaneRes` (recipes §2.5), owned.
+pub const PlaneResources = struct {
+    planes: []u32,
+
+    pub fn deinit(self: *PlaneResources, allocator: Allocator) void {
+        allocator.free(self.planes);
+        self.* = undefined;
+    }
+};
+
+/// Snapshot of `drmModePlane` (recipes §2.5). `possible_crtcs` is a bitmask
+/// of CRTC *indices* into Resources.crtcs, like Encoder.possible_crtcs.
+pub const Plane = struct {
+    plane_id: u32,
+    crtc_id: u32,
+    fb_id: u32,
+    possible_crtcs: u32,
+};
+
+/// Snapshot of `drmModeObjectProperties` (recipes §2.5), owned. Used to read
+/// a plane's "type" property when looking for a cursor plane.
+pub const ObjectProperties = struct {
+    props: []PropValue,
+
+    pub fn deinit(self: *ObjectProperties, allocator: Allocator) void {
+        allocator.free(self.props);
+        self.* = undefined;
+    }
+};
+
 /// Result of CREATE_DUMB: pitch is authoritative and may exceed width*4
 /// (recipes §4.1).
 pub const DumbBuffer = struct { handle: u32, pitch: u32, size: u64 };
@@ -278,6 +326,18 @@ pub const DrmOps = struct {
     set_cursor2: *const fn (ctx: ?*anyopaque, fd: i32, crtc_id: u32, handle: u32, width: u32, height: u32, hot_x: i32, hot_y: i32) anyerror!void,
     move_cursor: *const fn (ctx: ?*anyopaque, fd: i32, crtc_id: u32, x: i32, y: i32) anyerror!void,
 
+    // -- current CRTC / universal planes (optional; recipes §2.4/§2.5/§8.2) --
+    // Null when the seam implementation does not provide them; the backend
+    // then degrades (no current-mode detection, no cursor-plane discovery).
+    /// Current CRTC state for use-original-mode (drmModeGetCrtc).
+    get_crtc: ?*const fn (ctx: ?*anyopaque, fd: i32, crtc_id: u32) anyerror!CrtcState = null,
+    /// Universal plane list (drmModeGetPlaneResources); needs UNIVERSAL_PLANES.
+    get_plane_resources: ?*const fn (ctx: ?*anyopaque, fd: i32, allocator: Allocator) anyerror!PlaneResources = null,
+    /// One plane (drmModeGetPlane).
+    get_plane: ?*const fn (ctx: ?*anyopaque, fd: i32, plane_id: u32) anyerror!Plane = null,
+    /// An object's property values (drmModeObjectGetProperties).
+    object_get_properties: ?*const fn (ctx: ?*anyopaque, fd: i32, allocator: Allocator, object_id: u32, object_type: u32) anyerror!ObjectProperties = null,
+
     // -- syscalls --
     /// MAP_SHARED|PROT_READ|PROT_WRITE at the fake mmap offset from map_dumb.
     mmap: *const fn (ctx: ?*anyopaque, fd: i32, len: usize, offset: u64) anyerror![]align(page_align) u8,
@@ -315,6 +375,157 @@ pub fn connectorTypeName(connector_type: u32) ?[]const u8 {
         20 => "USB",
         else => null,
     };
+}
+
+// ---------------------------------------------------------------------------
+// GPU selection (`--gpus=all|primary|aux`, ROADMAP M5.3, recipes §10.1).
+//
+// The policy filter is pure and hermetically tested; `enumerateGpus` is the
+// production sysfs scanner that classifies each /dev/dri/cardN. The backend
+// itself opens one card; the caller (main.zig) uses these to choose which
+// card path(s) to open.
+// ---------------------------------------------------------------------------
+
+/// `--gpus` policy (kmscon config.c:466-498). Mirrors config.Gpus without
+/// importing the config module, keeping the backend independent.
+pub const GpuSelection = enum { all, primary, aux };
+
+/// A candidate DRM primary node. `primary`/`aux` are the kmscon udev flags
+/// (recipes §10.1): PCI `boot_vga` / platform SoC primary, and `udl` USB
+/// auxiliary. `path`/`name` borrow the caller's storage or the allocator.
+pub const GpuCandidate = struct {
+    path: []const u8,
+    name: []const u8,
+    primary: bool = false,
+    aux: bool = false,
+};
+
+/// Whether a card is ignored under the policy (kmscon
+/// `kmscon_seat_gpu_is_ignored`, recipes §10.1): `all` keeps everything;
+/// `primary` keeps only primary cards; `aux` keeps primary OR aux cards.
+/// Note the asymmetry: an unflagged card is kept by `all` but dropped by
+/// `aux`.
+pub fn gpuIgnored(primary: bool, aux: bool, policy: GpuSelection) bool {
+    return switch (policy) {
+        .all => false,
+        .primary => !primary,
+        .aux => !(primary or aux),
+    };
+}
+
+/// Copy the candidates accepted by `policy` into `out` (caller-provided,
+/// ideally at least `candidates.len`), preserving order, and return the kept
+/// slice. Allocation-free; entries beyond `out.len` are dropped.
+pub fn selectGpus(candidates: []const GpuCandidate, policy: GpuSelection, out: []GpuCandidate) []GpuCandidate {
+    var n: usize = 0;
+    for (candidates) |c| {
+        if (gpuIgnored(c.primary, c.aux, policy)) continue;
+        if (n < out.len) out[n] = c;
+        n += 1;
+    }
+    return out[0..@min(n, out.len)];
+}
+
+/// Scan /dev/dri for primary nodes (cardN, not renderDN) and classify each
+/// via sysfs (recipes §10.1). Best effort: a card whose sysfs attributes
+/// cannot be read is returned unflagged. The returned slice and its strings
+/// are allocator-owned; free with `freeGpuCandidates`.
+pub fn enumerateGpus(allocator: Allocator) ![]GpuCandidate {
+    var list: std.ArrayList(GpuCandidate) = .empty;
+    errdefer {
+        for (list.items) |c| {
+            allocator.free(c.path);
+            allocator.free(c.name);
+        }
+        list.deinit(allocator);
+    }
+    var dir = std.fs.cwd().openDir("/dev/dri", .{ .iterate = true }) catch
+        return list.toOwnedSlice(allocator);
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |ent| {
+        if (!isCardName(ent.name)) continue;
+        const path = try std.fmt.allocPrint(allocator, "/dev/dri/{s}", .{ent.name});
+        errdefer allocator.free(path);
+        const name = try allocator.dupe(u8, ent.name);
+        errdefer allocator.free(name);
+        const flags = classifyCard(allocator, ent.name);
+        try list.append(allocator, .{
+            .path = path,
+            .name = name,
+            .primary = flags.primary,
+            .aux = flags.aux,
+        });
+    }
+    std.mem.sort(GpuCandidate, list.items, {}, struct {
+        fn lt(_: void, a: GpuCandidate, b: GpuCandidate) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+    return list.toOwnedSlice(allocator);
+}
+
+/// Free a slice returned by `enumerateGpus`.
+pub fn freeGpuCandidates(allocator: Allocator, candidates: []GpuCandidate) void {
+    for (candidates) |c| {
+        allocator.free(c.path);
+        allocator.free(c.name);
+    }
+    allocator.free(candidates);
+}
+
+/// cardN: "card" followed by one or more decimal digits (excludes renderDN).
+fn isCardName(name: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, "card")) return false;
+    const digits = name["card".len..];
+    if (digits.len == 0) return false;
+    for (digits) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
+/// Classify a card from sysfs (recipes §10.1): PCI `boot_vga == 1` or a
+/// platform (SoC) display controller is primary; the `udl` driver is aux;
+/// USB-attached displays are never primary.
+fn classifyCard(allocator: Allocator, name: []const u8) struct { primary: bool, aux: bool } {
+    var primary = false;
+    var aux = false;
+    const dev = std.fmt.allocPrint(allocator, "/sys/class/drm/{s}/device", .{name}) catch
+        return .{ .primary = primary, .aux = aux };
+    defer allocator.free(dev);
+
+    if (readSysfsAttr(allocator, dev, "boot_vga")) |v| {
+        defer allocator.free(v);
+        if (std.mem.eql(u8, std.mem.trim(u8, v, " \t\r\n"), "1")) primary = true;
+    } else |_| {}
+
+    // Bus classification from the device symlink target.
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = std.fs.cwd().readLink(dev, &link_buf) catch "";
+    const is_usb = std.mem.indexOf(u8, real, "usb") != null;
+    const is_platform = std.mem.indexOf(u8, real, "platform") != null;
+    if (!is_usb and is_platform) primary = true;
+
+    if (readSysfsAttr(allocator, dev, "uevent")) |v| {
+        defer allocator.free(v);
+        var lines = std.mem.splitScalar(u8, v, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "DRIVER=")) {
+                if (std.mem.eql(u8, line["DRIVER=".len..], "udl")) aux = true;
+            }
+        }
+    } else |_| {}
+
+    if (is_usb) primary = false;
+    return .{ .primary = primary, .aux = aux };
+}
+
+/// Read `<dir>/<attr>` into an allocator-owned slice; error when absent.
+fn readSysfsAttr(allocator: Allocator, dir_path: []const u8, attr: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, attr });
+    defer allocator.free(path);
+    return std.fs.cwd().readFileAlloc(allocator, path, 4096);
 }
 
 fn dpmsValue(state: DpmsState) u64 {
@@ -361,6 +572,9 @@ const Conn = struct {
     info_modes: []Mode,
     name: []u8,
     dpms_prop_id: ?u32,
+    /// Index into `modes` of the mode the connector is currently driven at,
+    /// recovered from its bound CRTC (use-original-mode); null when unknown.
+    current_mode: ?usize = null,
 
     fn deinit(self: *Conn, allocator: Allocator) void {
         allocator.free(self.encoders);
@@ -394,6 +608,10 @@ const CursorBuffer = struct {
     pitch: u32,
     map: []align(page_align) u8,
 };
+
+/// A discovered cursor plane: its id and the CRTC-*index* bitmask it can
+/// drive (same convention as Encoder.possible_crtcs).
+const CursorPlane = struct { id: u32, possible_crtcs: u32 };
 
 const Crtc = struct { id: u32, index: usize };
 
@@ -435,8 +653,17 @@ pub const Drm2d = struct {
 
     cursor_w: ?u32,
     cursor_h: ?u32,
-    hw_cursor: bool,
+    /// Cursor planes discovered at init (id + possible_crtcs bitmask).
+    /// supportsHwCursor is true only when one can drive the active CRTC
+    /// (constraint #8: caps alone do not prove a cursor plane exists).
+    cursor_planes: []CursorPlane,
+    /// Permanent software fallback after a SetCursor2 device failure.
+    hw_cursor_failed: bool = false,
+    /// `--soft-cursor` (M5.7): force the software cursor even with a plane.
+    force_soft_cursor: bool = false,
     cursor_buf: ?CursorBuffer = null,
+    /// Hotplug event source (M5.5), created by enableHotplug.
+    hotplug: ?Hotplug = null,
 
     /// Cookie returned verbatim in flip events; matched together with
     /// crtc_id so events for other CRTCs (or after unbind) are ignored.
@@ -475,6 +702,8 @@ pub const Drm2d = struct {
 
         const cursor_w = capOptional(ops, fd, drm.CAP_CURSOR_WIDTH);
         const cursor_h = capOptional(ops, fd, drm.CAP_CURSOR_HEIGHT);
+        const cursor_planes = try detectCursorPlanes(allocator, ops, fd);
+        errdefer allocator.free(cursor_planes);
 
         // Owned copies: ConnectorInfo.card_name borrows from card_path, so
         // it must not point into the caller's string.
@@ -510,7 +739,7 @@ pub const Drm2d = struct {
             .chosen = chosen,
             .cursor_w = cursor_w,
             .cursor_h = cursor_h,
-            .hw_cursor = cursor_w != null and cursor_h != null,
+            .cursor_planes = cursor_planes,
         };
         return self;
     }
@@ -522,6 +751,8 @@ pub const Drm2d = struct {
         // Constraint #12: never free buffers under a pending flip.
         if (self.flip_pending) self.waitFlip() catch {};
         self.cursorTeardown();
+        if (self.hotplug) |*h| h.deinit();
+        self.allocator.free(self.cursor_planes);
         self.ops.drop_master(self.ops.ctx, self.fd) catch {};
         self.destroyBuffers();
         freeConns(self.allocator, self.conns);
@@ -576,7 +807,7 @@ pub const Drm2d = struct {
     pub fn dropMaster(self: *Drm2d) !void {
         if (!self.master) return;
         if (self.flip_pending) self.waitFlip() catch {};
-        if (self.hw_cursor and self.active != null) self.setCursor(null, 0, 0) catch {};
+        if (self.supportsHwCursor() and self.active != null) self.setCursor(null, 0, 0) catch {};
         self.ops.drop_master(self.ops.ctx, self.fd) catch |err| switch (err) {
             error.InvalidArgument => {},
             else => return err,
@@ -887,7 +1118,7 @@ pub const Drm2d = struct {
     /// error.Unsupported so the renderer composites a software cursor.
     pub fn setCursor(self: *Drm2d, img: ?*Framebuffer, x: i32, y: i32) !void {
         const act = self.active orelse return error.NoActiveDisplay;
-        if (!self.hw_cursor) return error.Unsupported;
+        if (!self.supportsHwCursor()) return error.Unsupported;
 
         if (img == null) {
             // handle 0 turns the cursor off (recipes §8.1).
@@ -932,15 +1163,93 @@ pub const Drm2d = struct {
         self.ops.move_cursor(self.ops.ctx, self.fd, act.crtc_id, x, y) catch return self.cursorFallback();
     }
 
-    /// Whether setCursor can use the hardware cursor: caps present and no
-    /// failed attempt yet. A 64x64 cap answer alone does not prove a cursor
-    /// plane exists (constraint #8) — the first SetCursor2 verifies that.
+    /// Whether setCursor can use a hardware cursor plane (M5.7). True only
+    /// when a cursor plane exists for the active CRTC, the size caps are
+    /// present, no SetCursor2 attempt has failed, and `--soft-cursor` is not
+    /// forcing software (constraint #8: caps alone do not prove a plane).
     pub fn supportsHwCursor(self: *const Drm2d) bool {
-        return self.hw_cursor;
+        if (self.force_soft_cursor or self.hw_cursor_failed) return false;
+        if (self.cursor_w == null or self.cursor_h == null) return false;
+        if (self.cursor_planes.len == 0) return false;
+        if (self.active) |act| return self.cursorPlaneForCrtc(act.crtc_index) != null;
+        return true; // a plane exists; no CRTC chosen yet
+    }
+
+    /// The cursor plane id that can drive CRTC index `crtc_index`, or null.
+    fn cursorPlaneForCrtc(self: *const Drm2d, crtc_index: usize) ?u32 {
+        if (crtc_index >= 32) return null;
+        const bit = @as(u32, 1) << @intCast(crtc_index);
+        for (self.cursor_planes) |p| {
+            if (p.possible_crtcs & bit != 0) return p.id;
+        }
+        return null;
+    }
+
+    /// Force the software cursor (`--soft-cursor`, M5.7). Hides any active
+    /// hardware cursor first; afterwards supportsHwCursor() is false and
+    /// setCursor() returns error.Unsupported so the renderer composites it.
+    pub fn setSoftCursorForce(self: *Drm2d, force: bool) void {
+        if (force and !self.force_soft_cursor and self.supportsHwCursor()) {
+            if (self.active) |act| {
+                self.ops.set_cursor2(self.ops.ctx, self.fd, act.crtc_id, 0, 0, 0, 0, 0) catch {};
+            }
+        }
+        self.force_soft_cursor = force;
+    }
+
+    /// Choose a mode index for connector `connector_idx` (M5.3): a matching
+    /// `mode=` spec wins, else use-original-mode keeps the current mode,
+    /// else preferred, else mode 0 (layout.selectMode). `spec` is the
+    /// resolved ModeSpec for this connector (layout.lookupMode), null when
+    /// none matches. Null result when the connector has no modes.
+    pub fn selectModeIndex(self: *const Drm2d, connector_idx: usize, spec: ?video.ModeSpec, use_original: bool) !?usize {
+        if (connector_idx >= self.conns.len) return null;
+        const conn = &self.conns[connector_idx];
+        if (conn.info_modes.len == 0) return null;
+        const candidates = try self.allocator.alloc(video.layout.ModeCandidate, conn.info_modes.len);
+        defer self.allocator.free(candidates);
+        for (conn.info_modes, 0..) |m, i| {
+            candidates[i] = .{
+                .width = m.width_px,
+                .height = m.height_px,
+                .refresh_hz = (m.refresh_mhz + 500) / 1000,
+            };
+        }
+        var preferred: ?usize = null;
+        for (conn.modes, 0..) |m, j| {
+            if (m.isPreferred()) {
+                preferred = j;
+                break;
+            }
+        }
+        if (preferred == null) preferred = 0;
+        return video.layout.selectMode(candidates, spec, use_original, preferred, conn.current_mode);
+    }
+
+    /// Enable the hotplug event source (M5.5). The loop polls hotplugFd()
+    /// and, on readability, calls pollHotplug() then connectors() to
+    /// re-probe (recipes §9.2: hotplug is a re-enumeration trigger, not a
+    /// reopen). Idempotent.
+    pub fn enableHotplug(self: *Drm2d, ops: HotplugOps) !void {
+        if (self.hotplug != null) return;
+        self.hotplug = try Hotplug.init(ops);
+    }
+
+    /// The hotplug monitor fd for the epoll loop, or null when not enabled.
+    pub fn hotplugFd(self: *const Drm2d) ?i32 {
+        if (self.hotplug) |*h| return h.fd();
+        return null;
+    }
+
+    /// Drain pending hotplug events; true when at least one arrived. The
+    /// caller then re-probes via connectors(). False when hotplug is off.
+    pub fn pollHotplug(self: *Drm2d) !bool {
+        if (self.hotplug) |*h| return h.poll();
+        return false;
     }
 
     fn cursorFallback(self: *Drm2d) anyerror {
-        self.hw_cursor = false;
+        self.hw_cursor_failed = true;
         self.cursorTeardown();
         return error.Unsupported;
     }
@@ -1137,6 +1446,33 @@ fn connFromSnapshot(allocator: Allocator, ops: DrmOps, fd: i32, snap: *const Con
         }
     }
 
+    // Current mode (use-original-mode, recipes §2.4): follow the bound
+    // encoder to its CRTC and match the CRTC's live mode against the
+    // connector's mode list by resolution + pixel clock. Skipped when the
+    // seam lacks get_crtc (current_mode stays null).
+    var current_mode: ?usize = null;
+    if (snap.connection == .connected and snap.encoder_id != 0) {
+        if (ops.get_crtc) |get_crtc| {
+            if (ops.get_encoder(ops.ctx, fd, snap.encoder_id)) |enc| {
+                if (enc.crtc_id != 0) {
+                    if (get_crtc(ops.ctx, fd, enc.crtc_id)) |crtc| {
+                        if (crtc.mode_valid) {
+                            for (modes, 0..) |m, i| {
+                                if (m.hdisplay == crtc.mode.hdisplay and
+                                    m.vdisplay == crtc.mode.vdisplay and
+                                    m.clock == crtc.mode.clock)
+                                {
+                                    current_mode = i;
+                                    break;
+                                }
+                            }
+                        }
+                    } else |_| {}
+                }
+            } else |_| {}
+        }
+    }
+
     return .{
         .id = snap.connector_id,
         .connector_type = snap.connector_type,
@@ -1150,6 +1486,7 @@ fn connFromSnapshot(allocator: Allocator, ops: DrmOps, fd: i32, snap: *const Con
         .info_modes = info_modes,
         .name = name,
         .dpms_prop_id = dpms_prop_id,
+        .current_mode = current_mode,
     };
 }
 
@@ -1174,11 +1511,93 @@ fn buildInfos(allocator: Allocator, conns: []const Conn, card_path: []const u8) 
             .connected = c.connected,
             .modes = c.info_modes,
             .preferred_mode = preferred,
-            .current_mode = null,
+            .current_mode = c.current_mode,
         };
     }
     return infos;
 }
+
+/// Discover cursor planes via universal planes (recipes §8.2, constraint
+/// #8). UNIVERSAL_PLANES must already be set. Returns an allocator-owned
+/// slice (possibly empty): empty when the seam lacks the plane ops, the
+/// driver lists no planes, or no plane has type CURSOR. A 64x64 cap answer
+/// alone never reaches here — only a real plane makes supportsHwCursor true.
+fn detectCursorPlanes(allocator: Allocator, ops: DrmOps, fd: i32) ![]CursorPlane {
+    var list: std.ArrayList(CursorPlane) = .empty;
+    errdefer list.deinit(allocator);
+    const get_res = ops.get_plane_resources orelse return list.toOwnedSlice(allocator);
+    const get_plane = ops.get_plane orelse return list.toOwnedSlice(allocator);
+    const get_props = ops.object_get_properties orelse return list.toOwnedSlice(allocator);
+
+    var res = get_res(ops.ctx, fd, allocator) catch return list.toOwnedSlice(allocator);
+    defer res.deinit(allocator);
+    for (res.planes) |pid| {
+        const plane = get_plane(ops.ctx, fd, pid) catch continue;
+        var props = get_props(ops.ctx, fd, allocator, pid, drm.OBJECT_PLANE) catch continue;
+        defer props.deinit(allocator);
+        var is_cursor = false;
+        for (props.props) |pv| {
+            const prop = ops.get_property(ops.ctx, fd, pv.id) catch continue;
+            if (std.mem.eql(u8, prop.nameSlice(), "type") and pv.value == drm.PLANE_TYPE_CURSOR) {
+                is_cursor = true;
+                break;
+            }
+        }
+        if (is_cursor) try list.append(allocator, .{ .id = pid, .possible_crtcs = plane.possible_crtcs });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+// ---------------------------------------------------------------------------
+// Hotplug event source (ROADMAP M5.5, recipes §9).
+//
+// connectors() already re-probes; this is the pollable trigger that tells the
+// loop WHEN to re-probe. A udev monitor on the "drm" subsystem yields add /
+// remove / change events; change is filtered to HOTPLUG=1 (recipes §9.1/§9.2).
+// The seam keeps it hermetic: production is libudev.hotplugOps(), tests inject
+// a fake event queue.
+// ---------------------------------------------------------------------------
+
+/// A relevant udev action on a DRM minor (recipes §9.2).
+pub const HotplugEvent = enum { add, remove, change };
+
+/// udev monitor seam. `open` creates a monitor filtered to subsystem "drm";
+/// `next` yields one relevant event (change already filtered to HOTPLUG=1)
+/// or null when drained; `fd` is the pollable netlink fd.
+pub const HotplugOps = struct {
+    ctx: ?*anyopaque = null,
+    open: *const fn (ctx: ?*anyopaque) anyerror!*anyopaque,
+    close: *const fn (ctx: ?*anyopaque, handle: *anyopaque) void,
+    fd: *const fn (ctx: ?*anyopaque, handle: *anyopaque) i32,
+    next: *const fn (ctx: ?*anyopaque, handle: *anyopaque) anyerror!?HotplugEvent,
+};
+
+/// Owns a hotplug monitor handle behind HotplugOps.
+pub const Hotplug = struct {
+    ops: HotplugOps,
+    handle: *anyopaque,
+
+    pub fn init(ops: HotplugOps) !Hotplug {
+        return .{ .ops = ops, .handle = try ops.open(ops.ctx) };
+    }
+
+    pub fn deinit(self: *Hotplug) void {
+        self.ops.close(self.ops.ctx, self.handle);
+    }
+
+    pub fn fd(self: *const Hotplug) i32 {
+        return self.ops.fd(self.ops.ctx, self.handle);
+    }
+
+    /// Drain pending events; true when at least one relevant event arrived.
+    pub fn poll(self: *Hotplug) !bool {
+        var any = false;
+        while (try self.ops.next(self.ops.ctx, self.handle)) |_| {
+            any = true;
+        }
+        return any;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Real libdrm implementation.
@@ -1223,6 +1642,10 @@ pub const libdrm = struct {
             .connector_set_property = connectorSetProperty,
             .set_cursor2 = setCursor2,
             .move_cursor = moveCursor,
+            .get_crtc = getCrtc,
+            .get_plane_resources = getPlaneResources,
+            .get_plane = getPlane,
+            .object_get_properties = objectGetProperties,
             .mmap = mmap,
             .munmap = munmap,
             .read = read,
@@ -1430,6 +1853,47 @@ pub const libdrm = struct {
         try kmsError(c.drmModeMoveCursor(fd, crtc_id, x, y));
     }
 
+    fn getCrtc(_: ?*anyopaque, fd: i32, crtc_id: u32) !CrtcState {
+        const cr: *c.struct__drmModeCrtc = @ptrCast(c.drmModeGetCrtc(fd, crtc_id) orelse return coreError());
+        defer c.drmModeFreeCrtc(cr);
+        return .{
+            .crtc_id = cr.crtc_id,
+            .buffer_id = cr.buffer_id,
+            .width = cr.width,
+            .height = cr.height,
+            .mode_valid = cr.mode_valid != 0,
+            .mode = @as(*const ModeInfo, @ptrCast(&cr.mode)).*,
+        };
+    }
+
+    fn getPlaneResources(_: ?*anyopaque, fd: i32, allocator: Allocator) !PlaneResources {
+        const r: *c.struct__drmModePlaneRes = @ptrCast(c.drmModeGetPlaneResources(fd) orelse return coreError());
+        defer c.drmModeFreePlaneResources(r);
+        const planes = try allocator.dupe(u32, r.planes[0..@intCast(r.count_planes)]);
+        return .{ .planes = planes };
+    }
+
+    fn getPlane(_: ?*anyopaque, fd: i32, plane_id: u32) !Plane {
+        const p: *c.struct__drmModePlane = @ptrCast(c.drmModeGetPlane(fd, plane_id) orelse return coreError());
+        defer c.drmModeFreePlane(p);
+        return .{
+            .plane_id = p.plane_id,
+            .crtc_id = p.crtc_id,
+            .fb_id = p.fb_id,
+            .possible_crtcs = p.possible_crtcs,
+        };
+    }
+
+    fn objectGetProperties(_: ?*anyopaque, fd: i32, allocator: Allocator, object_id: u32, object_type: u32) !ObjectProperties {
+        const op: *c.struct__drmModeObjectProperties = @ptrCast(c.drmModeObjectGetProperties(fd, object_id, object_type) orelse return coreError());
+        defer c.drmModeFreeObjectProperties(op);
+        const n: usize = @intCast(op.count_props);
+        const props = try allocator.alloc(PropValue, n);
+        errdefer allocator.free(props);
+        for (0..n) |i| props[i] = .{ .id = op.props[i], .value = op.prop_values[i] };
+        return .{ .props = props };
+    }
+
     fn mmap(_: ?*anyopaque, fd: i32, len: usize, offset: u64) ![]align(page_align) u8 {
         // MAP_SHARED is required so the kernel sees writes without msync
         // (recipes §4.2).
@@ -1490,6 +1954,89 @@ pub const libdrm = struct {
 test {
     if (comptime @import("builtin").link_libc) {
         std.testing.refAllDecls(libdrm);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Real libudev hotplug implementation (ROADMAP M5.5, recipes §9.2).
+//
+// libudev is already linked (build.zig). The extern declarations live inside
+// this namespace so the hermetic test build never resolves them; they are
+// referenced only through libudev.hotplugOps() (production) or the
+// link_libc-gated test below.
+// ---------------------------------------------------------------------------
+
+pub const libudev = struct {
+    extern fn udev_new() ?*anyopaque;
+    extern fn udev_unref(*anyopaque) ?*anyopaque;
+    extern fn udev_monitor_new_from_netlink(*anyopaque, [*:0]const u8) ?*anyopaque;
+    extern fn udev_monitor_unref(*anyopaque) ?*anyopaque;
+    extern fn udev_monitor_filter_add_match_subsystem_devtype(*anyopaque, [*:0]const u8, ?[*:0]const u8) c_int;
+    extern fn udev_monitor_enable_receiving(*anyopaque) c_int;
+    extern fn udev_monitor_get_fd(*anyopaque) c_int;
+    extern fn udev_monitor_receive_device(*anyopaque) ?*anyopaque;
+    extern fn udev_device_get_action(*anyopaque) ?[*:0]const u8;
+    extern fn udev_device_get_property_value(*anyopaque, [*:0]const u8) ?[*:0]const u8;
+    extern fn udev_device_unref(*anyopaque) ?*anyopaque;
+
+    const Handle = struct { udev: *anyopaque, monitor: *anyopaque };
+
+    /// HotplugOps backed by a udev netlink monitor on subsystem "drm".
+    pub fn hotplugOps() HotplugOps {
+        return .{
+            .open = open,
+            .close = close,
+            .fd = fd,
+            .next = next,
+        };
+    }
+
+    fn open(_: ?*anyopaque) !*anyopaque {
+        const udev = udev_new() orelse return error.Unsupported;
+        errdefer _ = udev_unref(udev);
+        const mon = udev_monitor_new_from_netlink(udev, "udev") orelse return error.Unsupported;
+        errdefer _ = udev_monitor_unref(mon);
+        if (udev_monitor_filter_add_match_subsystem_devtype(mon, "drm", null) < 0) return error.Unsupported;
+        if (udev_monitor_enable_receiving(mon) < 0) return error.Unsupported;
+        const h = try std.heap.c_allocator.create(Handle);
+        h.* = .{ .udev = udev, .monitor = mon };
+        return h;
+    }
+
+    fn close(_: ?*anyopaque, handle: *anyopaque) void {
+        const h: *Handle = @ptrCast(@alignCast(handle));
+        _ = udev_monitor_unref(h.monitor);
+        _ = udev_unref(h.udev);
+        std.heap.c_allocator.destroy(h);
+    }
+
+    fn fd(_: ?*anyopaque, handle: *anyopaque) i32 {
+        const h: *Handle = @ptrCast(@alignCast(handle));
+        return @intCast(udev_monitor_get_fd(h.monitor));
+    }
+
+    fn next(_: ?*anyopaque, handle: *anyopaque) !?HotplugEvent {
+        const h: *Handle = @ptrCast(@alignCast(handle));
+        while (true) {
+            const dev = udev_monitor_receive_device(h.monitor) orelse return null;
+            defer _ = udev_device_unref(dev);
+            const action = udev_device_get_action(dev) orelse continue;
+            const a = std.mem.span(action);
+            if (std.mem.eql(u8, a, "add")) return .add;
+            if (std.mem.eql(u8, a, "remove")) return .remove;
+            if (std.mem.eql(u8, a, "change")) {
+                if (udev_device_get_property_value(dev, "HOTPLUG")) |hp| {
+                    if (std.mem.eql(u8, std.mem.span(hp), "1")) return .change;
+                }
+            }
+            // Unrelated event: keep draining (recipes §9.2 HOTPLUG=1 filter).
+        }
+    }
+};
+
+test {
+    if (comptime @import("builtin").link_libc) {
+        std.testing.refAllDecls(libudev);
     }
 }
 
@@ -1607,6 +2154,10 @@ const Call = enum {
     munmap,
     read,
     poll,
+    get_crtc,
+    get_plane_resources,
+    get_plane,
+    object_get_properties,
 };
 
 /// Fake DRM device: model + call recorder. Every DrmOps entry point lands
@@ -1629,6 +2180,11 @@ const FakeDrm = struct {
     fail_page_flip: ?anyerror = null,
     fail_set_cursor2: ?anyerror = null,
     auto_flip_event: bool = false,
+    /// Whether a universal cursor plane exists (M5.7). Default true so the
+    /// legacy cursor tests see a plane; set false for the no-plane path.
+    cursor_plane_present: bool = true,
+    /// Current CRTC mode for use-original-mode (M5.3); null = no mode bound.
+    crtc_current_mode: ?ModeInfo = null,
 
     // State.
     master: bool = false,
@@ -1649,6 +2205,8 @@ const FakeDrm = struct {
     dirty_calls: std.ArrayList(DirtyCall) = .empty,
     cursor_calls: std.ArrayList(CursorCall) = .empty,
     move_calls: std.ArrayList(MoveCall) = .empty,
+
+    const plane_type_prop: u32 = 90;
 
     fn deinit(self: *FakeDrm) void {
         for (self.buffers.items) |*b| {
@@ -1707,6 +2265,10 @@ const FakeDrm = struct {
             .connector_set_property = connectorSetProperty,
             .set_cursor2 = setCursor2,
             .move_cursor = moveCursor,
+            .get_crtc = getCrtc,
+            .get_plane_resources = getPlaneResources,
+            .get_plane = getPlane,
+            .object_get_properties = objectGetProperties,
             .mmap = mmap,
             .munmap = munmap,
             .read = read,
@@ -1860,6 +2422,11 @@ const FakeDrm = struct {
     fn getProperty(ctx: ?*anyopaque, _: i32, prop_id: u32) !Property {
         const self = cast(ctx);
         self.record(.get_property);
+        if (prop_id == plane_type_prop) {
+            var prop: Property = .{ .prop_id = prop_id, .flags = 0, .name = @splat(0) };
+            @memcpy(prop.name[0..4], "type");
+            return prop;
+        }
         for (self.connectors) |cn| {
             for (cn.props) |p| {
                 if (p.id == prop_id) {
@@ -2016,6 +2583,44 @@ const FakeDrm = struct {
 
     fn poll(ctx: ?*anyopaque, _: i32, _: i32) !void {
         cast(ctx).record(.poll);
+    }
+
+    fn getCrtc(ctx: ?*anyopaque, _: i32, crtc_id: u32) !CrtcState {
+        const self = cast(ctx);
+        self.record(.get_crtc);
+        const m = self.crtc_current_mode orelse std.mem.zeroes(ModeInfo);
+        return .{
+            .crtc_id = crtc_id,
+            .buffer_id = if (self.crtc_current_mode != null) 1 else 0,
+            .width = m.hdisplay,
+            .height = m.vdisplay,
+            .mode_valid = self.crtc_current_mode != null,
+            .mode = m,
+        };
+    }
+
+    fn getPlaneResources(ctx: ?*anyopaque, _: i32, allocator: Allocator) !PlaneResources {
+        const self = cast(ctx);
+        self.record(.get_plane_resources);
+        const ids: []const u32 = if (self.cursor_plane_present) &.{ 70, 71 } else &.{70};
+        const planes = try allocator.dupe(u32, ids);
+        return .{ .planes = planes };
+    }
+
+    fn getPlane(ctx: ?*anyopaque, _: i32, plane_id: u32) !Plane {
+        const self = cast(ctx);
+        self.record(.get_plane);
+        return .{ .plane_id = plane_id, .crtc_id = 0, .fb_id = 0, .possible_crtcs = 0b11 };
+    }
+
+    fn objectGetProperties(ctx: ?*anyopaque, _: i32, allocator: Allocator, object_id: u32, _: u32) !ObjectProperties {
+        const self = cast(ctx);
+        self.record(.object_get_properties);
+        const props = try allocator.alloc(PropValue, 1);
+        errdefer allocator.free(props);
+        const typ: u64 = if (object_id == 71) drm.PLANE_TYPE_CURSOR else drm.PLANE_TYPE_PRIMARY;
+        props[0] = .{ .id = plane_type_prop, .value = typ };
+        return .{ .props = props };
     }
 };
 
@@ -2663,4 +3268,182 @@ test "vtable: backend interface dispatches to the same state" {
     try testing.expect(b.supportsHwCursor());
     try b.setCursor(null, 0, 0);
     try testing.expectEqual(@as(u32, 0), fake.cursor_calls.items[fake.cursor_calls.items.len - 1].handle);
+}
+
+test "gpus: policy filter matches kmscon seat_gpu_is_ignored" {
+    // all keeps everything; primary only primary; aux primary-or-aux.
+    try testing.expect(!gpuIgnored(false, false, .all));
+    try testing.expect(!gpuIgnored(true, false, .all));
+    try testing.expect(!gpuIgnored(false, true, .all));
+    try testing.expect(gpuIgnored(false, false, .primary));
+    try testing.expect(!gpuIgnored(true, false, .primary));
+    try testing.expect(gpuIgnored(false, true, .primary));
+    // The asymmetry: an unflagged card is kept by all but dropped by aux.
+    try testing.expect(gpuIgnored(false, false, .aux));
+    try testing.expect(!gpuIgnored(true, false, .aux));
+    try testing.expect(!gpuIgnored(false, true, .aux));
+    try testing.expect(!gpuIgnored(true, true, .aux));
+}
+
+test "gpus: selectGpus filters in order into the caller buffer" {
+    const cands = [_]GpuCandidate{
+        .{ .path = "/dev/dri/card0", .name = "card0", .primary = true },
+        .{ .path = "/dev/dri/card1", .name = "card1", .aux = true },
+        .{ .path = "/dev/dri/card2", .name = "card2" }, // unflagged
+    };
+    var out: [3]GpuCandidate = undefined;
+    try testing.expectEqual(@as(usize, 3), selectGpus(&cands, .all, &out).len);
+    const primary = selectGpus(&cands, .primary, &out);
+    try testing.expectEqual(@as(usize, 1), primary.len);
+    try testing.expectEqualStrings("card0", primary[0].name);
+    const aux = selectGpus(&cands, .aux, &out);
+    try testing.expectEqual(@as(usize, 2), aux.len);
+    try testing.expectEqualStrings("card0", aux[0].name);
+    try testing.expectEqualStrings("card1", aux[1].name);
+}
+
+test "gpus: isCardName accepts cardN, rejects renderDN and junk" {
+    try testing.expect(isCardName("card0"));
+    try testing.expect(isCardName("card12"));
+    try testing.expect(!isCardName("renderD128"));
+    try testing.expect(!isCardName("card"));
+    try testing.expect(!isCardName("cardX"));
+    try testing.expect(!isCardName("controlD64"));
+}
+
+test "mode: use-original-mode keeps the bound current mode" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    // The CRTC is currently driven at 1024x768 (fake_mode_1024, index 0).
+    fake.crtc_current_mode = fake_mode_1024;
+    const d = try Drm2d.init(a, "/dev/dri/card0", fake.ops());
+    defer d.deinit();
+    // HDMI-A-1 (index 1) current mode recovered from its bound CRTC.
+    try testing.expectEqual(@as(?usize, 0), d.infos[1].current_mode);
+    // use-original-mode selects it over the preferred 1920x1080 (index 1).
+    try testing.expectEqual(@as(?usize, 0), try d.selectModeIndex(1, null, true));
+    // Without use-original-mode the preferred mode wins.
+    try testing.expectEqual(@as(?usize, 1), try d.selectModeIndex(1, null, false));
+}
+
+test "mode: mode= spec selects by resolution and rate, else preferred" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try Drm2d.init(a, "/dev/dri/card0", fake.ops());
+    defer d.deinit();
+    // HDMI-A-1 modes: [1024x768@60, 1920x1080@60 (preferred)].
+    const spec = video.ModeSpec.parse("1024x768").?;
+    try testing.expectEqual(@as(?usize, 0), try d.selectModeIndex(1, spec, false));
+    const spec2 = video.ModeSpec.parse("1920x1080@60").?;
+    try testing.expectEqual(@as(?usize, 1), try d.selectModeIndex(1, spec2, false));
+    // No match falls back to preferred.
+    const miss = video.ModeSpec.parse("640x480").?;
+    try testing.expectEqual(@as(?usize, 1), try d.selectModeIndex(1, miss, false));
+    // Out-of-range connector: null.
+    try testing.expectEqual(@as(?usize, null), try d.selectModeIndex(99, null, false));
+}
+
+test "cursor: supportsHwCursor false when no cursor plane exists" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    fake.cursor_plane_present = false; // caps still report 64x64
+    const d = try setupActive(a, &fake);
+    defer d.deinit();
+    // Constraint #8: a 64x64 cap answer alone does not prove a plane.
+    try testing.expect(!d.supportsHwCursor());
+    var img = try Framebuffer.create(a, 8, 8, .argb8888, null);
+    defer img.destroy(a);
+    try testing.expectError(error.Unsupported, d.setCursor(&img, 0, 0));
+}
+
+test "cursor: soft-cursor force hides the plane and gates setCursor" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupActive(a, &fake);
+    defer d.deinit();
+    try testing.expect(d.supportsHwCursor());
+    var img = try Framebuffer.create(a, 8, 8, .argb8888, null);
+    defer img.destroy(a);
+    try d.setCursor(&img, 1, 2);
+    try testing.expectEqual(@as(usize, 1), fake.cursor_calls.items.len);
+    // Force software: hides the hw cursor (handle 0) and gates further sets.
+    d.setSoftCursorForce(true);
+    try testing.expect(!d.supportsHwCursor());
+    try testing.expectEqual(@as(u32, 0), fake.cursor_calls.items[fake.cursor_calls.items.len - 1].handle);
+    try testing.expectError(error.Unsupported, d.setCursor(&img, 3, 4));
+    // Releasing the force restores the hardware cursor.
+    d.setSoftCursorForce(false);
+    try testing.expect(d.supportsHwCursor());
+}
+
+/// Fake hotplug monitor: an event queue behind HotplugOps.
+const FakeHotplug = struct {
+    allocator: Allocator,
+    events: std.ArrayList(HotplugEvent) = .empty,
+    fd_value: i32 = 42,
+    closed: bool = false,
+
+    fn deinit(self: *FakeHotplug) void {
+        self.events.deinit(self.allocator);
+    }
+
+    fn ops(self: *FakeHotplug) HotplugOps {
+        return .{ .ctx = self, .open = open, .close = close, .fd = fd, .next = next };
+    }
+
+    fn cast(ctx: ?*anyopaque) *FakeHotplug {
+        return @ptrCast(@alignCast(ctx.?));
+    }
+
+    fn open(ctx: ?*anyopaque) !*anyopaque {
+        return ctx.?;
+    }
+
+    fn close(ctx: ?*anyopaque, _: *anyopaque) void {
+        cast(ctx).closed = true;
+    }
+
+    fn fd(ctx: ?*anyopaque, _: *anyopaque) i32 {
+        return cast(ctx).fd_value;
+    }
+
+    fn next(ctx: ?*anyopaque, _: *anyopaque) !?HotplugEvent {
+        const self = cast(ctx);
+        if (self.events.items.len == 0) return null;
+        const ev = self.events.items[0];
+        std.mem.copyForwards(HotplugEvent, self.events.items[0..], self.events.items[1..]);
+        self.events.shrinkRetainingCapacity(self.events.items.len - 1);
+        return ev;
+    }
+};
+
+test "hotplug: monitor fd, drain events, idempotent enable, close on deinit" {
+    const a = testing.allocator;
+    var fake: FakeDrm = .{ .allocator = a };
+    defer fake.deinit();
+    const d = try setupActive(a, &fake);
+    // Not enabled yet: no fd, poll is a no-op.
+    try testing.expect(d.hotplugFd() == null);
+    try testing.expectEqual(false, try d.pollHotplug());
+
+    var hp: FakeHotplug = .{ .allocator = a };
+    defer hp.deinit();
+    try d.enableHotplug(hp.ops());
+    try testing.expectEqual(@as(?i32, 42), d.hotplugFd());
+    try testing.expectEqual(false, try d.pollHotplug());
+    // Queue events: poll drains them all and reports true.
+    try hp.events.append(a, .change);
+    try hp.events.append(a, .add);
+    try testing.expectEqual(true, try d.pollHotplug());
+    try testing.expectEqual(@as(usize, 0), hp.events.items.len);
+    // Idempotent: a second enable does not replace the monitor.
+    try d.enableHotplug(hp.ops());
+    try testing.expectEqual(@as(?i32, 42), d.hotplugFd());
+
+    d.deinit();
+    try testing.expect(hp.closed);
 }

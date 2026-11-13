@@ -174,6 +174,17 @@ pub const Connection = drm2d.Connection;
 pub const drmc = drm2d.drm;
 pub const connectorTypeName = drm2d.connectorTypeName;
 
+// GPU selection + hotplug are shared with drm2d (M5.3/M5.5).
+pub const GpuSelection = drm2d.GpuSelection;
+pub const GpuCandidate = drm2d.GpuCandidate;
+pub const gpuIgnored = drm2d.gpuIgnored;
+pub const selectGpus = drm2d.selectGpus;
+pub const enumerateGpus = drm2d.enumerateGpus;
+pub const freeGpuCandidates = drm2d.freeGpuCandidates;
+pub const HotplugOps = drm2d.HotplugOps;
+pub const HotplugEvent = drm2d.HotplugEvent;
+pub const Hotplug = drm2d.Hotplug;
+
 // ---------------------------------------------------------------------------
 // GBM / EGL / GL constants (values verified against the pinned mesa headers).
 // ---------------------------------------------------------------------------
@@ -433,6 +444,9 @@ const Conn = struct {
     info_modes: []Mode,
     name: []u8,
     dpms_prop_id: ?u32,
+    /// Index into `modes` of the mode the connector is currently driven at,
+    /// recovered from its bound CRTC (use-original-mode); null when unknown.
+    current_mode: ?usize = null,
 
     fn deinit(self: *Conn, allocator: Allocator) void {
         allocator.free(self.encoders);
@@ -488,6 +502,32 @@ fn connFromSnapshot(allocator: Allocator, ops: DrmOps, fd: i32, snap: *const Con
         }
     }
 
+    // Current mode (use-original-mode, recipes §2.4): follow the bound
+    // encoder to its CRTC and match the live mode by resolution + clock.
+    // Skipped when the seam lacks get_crtc (current_mode stays null).
+    var current_mode: ?usize = null;
+    if (snap.connection == .connected and snap.encoder_id != 0) {
+        if (ops.get_crtc) |get_crtc| {
+            if (ops.get_encoder(ops.ctx, fd, snap.encoder_id)) |enc| {
+                if (enc.crtc_id != 0) {
+                    if (get_crtc(ops.ctx, fd, enc.crtc_id)) |crtc| {
+                        if (crtc.mode_valid) {
+                            for (modes, 0..) |m, i| {
+                                if (m.hdisplay == crtc.mode.hdisplay and
+                                    m.vdisplay == crtc.mode.vdisplay and
+                                    m.clock == crtc.mode.clock)
+                                {
+                                    current_mode = i;
+                                    break;
+                                }
+                            }
+                        }
+                    } else |_| {}
+                }
+            } else |_| {}
+        }
+    }
+
     return .{
         .id = snap.connector_id,
         .connector_type = snap.connector_type,
@@ -501,6 +541,7 @@ fn connFromSnapshot(allocator: Allocator, ops: DrmOps, fd: i32, snap: *const Con
         .info_modes = info_modes,
         .name = name,
         .dpms_prop_id = dpms_prop_id,
+        .current_mode = current_mode,
     };
 }
 
@@ -523,7 +564,7 @@ fn buildInfos(allocator: Allocator, conns: []const Conn, card_path: []const u8) 
             .connected = c.connected,
             .modes = c.info_modes,
             .preferred_mode = preferred,
-            .current_mode = null,
+            .current_mode = c.current_mode,
         };
     }
     return infos;
@@ -585,6 +626,8 @@ pub const Drm3d = struct {
     flipping: ?GbmBo = null,
     flip_pending: bool = false,
     full_redraw: bool = true,
+    /// Hotplug event source (M5.5), created by enableHotplug.
+    hotplug: ?Hotplug = null,
     /// bo pointer -> fb id, for the life of the current GBM surface.
     fb_cache: std.AutoHashMap(usize, u32),
 
@@ -705,6 +748,7 @@ pub const Drm3d = struct {
     pub fn deinit(self: *Drm3d) void {
         if (self.flip_pending) self.waitFlip() catch {};
         self.releaseLockedBuffers();
+        if (self.hotplug) |*h| h.deinit();
         self.ops.drop_master(self.ops.ctx, self.fd) catch {};
 
         self.destroyGl();
@@ -735,6 +779,53 @@ pub const Drm3d = struct {
     /// The DRM fd for the epoll loop; on readability call readEvents.
     pub fn eventFd(self: *const Drm3d) i32 {
         return self.fd;
+    }
+
+    /// Choose a mode index for connector `connector_idx` (M5.3), identical
+    /// to drm2d: a matching mode= spec, else use-original-mode keeps the
+    /// current mode, else preferred, else mode 0 (layout.selectMode). Null
+    /// when the connector has no modes.
+    pub fn selectModeIndex(self: *const Drm3d, connector_idx: usize, spec: ?video.ModeSpec, use_original: bool) !?usize {
+        if (connector_idx >= self.conns.len) return null;
+        const conn = &self.conns[connector_idx];
+        if (conn.info_modes.len == 0) return null;
+        const candidates = try self.allocator.alloc(video.layout.ModeCandidate, conn.info_modes.len);
+        defer self.allocator.free(candidates);
+        for (conn.info_modes, 0..) |m, i| {
+            candidates[i] = .{
+                .width = m.width_px,
+                .height = m.height_px,
+                .refresh_hz = (m.refresh_mhz + 500) / 1000,
+            };
+        }
+        var preferred: ?usize = null;
+        for (conn.modes, 0..) |m, j| {
+            if (m.isPreferred()) {
+                preferred = j;
+                break;
+            }
+        }
+        if (preferred == null) preferred = 0;
+        return video.layout.selectMode(candidates, spec, use_original, preferred, conn.current_mode);
+    }
+
+    /// Enable the hotplug event source (M5.5); see drm2d.enableHotplug. The
+    /// loop polls hotplugFd() and re-probes via connectors() on events.
+    pub fn enableHotplug(self: *Drm3d, ops: HotplugOps) !void {
+        if (self.hotplug != null) return;
+        self.hotplug = try Hotplug.init(ops);
+    }
+
+    /// The hotplug monitor fd for the epoll loop, or null when not enabled.
+    pub fn hotplugFd(self: *const Drm3d) ?i32 {
+        if (self.hotplug) |*h| return h.fd();
+        return null;
+    }
+
+    /// Drain pending hotplug events; true when at least one arrived.
+    pub fn pollHotplug(self: *Drm3d) !bool {
+        if (self.hotplug) |*h| return h.poll();
+        return false;
     }
 
     // ------------------------------------------------------------------
@@ -3007,4 +3098,21 @@ test "vtable: backend interface dispatches to the same state" {
     try testing.expectEqual(DpmsState.off, d.dpmsState());
     try testing.expect(!b.supportsHwCursor());
     try testing.expectError(error.Unsupported, b.setCursor(null, 0, 0));
+}
+
+test "mode: selectModeIndex honours mode= spec and preferred (M5.3 parity)" {
+    const a = testing.allocator;
+    var drm: FakeDrm = .{ .allocator = a };
+    defer drm.deinit();
+    var gpu: FakeGpu = .{ .allocator = a };
+    defer gpu.deinit();
+    const d = try Drm3d.init(a, "/dev/dri/card0", drm.ops(), gpu.gbmOps(), gpu.eglOps(), gpu.glOps());
+    defer d.deinit();
+    // HDMI-A-1 (index 1): [1024x768@60, 1920x1080@60 (preferred)].
+    try testing.expectEqual(@as(?usize, 1), try d.selectModeIndex(1, null, false));
+    const spec = video.ModeSpec.parse("1024x768").?;
+    try testing.expectEqual(@as(?usize, 0), try d.selectModeIndex(1, spec, false));
+    // The fake seam has no get_crtc: current mode unknown, so
+    // use-original-mode falls back to the preferred mode.
+    try testing.expectEqual(@as(?usize, 1), try d.selectModeIndex(1, null, true));
 }

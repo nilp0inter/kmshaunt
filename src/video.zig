@@ -10,10 +10,10 @@
 //! loop learns the flip completed through `flipPending`/`waitFlip` and the
 //! backend's own event source. See `Backend.endFrame` for the exact contract.
 //!
-//! This file imports only std and framebuffer.zig (both contract-owned). The
-//! layout glue (`LayoutConfig` below) is a placeholder seam; it does NOT
-//! import src/video/layout.zig, which is being written concurrently and will
-//! be unified in M1 integration.
+//! This file imports std, framebuffer.zig and the layout module
+//! (src/video/layout.zig). The multi-monitor layout types below are
+//! re-exports of that module (unified in ROADMAP M5.4); the former
+//! placeholder seam has been removed.
 
 const std = @import("std");
 const fb = @import("framebuffer.zig");
@@ -161,42 +161,32 @@ pub const Backend = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Layout glue seam.
+// Layout glue (unified with src/video/layout.zig, ROADMAP M5.4).
 //
-// These are minimal placeholder types so video.zig compiles standalone. They
-// are TO BE UNIFIED with src/video/layout.zig in M1 integration: that module
-// (being written concurrently) owns the real multi-monitor layout algorithm
-// (clone/largest/scaled, per-connector rotation and disable, cell grid math).
-// Do not import src/video/layout.zig here; when it lands, replace these
-// declarations with re-exports of its types.
+// The multi-monitor layout algorithm — clone/largest/scaled, per-connector
+// rotation and disable, the shared terminal grid, the `mode=`/`screen=`
+// matching and the dirty-row → physical damage mapping — lives in
+// src/video/layout.zig. These re-exports keep a stable `video.*` surface;
+// callers may also reach the full module through `video.layout`.
 // ---------------------------------------------------------------------------
 
-/// Multi-monitor policy, matching the `multi-monitor=` option values
-/// (kmscon-options.md §5.8). `scaled` is the kmscon default.
-pub const MultiMonitorMode = enum {
-    clone,
-    largest,
-    scaled,
-};
+pub const layout = @import("video/layout.zig");
 
-/// Per-connector layout input: which connector, whether it is enabled, and
-/// its rotation. Placeholder for the richer per-connector config that
-/// src/video/layout.zig will define (screen= orientation/disable).
-pub const ConnectorLayoutInput = struct {
-    connector_idx: usize,
-    enabled: bool = true,
-    /// Rotation in degrees clockwise: 0, 90, 180, 270.
-    rotation_deg: u16 = 0,
-};
+pub const MultiMonitorMode = layout.MultiMonitorMode;
+pub const Rotation = layout.Rotation;
+pub const computeLayout = layout.computeLayout;
+pub const ModeSpec = layout.ModeSpec;
+pub const ScreenSpec = layout.ScreenSpec;
+pub const DisplayPattern = layout.DisplayPattern;
+pub const lookupMode = layout.lookupMode;
+pub const lookupScreen = layout.lookupScreen;
 
-/// Minimal layout configuration handed to the layout glue. Placeholder; to
-/// be unified with src/video/layout.zig in M1 integration.
-pub const LayoutConfig = struct {
-    multi_monitor: MultiMonitorMode,
-    connectors: []const ConnectorLayoutInput,
-    cell_w: u16,
-    cell_h: u16,
-};
+// Prefixed to avoid ambiguity with the backend's `ConnectorInfo`.
+pub const LayoutConnector = layout.Connector;
+pub const LayoutPlan = layout.Plan;
+pub const LayoutCanvas = layout.Canvas;
+pub const LayoutCell = layout.Cell;
+pub const LayoutRect = layout.Rect;
 
 // ---------------------------------------------------------------------------
 // Tests: prove the vtable interface is implementable and that Damage slices
@@ -450,19 +440,24 @@ test "video: endFrame passes Damage slices through and paces flips" {
     try std.testing.expectEqualSlices(MockBackend.Call, &expected, mock.calls.items);
 }
 
-test "video: LayoutConfig seam constructs with placeholder types" {
-    const inputs = [_]ConnectorLayoutInput{
-        .{ .connector_idx = 0, .enabled = true, .rotation_deg = 0 },
-        .{ .connector_idx = 1, .enabled = false, .rotation_deg = 90 },
+test "video: layout re-exports drive computeLayout end to end" {
+    // The former placeholder seam is now the real layout module: build a
+    // clone layout through the video.* re-exports and check the grid.
+    const conns = [_]LayoutConnector{
+        .{ .gpu = "card0", .connector = "HDMI-A-1", .width_px = 1920, .height_px = 1080 },
+        .{ .gpu = "card0", .connector = "DP-1", .width_px = 1280, .height_px = 1024, .enabled = false },
     };
-    const cfg = LayoutConfig{
-        .multi_monitor = .scaled,
-        .connectors = &inputs,
-        .cell_w = 8,
-        .cell_h = 16,
-    };
-    try std.testing.expectEqual(MultiMonitorMode.scaled, cfg.multi_monitor);
-    try std.testing.expectEqual(@as(usize, 2), cfg.connectors.len);
-    try std.testing.expect(!cfg.connectors[1].enabled);
-    try std.testing.expectEqual(@as(u16, 90), cfg.connectors[1].rotation_deg);
+    var plans: [2]LayoutPlan = undefined;
+    const canvas = computeLayout(&conns, .{ .w = 8, .h = 16 }, .clone, &plans);
+    try std.testing.expectEqual(MultiMonitorMode.clone, MultiMonitorMode.fromConfigString("clone"));
+    try std.testing.expectEqual(MultiMonitorMode.scaled, MultiMonitorMode.default);
+    // The disabled connector is excluded: the canvas is the HDMI grid.
+    try std.testing.expectEqual(@as(u32, 240), canvas.cols);
+    try std.testing.expectEqual(@as(u32, 67), canvas.rows);
+    try std.testing.expect(plans[0].active);
+    try std.testing.expect(!plans[1].active);
+    // Rotation re-export steps clockwise (grab-rotate-cw).
+    try std.testing.expectEqual(Rotation.right, Rotation.normal.rotateCw());
+    // Mode parsing is reachable through the same surface.
+    try std.testing.expectEqual(@as(u32, 1920), ModeSpec.parse("1920x1080@60").?.width);
 }
