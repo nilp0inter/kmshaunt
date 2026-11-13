@@ -15,6 +15,7 @@
 //!   render_golden --fixture <file.bin> [--out <out.png>] [--check <golden.png>]
 //!                 [--generate] [--cols 80] [--rows 24] [--font "JetBrains Mono"]
 //!                 [--size 16] [--palette legacy] [--font-dir fixtures/t2/fonts]
+//!                 [--animation-ms N]
 //!
 //!   --fixture <path>   VT byte fixture to feed the terminal (required).
 //!   --out <path>       Write the rendered PNG here.
@@ -26,10 +27,22 @@
 //!   --size <px>        Font pixel size (default 16).
 //!   --palette <name>   Palette preset, src/misc/palette.zig (default legacy).
 //!   --font-dir <dir>   Pinned font directory (default fixtures/t2/fonts).
+//!   --animation-ms N   Advance playing kitty animations to the frame due at
+//!                      monotonic time N ms before rendering (M4.6). Without
+//!                      it every animation stays on its root frame.
 //!   --help             Usage.
 //!
 //! At least one of --out / --check is required. Exit codes: 0 success or
 //! golden match, 1 golden differs, 2 usage or I/O error.
+//!
+//! # Kitty images (M4.6)
+//!
+//! The terminal is resized with the renderer's cell pixel size and bound as
+//! the renderer's pixel source, so kitty escape fixtures (raw RGBA f=32
+//! transmit + placement, layers, crop, scroll, delete, animation) composite
+//! exactly as in the session. Animation-frame goldens are deterministic:
+//! --animation-ms ticks the storage clock to a fixed time instead of reading
+//! a wall clock. Text fixtures render identically with the kitty wiring on.
 //!
 //! # Determinism (R6)
 //!
@@ -283,6 +296,10 @@ pub const Request = struct {
     palette: presets.Preset = default_palette,
     /// Directory holding ONLY the pinned fonts (see the module comment).
     font_dir: []const u8 = default_font_dir,
+    /// Advance playing kitty animations to the frame due at this monotonic
+    /// time (ms) before rendering; null leaves every animation on its root
+    /// frame (M4.6 animation goldens).
+    animation_ms: ?u64 = null,
 };
 
 /// Render `req.fixture` to a deterministic PNG file image. The caller owns
@@ -308,7 +325,19 @@ pub fn renderPng(allocator: std.mem.Allocator, io: std.Io, req: Request) ![]u8 {
 
     var t = try vt.Vt.init(req.cols, req.rows);
     defer t.deinit();
+    // Kitty placements are pixel geometry: the terminal needs the cell pixel
+    // size and the renderer needs the terminal as its pixel source (M4).
+    // Text-only fixtures render identically with both set.
+    try t.resize(req.cols, req.rows, renderer.metrics.cell_w, renderer.metrics.cell_h);
+    renderer.vt = &t;
     t.write(req.fixture);
+    if (req.animation_ms) |ms| {
+        const kg = try t.kittyGraphics();
+        // The first tick arms the storage clock (epoch 0); the second
+        // advances every playing animation to the frame due at `ms`.
+        _ = try kg.animationTick(0);
+        _ = try kg.animationTick(ms);
+    }
 
     var state = try vt.RenderState.new();
     defer state.deinit();
@@ -405,6 +434,7 @@ const usage =
     \\Usage: render_golden --fixture <file.bin> [--out <out.png>] [--check <golden.png>]
     \\                     [--generate] [--cols N] [--rows N] [--font NAME]
     \\                     [--size PX] [--palette PRESET] [--font-dir DIR]
+    \\                     [--animation-ms N]
     \\
     \\Headless T2 golden renderer: VT byte fixture + pinned fonts -> PNG.
     \\
@@ -420,6 +450,8 @@ const usage =
     \\                     solarized-white, soft-black, base16-dark, base16-light,
     \\                     custom (default legacy)
     \\  --font-dir DIR     pinned font directory (default fixtures/t2/fonts)
+    \\  --animation-ms N   advance kitty animations to the frame due at N ms
+    \\                     (default: root frame, no tick)
     \\  --help             this text
     \\
     \\Exit codes: 0 success/match, 1 golden differs, 2 usage or I/O error.
@@ -438,6 +470,7 @@ const Options = struct {
     size: u16 = default_size_px,
     palette: presets.Preset = default_palette,
     font_dir: []const u8 = default_font_dir,
+    animation_ms: ?u64 = null,
 };
 
 fn parseArgs(args: []const []const u8, stderr: *std.Io.Writer) !Options {
@@ -473,6 +506,11 @@ fn parseArgs(args: []const []const u8, stderr: *std.Io.Writer) !Options {
             opts.rows = try parseDim(value, "--rows", stderr);
         } else if (std.mem.eql(u8, arg, "--size")) {
             opts.size = try parseDim(value, "--size", stderr);
+        } else if (std.mem.eql(u8, arg, "--animation-ms")) {
+            opts.animation_ms = std.fmt.parseInt(u64, value, 10) catch {
+                try stderr.print("render_golden: --animation-ms expects a number, got '{s}'\n", .{value});
+                return error.InvalidNumber;
+            };
         } else if (std.mem.eql(u8, arg, "--palette")) {
             opts.palette = presets.Preset.fromName(value) orelse {
                 try stderr.print("render_golden: unknown palette '{s}'\n", .{value});
@@ -548,6 +586,7 @@ pub fn main(init: std.process.Init) !void {
         .size_px = opts.size,
         .palette = opts.palette,
         .font_dir = opts.font_dir,
+        .animation_ms = opts.animation_ms,
     }) catch |err| {
         try stderr.print("render_golden: render failed: {s} (font dir '{s}')\n", .{ @errorName(err), opts.font_dir });
         try stderr.flush();
@@ -655,35 +694,72 @@ test "render_golden: check matches a generated golden and rejects a corrupted on
 
 test "render_golden: committed T2 goldens are byte-exact" {
     const a = testing.allocator;
-    const cases = [_][]const u8{
-        "box-drawing",
-        "combining-marks",
-        "cjk-wide",
-        "decorations",
-        "bold-italic",
-        "blocks-braille-powerline",
-        "legacy-computing",
-        "cursor-styles",
-        "zwj-family",
-        "flags",
-        "skin-tones",
-        "variation-selectors",
+    const Case = struct {
+        fixture: []const u8,
+        golden: []const u8,
+        animation_ms: ?u64 = null,
     };
-    for (cases) |name| {
-        const fixture_path = try std.fmt.allocPrint(a, "fixtures/t2/{s}.bin", .{name});
+    const cases = [_]Case{
+        // M3.10 text fixtures.
+        .{ .fixture = "box-drawing", .golden = "box-drawing" },
+        .{ .fixture = "combining-marks", .golden = "combining-marks" },
+        .{ .fixture = "cjk-wide", .golden = "cjk-wide" },
+        .{ .fixture = "decorations", .golden = "decorations" },
+        .{ .fixture = "bold-italic", .golden = "bold-italic" },
+        .{ .fixture = "blocks-braille-powerline", .golden = "blocks-braille-powerline" },
+        .{ .fixture = "legacy-computing", .golden = "legacy-computing" },
+        .{ .fixture = "cursor-styles", .golden = "cursor-styles" },
+        .{ .fixture = "zwj-family", .golden = "zwj-family" },
+        .{ .fixture = "flags", .golden = "flags" },
+        .{ .fixture = "skin-tones", .golden = "skin-tones" },
+        .{ .fixture = "variation-selectors", .golden = "variation-selectors" },
+        .{ .fixture = "palette-colors", .golden = "palette-colors" },
+        // M4.6 kitty escape fixtures (fixtures/t2/make_kitty_fixtures.py).
+        .{ .fixture = "kitty-placement", .golden = "kitty-placement" },
+        .{ .fixture = "kitty-layers", .golden = "kitty-layers" },
+        .{ .fixture = "kitty-crop", .golden = "kitty-crop" },
+        .{ .fixture = "kitty-scroll", .golden = "kitty-scroll" },
+        .{ .fixture = "kitty-delete", .golden = "kitty-delete" },
+        .{ .fixture = "kitty-animation", .golden = "kitty-animation" },
+        .{ .fixture = "kitty-animation", .golden = "kitty-animation-frame2", .animation_ms = 40 },
+    };
+    for (cases) |case| {
+        const fixture_path = try std.fmt.allocPrint(a, "fixtures/t2/{s}.bin", .{case.fixture});
         defer a.free(fixture_path);
-        const golden_path = try std.fmt.allocPrint(a, "fixtures/t2/goldens/{s}.png", .{name});
+        const golden_path = try std.fmt.allocPrint(a, "fixtures/t2/goldens/{s}.png", .{case.golden});
         defer a.free(golden_path);
         const fixture = try std.Io.Dir.cwd().readFileAlloc(testing.io, fixture_path, a, .limited(max_file_bytes));
         defer a.free(fixture);
-        const img = try renderPng(a, testing.io, .{ .fixture = fixture });
+        const img = try renderPng(a, testing.io, .{ .fixture = fixture, .animation_ms = case.animation_ms });
         defer a.free(img);
         const cmp = try checkGoldenFile(a, testing.io, img, golden_path);
         if (!cmp.match) {
             std.debug.print("golden mismatch for {s}: rendered {d} bytes, golden {d} bytes, first diff {d}\n", .{
-                name, cmp.rendered_len, cmp.golden_len, cmp.first_diff orelse cmp.golden_len,
+                case.golden, cmp.rendered_len, cmp.golden_len, cmp.first_diff orelse cmp.golden_len,
             });
         }
         try testing.expect(cmp.match);
     }
+}
+
+test "render_golden: kitty animation tick selects the frame deterministically" {
+    const a = testing.allocator;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(testing.io, "fixtures/t2/kitty-animation.bin", a, .limited(max_file_bytes));
+    defer a.free(fixture);
+
+    // Root frame (no tick) vs the frame due at 40 ms: different pixels, and
+    // each is stable across renders (the storage clock is the only input).
+    const frame1 = try renderPng(a, testing.io, .{ .fixture = fixture });
+    defer a.free(frame1);
+    const frame2 = try renderPng(a, testing.io, .{ .fixture = fixture, .animation_ms = 40 });
+    defer a.free(frame2);
+    const frame2_again = try renderPng(a, testing.io, .{ .fixture = fixture, .animation_ms = 40 });
+    defer a.free(frame2_again);
+    try testing.expect(!std.mem.eql(u8, frame1, frame2));
+    try testing.expectEqualStrings(frame2, frame2_again);
+
+    // The image actually composites: the animation fixture is not blank.
+    const blank = try renderPng(a, testing.io, .{ .fixture = "" });
+    defer a.free(blank);
+    try testing.expect(!std.mem.eql(u8, frame1, blank));
 }

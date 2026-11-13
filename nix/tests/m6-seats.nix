@@ -24,13 +24,18 @@
 #       alone still yields a real VT ("session control cannot be configured on
 #       real VT, disabling session control" in the boot log). A fake VT needs
 #       the unit's --vt removed.
-#     * kmshaunt with libseat=true segfaults during startup (NULL deref in the
-#       libseat seat path, src/main.zig setupSeat -> src/seat/libseat.zig), so
-#       the fake-VT configuration that would enable session-control crashes the
-#       console (kmshaunt-vt@tty1.service: Failed with result 'core-dump').
-#   Until the kmshaunt libseat crash is fixed and a fake-VT unit is available to
-#   both, there is no configuration where the session grabs pass on BOTH nodes,
-#   so they are deferred rather than asserted against a moving target.
+#     * kmshaunt with libseat=true used to segfault during startup (the
+#       initial enable_seat was delivered from setCallbacks, before the video
+#       backend existed -> NULL-vtable deref at flipPending, offset 0x28).
+#       Fixed by delivering the queued enable from activate() instead; see
+#       src/seat/libseat.zig and the m6-libseat-startup regression test.
+#       kmshaunt's libseat backend still opens no kernel VT, so session-control
+#       is not force-disabled there, but main.zig does not yet clear
+#       cfg.session_control on the real-VT (!libseat) path the way kmscon does.
+#   Until a fake-VT unit is available to BOTH implementations (and kmshaunt
+#   gates session-control on real VTs), there is no configuration where the
+#   session grabs pass on BOTH nodes, so they are deferred rather than asserted
+#   against a moving target.
 #
 #   Q1 second seat gets its own console. The input-routing recipe is verified
 #   on paper in docs/spikes/q1-multiseat-input.md, but kmshaunt's multi-seat
