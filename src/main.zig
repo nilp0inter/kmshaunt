@@ -25,7 +25,8 @@
 //!  8. Input: `xkb.Keymap` + `Input` (libinput), sink routes to the manager,
 //!     repeat through a `loop.Timer` adapter, VT-switch grabs handled here.
 //!  9. Each terminal's pty master registered EPOLLIN edge-triggered.
-//! 10. Frame loop paced by DRM page-flip events; DPMS + cursor-blink timers.
+//! 10. Frame loop paced by DRM page-flip events; DPMS + cursor-blink +
+//!     kitty-animation timers.
 //! 11. issue text, asciicast recorder, locale1 live keymap follow.
 //! 12. `loop.run`; SIGTERM/INT (or oneshot child exit) stops it; everything
 //!     is deinitialised in reverse order.
@@ -43,6 +44,7 @@
 //! | DPMS timerfd          | IN              | onDpmsTimer              |
 //! | blink timerfd         | IN              | onBlinkTimer             |
 //! | repeat timerfd        | IN              | RepeatAdapter.fired      |
+//! | kitty timerfd         | IN              | onKittyTimer             |
 //!
 //! Rendering uses a persistent shadow framebuffer: the CPU renderer paints
 //! only dirty rows, so the shadow accumulates the full image across frames
@@ -272,6 +274,7 @@ const Console = struct {
     dpms_timer: loop.Timer = .{},
     blink_timer: loop.Timer = .{},
     respawn_timer: loop.Timer = .{},
+    kitty_timer: loop.Timer = .{},
     recorder: ?*asciicast.Recorder = null,
     loc1: ?*locale1.Locale1 = null,
     locale_token: ?loop.Token = null,
@@ -301,6 +304,7 @@ const Console = struct {
             self.recorder = null;
         }
         self.respawn_timer.deinit();
+        self.kitty_timer.deinit();
         self.blink_timer.deinit();
         self.dpms_timer.deinit();
 
@@ -413,6 +417,7 @@ const Console = struct {
         try self.dpms_timer.init(&self.lp, .{ .callback = onDpmsTimer, .userdata = @intFromPtr(self) });
         try self.blink_timer.init(&self.lp, .{ .callback = onBlinkTimer, .userdata = @intFromPtr(self) });
         try self.respawn_timer.init(&self.lp, .{ .callback = onRespawnTimer, .userdata = @intFromPtr(self) });
+        try self.kitty_timer.init(&self.lp, .{ .callback = onKittyTimer, .userdata = @intFromPtr(self) });
         if (self.cfg.blink) try self.blink_timer.armInterval(blink_interval_ns);
         self.armDpms();
 
@@ -649,10 +654,17 @@ const Console = struct {
             .cols = self.cols,
             .rows = self.rows,
         };
+        // Kitty pixels come from the active session's terminal (M4);
+        // the render state alone cannot reach the storage.
+        self.renderer.?.vt = if (self.activeTerminal()) |ts| &ts.vt else null;
         m.render(&ctx) catch |err| {
             log.warn("render: {t}", .{err});
             return;
         };
+        // Advance kitty animations once per rendered frame and schedule
+        // the next one (M4.4); the tick's new pixel generations reach the
+        // renderer through the next frame's placement list.
+        self.tickKittyAnimations();
         // The shadow holds the complete image in logical (content) space;
         // blit it into the physical back buffer, rotating if needed (M5.4).
         if (self.rotation == .normal) {
@@ -984,6 +996,12 @@ const Console = struct {
         self.doRespawn();
     }
 
+    fn onKittyTimer(_: *loop.Timer, expirations: u64, ud: usize) void {
+        _ = expirations;
+        const self: *Console = @ptrFromInt(ud);
+        self.markDirty();
+    }
+
     fn onInput(ud: usize, event: sess.InputEvent) void {
         const self: *Console = @ptrFromInt(ud);
         self.wakeDpms();
@@ -1008,7 +1026,50 @@ const Console = struct {
         if (self.mgr) |*m| m.onInput(event) catch |err| log.warn("onInput: {t}", .{err});
         self.markDirty();
     }
+
+    /// Advance the active terminal's kitty animations and arm the redraw
+    /// timer at the next frame's due time (M4.4). Called once after each
+    /// rendered frame; the timer re-enters through markDirty, so every
+    /// animation frame is ticked exactly once per rendered frame.
+    /// animationTick mutates storage (invalidating image handles), which
+    /// is safe here: the frame is already drawn.
+    fn tickKittyAnimations(self: *Console) void {
+        const ts = self.activeTerminal() orelse return;
+        const kg = ts.vt.kittyGraphics() catch |err| {
+            log.warn("kitty graphics: {t}", .{err});
+            return;
+        };
+        const now = monotonicMs();
+        const next = kg.animationTick(now) catch |err| {
+            log.warn("kitty animation tick: {t}", .{err});
+            return;
+        };
+        if (next) |n| {
+            self.kitty_timer.armOneShot(kittyRedrawDelayNs(now, n)) catch |err|
+                log.warn("kitty timer: {t}", .{err});
+        } else {
+            self.kitty_timer.disarm() catch |err|
+                log.warn("kitty timer disarm: {t}", .{err});
+        }
+    }
 };
+
+/// Milliseconds on the monotonic clock: the time base for kitty
+/// animationTick, which requires a monotonic clock stable for the
+/// terminal's lifetime.
+fn monotonicMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s +
+        @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
+
+/// Delay until the next animation frame is due, floored at 1 ms: a due
+/// or past deadline must not disarm the timer (a zero delay) or spin the
+/// loop (docs/reference/ghostty-vt-api.md §9.4).
+fn kittyRedrawDelayNs(now_ms: u64, next_ms: u64) u64 {
+    return @max(1, next_ms -| now_ms) * std.time.ns_per_ms;
+}
 
 /// The active console for the session factory (a plain fn pointer with no
 /// closure). One console per process; the daemon spawns separate workers.
@@ -1053,6 +1114,21 @@ fn createTerminal(
     errdefer alloc.destroy(ts);
     ts.* = try terminal.TerminalSession.init(alloc, cfg, cols, rows);
     errdefer ts.deinit();
+
+    // Kitty storage limit (M4.5): config.zig has no
+    // kitty-image-storage-limit option yet, so Vt.init's 10 MiB default
+    // (vt.default_kitty_storage_limit) applies.
+    //
+    // R3 root hardening: the VT unit runs as root, and kitty file /
+    // temp-file / shared-memory media could read root-only files. Keep
+    // them disabled (a NULL value disables each; they are off by
+    // default, this pins them off explicitly). Only direct data and
+    // PNG media remain when euid is 0.
+    if (linux.geteuid() == 0) {
+        try ts.vt.setOption(.kitty_image_medium_file, null);
+        try ts.vt.setOption(.kitty_image_medium_temp_file, null);
+        try ts.vt.setOption(.kitty_image_medium_shared_mem, null);
+    }
 
     ts.setRenderer(c.renderer.?.renderer());
     ts.seat_name = c.seatName();
@@ -1274,4 +1350,11 @@ test "parseArgs: the first argument decides" {
 
 test "parseArgs: a bare word is unknown" {
     try std.testing.expectEqualStrings("run", parseArgs(&.{"run"}).unknown);
+}
+
+test "kittyRedrawDelayNs: future deadline, due and past floor at 1 ms" {
+    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), kittyRedrawDelayNs(100, 150));
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), kittyRedrawDelayNs(100, 100));
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), kittyRedrawDelayNs(100, 90));
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), kittyRedrawDelayNs(std.math.maxInt(u64), 0));
 }

@@ -1774,15 +1774,28 @@ fn rgbFromC(v: c.GhosttyColorRgb) Rgb {
     return .{ .r = v.r, .g = v.g, .b = v.b };
 }
 
-/// Dirty-row iterator (§4.2). nextDirty skips clean rows when dirty is
-/// partial, returns every remaining row when full, and nothing when clean.
-/// It does not clear dirty state.
+/// Row iterator (§4.2). nextDirty skips clean rows when dirty is
+/// partial, returns every remaining row when full, and nothing when
+/// clean. next visits every captured row regardless of dirty state (the
+/// kitty image path redraws clean rows under placements, M4). Neither
+/// clears dirty state.
 pub const Rows = struct {
     state: *RenderState,
+    /// Iterator position of the next row; both walkers keep it in sync.
+    i: u16 = 0,
 
     pub fn nextDirty(self: *Rows) Error!?Row {
         var y: u16 = 0;
         if (!c.ghostty_render_state_row_iterator_next_dirty(self.state.row_iter, &y)) return null;
+        self.i = y + 1;
+        return Row{ .state = self.state, .y = y };
+    }
+
+    /// Move to the next captured row, top to bottom, dirty or clean.
+    pub fn next(self: *Rows) Error!?Row {
+        if (!c.ghostty_render_state_row_iterator_next(self.state.row_iter)) return null;
+        const y = self.i;
+        self.i += 1;
         return Row{ .state = self.state, .y = y };
     }
 };

@@ -1,4 +1,5 @@
-//! src/render/cpu.zig -- CPU renderer (ROADMAP M1.5, M3.3/M3.4/M3.5).
+//! src/render/cpu.zig -- CPU renderer (ROADMAP M1.5, M3.3/M3.4/M3.5,
+//! M4.3/M4.4 kitty images).
 //!
 //! Draws the dirty rows of a `vt.RenderState` into a `Framebuffer`.
 //! Implements the `render.Renderer` vtable so the session can swap in the
@@ -13,6 +14,9 @@
 //! * The caller's `discovery.Discovery` must outlive the renderer: the face
 //!   table holds `Face` handles owned by it, and fallback/style lookups go
 //!   through it. The renderer never destroys a face.
+//! * Kitty images (M4): the console binds the active session's terminal
+//!   through the `vt` field before `renderFrame` (the render state alone
+//!   cannot reach the pixel storage). Null keeps the renderer text-only.
 //! * `resize` must run before the first `renderFrame` (it establishes the
 //!   grid). The framebuffer is cleared/presented by the caller; the
 //!   renderer paints dirty rows only and appends one full-width damage
@@ -51,6 +55,28 @@
 //! font-features strings, parsed with `shaper.Feature.parse` on top of the
 //! shaper defaults (kern ON, liga OFF -- ligatures are opt-in).
 //!
+//! # Kitty image pipeline (M4)
+//!
+//! Each frame builds the drawing list from `RenderState.images()` (the
+//! render-state placement iterator, NOT the storage iterator), converts
+//! it to `image.Placement` geometry (cell offsets folded into dst,
+//! viewport clipping mapped back onto the source crop) and fetches the
+//! decoded pixels from `vt.KittyGraphics.image(id)` into an `ImageCache`
+//! keyed by (protocol, id, generation). The frame then draws in the
+//! ghostty layer order, interleaved with the row passes:
+//!
+//!     below_background images -> cell backgrounds -> below_text images
+//!     -> text -> above_text images
+//!
+//! Alpha blending is not idempotent, so any row a placement touches is
+//! rebuilt from its background before the images are composited again:
+//! the redraw set is the dirty rows plus the rows covered by this
+//! frame's AND the previous frame's placements (moved/deleted images
+//! leave no residue). A frame with a clean render state and an unchanged
+//! placement list draws nothing. Animation frames arrive as generation
+//! bumps on the placement list; the console drives `animationTick` and
+//! the redraw timer (main.zig, M4.4).
+//!
 //! Standalone tests: src/test_cpu.zig (exact command in that file's
 //! header; needs the vt-c, fontconfig_c, freetype_c, hb-c, freetype-c and
 //! harfbuzz-c translate-c modules plus libghostty-vt, libfontconfig,
@@ -67,11 +93,20 @@ const shaper = @import("../font/shaper.zig");
 const color = @import("../font/color.zig");
 const deco = @import("decorations.zig");
 const layout = @import("../video/layout.zig");
+const image = @import("image.zig");
+
+const log = std.log.scoped(.cpu);
 
 pub const Framebuffer = fb.Framebuffer;
 pub const Damage = fb.Damage;
 pub const DamageList = render.DamageList;
 pub const RenderOpts = render.RenderOpts;
+
+/// Renderer-side kitty cache budget: the terminal stores at most
+/// `vt.default_kitty_storage_limit` bytes of originals per screen; scaled
+/// copies share the cache, so double the budget for headroom. CacheFull
+/// degrades to skipping a layer, never to a failed frame.
+const image_cache_limit_bytes: usize = @intCast(2 * vt.default_kitty_storage_limit);
 
 /// Init-time configuration.
 pub const Options = struct {
@@ -140,6 +175,25 @@ pub const CpuRenderer = struct {
     /// Scratch CellDesc buffer for shaping one complex cluster.
     cluster_descs: std.ArrayListUnmanaged(shaper.CellDesc) = .empty,
 
+    // ---- M4 kitty image state ----
+
+    /// Terminal owning the RenderState passed to renderFrame; borrowed,
+    /// bound by the console to the active session before rendering.
+    /// Null = text-only (no kitty pixel source).
+    vt: ?*vt.Vt = null,
+    /// Decoded originals + scaled copies, keyed by (protocol, id,
+    /// generation); frame-pinned like the glyph atlas.
+    image_cache: image.ImageCache,
+    /// This frame's drawing list, built from RenderState.images().
+    /// After a successful frame the lists swap: `prev_placements` holds
+    /// the rendered list and this becomes scratch for the next frame.
+    placements: std.ArrayListUnmanaged(image.Placement) = .empty,
+    /// The last successfully rendered frame's drawing list: its rects
+    /// join the redraw set so moved/deleted images are erased.
+    prev_placements: std.ArrayListUnmanaged(image.Placement) = .empty,
+    /// Per-row redraw flags for the current frame, sized to `rows`.
+    redraw_rows: []bool = &.{},
+
     const FaceSlot = struct {
         face: discovery.Face,
         /// Face carries color glyphs (CBDT/sbix strikes or a COLR table).
@@ -174,6 +228,7 @@ pub const CpuRenderer = struct {
             .opts = opts,
             .metrics = metrics,
             .atlas = try atlas.GlyphAtlas.init(allocator, opts.atlas_width, opts.atlas_height),
+            .image_cache = image.ImageCache.init(allocator, image_cache_limit_bytes),
             .shaper = shaper.Shaper.init(allocator),
             .style_faces = .{ face.*, null, null, null },
         };
@@ -202,6 +257,10 @@ pub const CpuRenderer = struct {
         if (self.runs_buf.len > 0) self.allocator.free(self.runs_buf);
         self.row_cps.deinit(self.allocator);
         self.cluster_descs.deinit(self.allocator);
+        self.image_cache.deinit();
+        self.placements.deinit(self.allocator);
+        self.prev_placements.deinit(self.allocator);
+        if (self.redraw_rows.len > 0) self.allocator.free(self.redraw_rows);
     }
 
     pub fn renderer(self: *CpuRenderer) render.Renderer {
@@ -222,6 +281,9 @@ pub const CpuRenderer = struct {
             self.descs = try self.allocator.realloc(self.descs, cols);
             self.runs_buf = try self.allocator.realloc(self.runs_buf, cols);
         }
+        if (rows != self.redraw_rows.len) {
+            self.redraw_rows = try self.allocator.realloc(self.redraw_rows, rows);
+        }
         self.cols = cols;
         self.rows = rows;
     }
@@ -239,6 +301,7 @@ pub const CpuRenderer = struct {
         var fresh = try init(self.allocator, self.discovery, &self.face, opts);
         errdefer fresh.deinit();
         try fresh.resize(self.cols, self.rows, fresh.metrics.cell_w, fresh.metrics.cell_h);
+        fresh.vt = self.vt;
         const metrics = fresh.metrics;
         self.deinit();
         self.* = fresh;
@@ -256,20 +319,54 @@ pub const CpuRenderer = struct {
     ) !void {
         if (self.cols == 0 or self.rows == 0 or
             self.metrics.cell_w == 0 or self.metrics.cell_h == 0) return;
+
+        // Kitty drawing list + pixel cache (M4). beginFrame before the
+        // first cache touch: everything fetched below is pinned for this
+        // frame, so scaling cannot evict an image still being drawn.
+        self.image_cache.beginFrame();
+        try self.collectPlacements(state);
+
         const dirty = try state.dirty();
-        if (dirty == .clean) return;
+        const images_changed = !placementsEqual(self.placements.items, self.prev_placements.items);
+        if (dirty == .clean and !images_changed) return;
 
         self.atlas.beginFrame();
         const colors = try state.colors();
         const cursor = try self.cursorDraw(state, opts, colors);
 
-        var rows = try state.rowsIter();
-        while (try rows.nextDirty()) |row| {
-            const vy = try row.viewportY();
-            if (vy < 0 or vy >= self.rows) continue; // overscan row
-            const y: u16 = @intCast(vy);
-            try self.drawRow(&row, y, f, opts, cursor);
-            const y0: u32 = @as(u32, y) * self.metrics.cell_h;
+        // Redraw set: dirty rows plus every row touched by this frame's
+        // or the previous frame's placements. Blending is not idempotent,
+        // so a repainted row is rebuilt from its background before the
+        // images are composited again; the previous rects erase images
+        // that moved or were deleted.
+        if (dirty == .full) {
+            @memset(self.redraw_rows, true);
+        } else {
+            @memset(self.redraw_rows, false);
+            var dirty_rows = try state.rowsIter();
+            while (try dirty_rows.nextDirty()) |row| {
+                const vy = try row.viewportY();
+                if (vy >= 0 and vy < self.rows) self.redraw_rows[@intCast(vy)] = true;
+            }
+        }
+        for (self.placements.items) |p| self.markImageRows(p.dst);
+        for (self.prev_placements.items) |p| self.markImageRows(p.dst);
+
+        // Layer interleaving (ghostty-vt-api.md §9.6): below_background
+        // -> cell backgrounds -> below_text -> text -> above_text. All
+        // backgrounds land before any text, so a wide glyph can overflow
+        // into its continuation cell without being overpainted.
+        try self.compositeImages(f, .below_background);
+        try self.drawRows(f, state, opts, cursor, .background);
+        try self.compositeImages(f, .below_text);
+        try self.drawRows(f, state, opts, cursor, .text);
+        try self.compositeImages(f, .above_text);
+
+        // Damage: one full-width band per redrawn row. Placements are
+        // clipped to the grid, so the bands cover every image pixel.
+        for (self.redraw_rows, 0..) |redraw, y| {
+            if (!redraw) continue;
+            const y0: u32 = @as(u32, @intCast(y)) * self.metrics.cell_h;
             if (y0 < f.height) {
                 const y1 = @min(y0 + self.metrics.cell_h, f.height);
                 try damage.append(self.allocator, Damage.fromRows(y0, y1, f.width));
@@ -279,6 +376,11 @@ pub const CpuRenderer = struct {
         // The CPU reads the pages directly; drop the GL upload bookkeeping
         // so the dirty list stays bounded.
         self.atlas.clearDirty();
+        std.mem.swap(
+            std.ArrayListUnmanaged(image.Placement),
+            &self.placements,
+            &self.prev_placements,
+        );
         try state.clean();
     }
 
@@ -286,11 +388,34 @@ pub const CpuRenderer = struct {
     // Row walk
     // ------------------------------------------------------------------
 
-    /// Two passes over the row's cells: backgrounds first (a block cursor
-    /// sits under the glyph), then text/decorations. The split lets a wide
-    /// glyph overflow into its continuation cell without being overpainted
-    /// by that cell's background.
-    fn drawRow(
+    /// One row pass over the redraw set. `next` visits clean rows too:
+    /// rows under kitty placements repaint even when the terminal state
+    /// is clean (animation frames, moved/deleted images).
+    fn drawRows(
+        self: *CpuRenderer,
+        f: *Framebuffer,
+        state: *vt.RenderState,
+        opts: RenderOpts,
+        cursor: CursorDraw,
+        pass: RowPass,
+    ) !void {
+        var rows = try state.rowsIter();
+        while (try rows.next()) |row| {
+            const vy = try row.viewportY();
+            if (vy < 0 or vy >= self.rows) continue; // overscan row
+            const y: u16 = @intCast(vy);
+            if (!self.redraw_rows[y]) continue;
+            switch (pass) {
+                .background => try self.drawRowBackground(&row, y, f, opts, cursor),
+                .text => try self.drawRowTextPass(&row, y, f, opts, cursor),
+            }
+        }
+    }
+
+    const RowPass = enum { background, text };
+
+    /// Backgrounds + block cursors (a block cursor sits under the glyph).
+    fn drawRowBackground(
         self: *CpuRenderer,
         row: *const vt.Row,
         y: u16,
@@ -301,27 +426,35 @@ pub const CpuRenderer = struct {
         const cw = self.metrics.cell_w;
         const ch = self.metrics.cell_h;
         const y_px: i32 = @as(i32, y) * ch;
-
-        // Pass 1: backgrounds + block cursors.
-        {
-            var cells = try row.cells();
-            var x: u16 = 0;
-            while (try cells.next()) |cell| {
-                if (x >= self.cols) break;
-                const x_px: i32 = @as(i32, x) * cw;
-                const cc = resolveColors(&cell, opts);
-                fillCell(f, x_px, y_px, cw, ch, cc.bg);
-                if (cursor.active and cursor.style == .block and
-                    x == cursor.x and y == cursor.y)
-                {
-                    deco.drawCursor(f.*, x_px, y_px, cw, ch, .block, cursor.color, true);
-                }
-                x += 1;
+        var cells = try row.cells();
+        var x: u16 = 0;
+        while (try cells.next()) |cell| {
+            if (x >= self.cols) break;
+            const x_px: i32 = @as(i32, x) * cw;
+            const cc = resolveColors(&cell, opts);
+            fillCell(f, x_px, y_px, cw, ch, cc.bg);
+            if (cursor.active and cursor.style == .block and
+                x == cursor.x and y == cursor.y)
+            {
+                deco.drawCursor(f.*, x_px, y_px, cw, ch, .block, cursor.color, true);
             }
+            x += 1;
         }
+    }
 
-        // Pass 2: collect the row, draw shaped text, then decorations and
-        // bar/underline cursors (per cell, text first, as in M1).
+    /// Collect the row, draw shaped text, then decorations and
+    /// bar/underline cursors (per cell, text first, as in M1).
+    fn drawRowTextPass(
+        self: *CpuRenderer,
+        row: *const vt.Row,
+        y: u16,
+        f: *Framebuffer,
+        opts: RenderOpts,
+        cursor: CursorDraw,
+    ) !void {
+        const cw = self.metrics.cell_w;
+        const ch = self.metrics.cell_h;
+        const y_px: i32 = @as(i32, y) * ch;
         const n = try self.collectRow(row, y, opts, cursor);
         try self.drawRowText(f, y_px, n);
         for (self.row_cells[0..n], 0..) |*rc, x| {
@@ -331,6 +464,207 @@ pub const CpuRenderer = struct {
             if (rc.is_cursor and cursor.style != .block)
                 deco.drawCursor(f.*, x_px, y_px, cw, ch, cursorStyle(cursor.style), cursor.color, true);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Kitty images (M4): drawing list, pixel cache, layer passes
+    // ------------------------------------------------------------------
+
+    /// Build this frame's drawing list from the render-state placement
+    /// iterator and make sure every referenced image is cached, fetching
+    /// decoded pixels from kitty storage on demand. Placements whose
+    /// image is deleted, still transmitting or outside the grid drop out.
+    fn collectPlacements(self: *CpuRenderer, state: *vt.RenderState) !void {
+        self.placements.clearRetainingCapacity();
+        const v = self.vt orelse return; // text-only: no pixel source
+        var imgs = try state.images();
+        const kg = try v.kittyGraphics();
+        while (try imgs.next()) |raw| {
+            if (raw.protocol != .kitty) continue;
+            const key = image.ImageKey{
+                .protocol = .kitty,
+                .id = raw.image_id,
+                // The cache key is u32; generations are per-image
+                // counters, so wraparound needs 2^32 pixel changes on
+                // one id before a collision is possible.
+                .generation = @truncate(raw.image_generation),
+            };
+            const img = (try self.ensureImage(kg, key, raw.image_id, raw.image_generation)) orelse continue;
+            const p = self.buildPlacement(raw, key, img.width, img.height) orelse continue;
+            try self.placements.append(self.allocator, p);
+        }
+    }
+
+    /// Cache lookup for one placement's image; on a miss fetch the
+    /// decoded pixels from kitty storage, convert to RGBA8 and store.
+    /// Null when the image is gone, not fully transmitted yet, or the
+    /// cache is full (the placement is skipped this frame).
+    fn ensureImage(
+        self: *CpuRenderer,
+        kg: vt.KittyGraphics,
+        key: image.ImageKey,
+        id: u32,
+        generation: u64,
+    ) !?*image.Image {
+        if (self.image_cache.get(key)) |img| return img;
+        const ki = kg.image(id) orelse return null;
+        if (try ki.generation() != generation) return null;
+        const w = try ki.width();
+        const h = try ki.height();
+        const pixels = (try ki.pixels()) orelse return null;
+        const area = @as(usize, w) * h;
+        const fmt = try ki.format();
+        switch (fmt) {
+            .rgba => {
+                if (pixels.len != area * 4) return null;
+                self.image_cache.put(key, .{ .width = w, .height = h, .pixels = pixels }) catch |err| switch (err) {
+                    error.CacheFull => return null,
+                    else => return err,
+                };
+            },
+            .rgb, .gray, .gray_alpha => {
+                const bpp: usize = switch (fmt) {
+                    .rgb => 3,
+                    .gray => 1,
+                    .gray_alpha => 2,
+                    else => unreachable,
+                };
+                if (pixels.len != area * bpp) return null;
+                try self.ensureScratch(area * 4);
+                const out = self.scratch[0 .. area * 4];
+                switch (fmt) {
+                    .rgb => for (0..area) |i| {
+                        out[i * 4 + 0] = pixels[i * 3 + 0];
+                        out[i * 4 + 1] = pixels[i * 3 + 1];
+                        out[i * 4 + 2] = pixels[i * 3 + 2];
+                        out[i * 4 + 3] = 255;
+                    },
+                    .gray => for (0..area) |i| {
+                        out[i * 4 + 0] = pixels[i];
+                        out[i * 4 + 1] = pixels[i];
+                        out[i * 4 + 2] = pixels[i];
+                        out[i * 4 + 3] = 255;
+                    },
+                    .gray_alpha => for (0..area) |i| {
+                        out[i * 4 + 0] = pixels[i * 2];
+                        out[i * 4 + 1] = pixels[i * 2];
+                        out[i * 4 + 2] = pixels[i * 2];
+                        out[i * 4 + 3] = pixels[i * 2 + 1];
+                    },
+                    else => unreachable,
+                }
+                self.image_cache.put(key, .{ .width = w, .height = h, .pixels = out }) catch |err| switch (err) {
+                    error.CacheFull => return null,
+                    else => return err,
+                };
+            },
+            // Stored images are fully decoded; PNG never reaches here.
+            .png => return null,
+        }
+        return self.image_cache.get(key);
+    }
+
+    /// Convert one render-state placement into compositor geometry: fold
+    /// the cell offset into dst (the compositor treats dst as
+    /// authoritative), clip to the grid -- viewport positions may be
+    /// negative or overflow it -- and map the clipped dst back onto the
+    /// source crop so scaling stays correct. Null when nothing shows.
+    fn buildPlacement(
+        self: *const CpuRenderer,
+        raw: vt.ImagePlacement,
+        key: image.ImageKey,
+        img_w: u32,
+        img_h: u32,
+    ) ?image.Placement {
+        const cw: i64 = self.metrics.cell_w;
+        const ch: i64 = self.metrics.cell_h;
+        const x: i64 = @as(i64, raw.viewport_col) * cw + raw.cell_offset_x;
+        const y: i64 = @as(i64, raw.viewport_row) * ch + raw.cell_offset_y;
+        const w: i64 = raw.pixel_width;
+        const h: i64 = raw.pixel_height;
+        if (w <= 0 or h <= 0) return null;
+        const gw: i64 = @as(i64, self.cols) * cw;
+        const gh: i64 = @as(i64, self.rows) * ch;
+        const x0 = @max(x, 0);
+        const y0 = @max(y, 0);
+        const x1 = @min(x + w, gw);
+        const y1 = @min(y + h, gh);
+        if (x1 <= x0 or y1 <= y0) return null;
+
+        var src = image.Damage{
+            .x = raw.source_x,
+            .y = raw.source_y,
+            .w = raw.source_width,
+            .h = raw.source_height,
+        };
+        if (src.isEmpty()) src = .{ .x = 0, .y = 0, .w = img_w, .h = img_h };
+        if (x0 != x or y0 != y or x1 != x + w or y1 != y + h) {
+            // Viewport clip: take the matching sub-rect of the source
+            // crop (floor division, like image.zig's mapRect). u64 math
+            // so u32 extents cannot overflow.
+            const sw: u64 = src.w;
+            const sh: u64 = src.h;
+            const uw: u64 = @intCast(w);
+            const uh: u64 = @intCast(h);
+            src = .{
+                .x = src.x + @as(u32, @intCast(@as(u64, @intCast(x0 - x)) * sw / uw)),
+                .y = src.y + @as(u32, @intCast(@as(u64, @intCast(y0 - y)) * sh / uh)),
+                .w = @intCast(@as(u64, @intCast(x1 - x0)) * sw / uw),
+                .h = @intCast(@as(u64, @intCast(y1 - y0)) * sh / uh),
+            };
+            if (src.isEmpty()) return null;
+        }
+        return .{
+            .key = key,
+            .layer = switch (raw.layer) {
+                .below_background => .below_background,
+                .below_text => .below_text,
+                .above_text => .above_text,
+            },
+            .z = raw.z,
+            .dst = .{
+                .x = @intCast(x0),
+                .y = @intCast(y0),
+                .w = @intCast(x1 - x0),
+                .h = @intCast(y1 - y0),
+            },
+            .src = src,
+            // The 1.0.1 render state exposes no per-placement opacity.
+            .opacity = 255,
+        };
+    }
+
+    /// Mark every grid row a (grid-clipped) placement rect touches.
+    fn markImageRows(self: *CpuRenderer, dst: image.Damage) void {
+        if (dst.isEmpty()) return;
+        const ch: u32 = self.metrics.cell_h;
+        const y0 = dst.y / ch;
+        if (y0 >= self.rows) return; // stale rect from a larger grid
+        const y1 = @min((dst.y + dst.h - 1) / ch, self.rows - 1);
+        var y = y0;
+        while (y <= y1) : (y += 1) self.redraw_rows[y] = true;
+    }
+
+    /// One interleaving pass over the drawing list. CacheFull degrades
+    /// to skipping the layer (the frame still completes and is cleaned);
+    /// the next frame retries with fresh pins.
+    fn compositeImages(self: *CpuRenderer, f: *Framebuffer, layer: image.Layer) !void {
+        if (self.placements.items.len == 0) return;
+        image.compositeLayer(f, self.placements.items, &self.image_cache, layer) catch |err| switch (err) {
+            error.CacheFull => log.warn("kitty image cache full; {s} layer skipped", .{@tagName(layer)}),
+            else => return err,
+        };
+    }
+
+    /// Drawing-list equality: same placements in the same order with the
+    /// same keys and geometry. std.meta.eql walks the optional source
+    /// rect (Placement has no derived ==).
+    fn placementsEqual(a: []const image.Placement, b: []const image.Placement) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |pa, pb| {
+            if (!std.meta.eql(pa, pb)) return false;
+        }
+        return true;
     }
 
     /// Snapshot the row's cells into `row_cells`/`descs`, decoding every
@@ -1852,4 +2186,299 @@ test "cpu: blitRotated matches layout.physicalToLogical for all rotations (M5.4)
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Kitty image tests (M4): real libghostty-vt storage + real compositor.
+// ---------------------------------------------------------------------------
+
+/// An Env whose terminal has pixel cell sizes (kitty placements need
+/// them). The caller binds `env.cpu.vt = &env.t` AFTER the returned Env
+/// lands in its final location (the pointer must not dangle across the
+/// return-by-value move).
+fn kittyEnv(a: std.mem.Allocator, cols: u16, rows: u16) !Env {
+    var env = try Env.init(a, cols, rows);
+    errdefer env.deinit(a);
+    try env.t.resize(cols, rows, env.cpu.metrics.cell_w, env.cpu.metrics.cell_h);
+    env.f.fill(env.palette[17]);
+    return env;
+}
+
+/// Transmit + display raw RGBA pixels (kitty f=32) with the top-left at
+/// zero-based cell (col, row), scaled over w_cells x h_cells cells, at
+/// z-index z. Kitty places images at the CURSOR and c/r are the display
+/// span in cells (not coordinates), so move the cursor first; C=1 keeps
+/// it put afterwards, q=2 suppresses the reply.
+fn sendKittyImage(
+    a: std.mem.Allocator,
+    env: *Env,
+    id: u32,
+    col: u16,
+    row: u16,
+    z: i32,
+    w_cells: u16,
+    h_cells: u16,
+    w: u32,
+    h: u32,
+    pixels: []const u8,
+) !void {
+    var csi_buf: [24]u8 = undefined;
+    const csi = try std.fmt.bufPrint(&csi_buf, "\x1b[{d};{d}H", .{ row + 1, col + 1 });
+    env.t.write(csi);
+    const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(pixels.len));
+    defer a.free(b64);
+    const encoded = std.base64.standard.Encoder.encode(b64, pixels);
+    const apc = try std.fmt.allocPrint(
+        a,
+        "\x1b_Gf=32,s={d},v={d},i={d},a=T,c={d},r={d},z={d},C=1,q=2;{s}\x1b\\",
+        .{ w, h, id, w_cells, h_cells, z, encoded },
+    );
+    defer a.free(apc);
+    env.t.write(apc);
+}
+
+/// A solid-color image spanning w_cells x h_cells cells: scaling a
+/// constant image reproduces the color exactly at every pixel.
+fn sendKittySolid(
+    a: std.mem.Allocator,
+    env: *Env,
+    id: u32,
+    col: u16,
+    row: u16,
+    w_cells: u16,
+    h_cells: u16,
+    z: i32,
+    rgba: [4]u8,
+) !void {
+    const w: u32 = @as(u32, w_cells) * env.cpu.metrics.cell_w;
+    const h: u32 = @as(u32, h_cells) * env.cpu.metrics.cell_h;
+    const px = try a.alloc(u8, @as(usize, w) * h * 4);
+    defer a.free(px);
+    for (0..@as(usize, w) * h) |i| @memcpy(px[i * 4 ..][0..4], &rgba);
+    try sendKittyImage(a, env, id, col, row, z, w_cells, h_cells, w, h, px);
+}
+
+test "cpu: kitty image composites at cell geometry, caches, deletes (M4)" {
+    const a = testing.allocator;
+    var env = try kittyEnv(a, 20, 6);
+    defer env.deinit(a);
+    env.cpu.vt = &env.t;
+    const cw = env.cpu.metrics.cell_w;
+    const ch = env.cpu.metrics.cell_h;
+    const bg = env.palette[17];
+
+    // 2x2 RGBA: red/green over blue/yellow, displayed across 2x2 cells
+    // at cell (2, 1), above_text (z=0).
+    const pixels = [_]u8{
+        255, 0,   0,   255, 0, 255, 0,   255,
+        0,   0,   255, 255, 255, 255, 0,   255,
+    };
+    try sendKittyImage(a, &env, 1, 2, 1, 0, 2, 2, 2, 2, &pixels);
+
+    var damage: DamageList = .empty;
+    defer damage.deinit(a);
+    try env.renderNoCursor(&damage);
+    try testing.expect(damage.items.len > 0);
+    try testing.expectEqual(@as(usize, 1), env.cpu.prev_placements.items.len);
+
+    // Bilinear edge clamp: the dst corners sample the src corners
+    // exactly, and opaque src-over copies the RGB verbatim.
+    try testing.expectEqual(@as(u32, 0xFF0000), env.f.get(2 * cw, ch));
+    try testing.expectEqual(@as(u32, 0xFFFF00), env.f.get(4 * cw - 1, 3 * ch - 1));
+    // Outside the placement: untouched background.
+    try testing.expectEqual(bg, env.f.get(0, 0));
+    try testing.expectEqual(bg, env.f.get(4 * cw, 3 * ch));
+    // The decoded original is cached (16 pixel bytes) and pinned.
+    try testing.expect(env.cpu.image_cache.byteSize() >= 16);
+
+    // A second frame with no changes draws nothing: clean state and an
+    // unchanged placement list short-circuit before any pass.
+    const snapshot = try a.dupe(u8, env.f.mem);
+    defer a.free(snapshot);
+    damage.clearRetainingCapacity();
+    try env.renderNoCursor(&damage);
+    try testing.expectEqual(@as(usize, 0), damage.items.len);
+    try testing.expectEqualSlices(u8, snapshot, env.f.mem);
+
+    // Delete by id: the placement disappears and the previous frame's
+    // rects force the rows back to the background.
+    env.t.write("\x1b_Ga=d,d=i,i=1,q=2\x1b\\");
+    damage.clearRetainingCapacity();
+    try env.renderNoCursor(&damage);
+    try testing.expect(damage.items.len > 0);
+    try testing.expectEqual(@as(usize, 0), env.cpu.prev_placements.items.len);
+    try testing.expectEqual(bg, env.f.get(2 * cw, ch));
+    try testing.expectEqual(bg, env.f.get(4 * cw - 1, 3 * ch - 1));
+}
+
+test "cpu: kitty layers interleave with backgrounds and text (M4)" {
+    const a = testing.allocator;
+    var env = try kittyEnv(a, 20, 6);
+    defer env.deinit(a);
+    env.cpu.vt = &env.t;
+    const cw = env.cpu.metrics.cell_w;
+    const ch = env.cpu.metrics.cell_h;
+    const bg = env.palette[17];
+    const fg = env.palette[16];
+    const blue: u32 = 0x0000FF;
+    const red: u32 = 0xFF0000;
+
+    env.t.write("\x1b[?25hABCD");
+    // below_text (z=-1) under 'AB', above_text (z=1) over 'CD',
+    // below_background (z < INT32_MIN/2) under the empty cells 4..5.
+    try sendKittySolid(a, &env, 1, 0, 0, 2, 1, -1, .{ 0, 0, 255, 255 });
+    try sendKittySolid(a, &env, 2, 2, 0, 2, 1, 1, .{ 255, 0, 0, 255 });
+    try sendKittySolid(a, &env, 3, 4, 0, 2, 1, -1073741825, .{ 0, 255, 0, 255 });
+
+    var damage: DamageList = .empty;
+    defer damage.deinit(a);
+    try env.renderNoCursor(&damage);
+
+    // below_text: the image shows, and the glyph draws on top of it.
+    try testing.expectEqual(blue, env.f.get(0, ch - 1));
+    var has_glyph = false;
+    for (0..ch) |y| {
+        for (0..2 * cw) |x| {
+            if (env.f.get(@intCast(x), @intCast(y)) == fg) has_glyph = true;
+        }
+    }
+    try testing.expect(has_glyph);
+
+    // above_text: the image covers the glyphs completely.
+    for (0..ch) |y| {
+        for (2 * cw..4 * cw) |x| {
+            try testing.expectEqual(red, env.f.get(@intCast(x), @intCast(y)));
+        }
+    }
+
+    // below_background: the opaque cell background wins.
+    for (0..ch) |y| {
+        for (4 * cw..6 * cw) |x| {
+            try testing.expectEqual(bg, env.f.get(@intCast(x), @intCast(y)));
+        }
+    }
+}
+
+test "cpu: kitty pixel replacement repaints clean rows (M4.4 mechanism)" {
+    const a = testing.allocator;
+    var env = try kittyEnv(a, 20, 6);
+    defer env.deinit(a);
+    env.cpu.vt = &env.t;
+    const cw = env.cpu.metrics.cell_w;
+    const ch = env.cpu.metrics.cell_h;
+    const red: u32 = 0xFF0000;
+    const blue: u32 = 0x0000FF;
+
+    try sendKittySolid(a, &env, 1, 1, 1, 2, 2, 0, .{ 255, 0, 0, 255 });
+    var damage: DamageList = .empty;
+    defer damage.deinit(a);
+    try env.renderNoCursor(&damage);
+    try testing.expectEqual(red, env.f.get(cw + cw / 2, ch + ch / 2));
+
+    // Retransmit the same id with new pixels: the generation bumps but
+    // no cell changes, so the render state stays clean. The placement
+    // list comparison must still repaint the image's rows.
+    try sendKittySolid(a, &env, 1, 1, 1, 2, 2, 0, .{ 0, 0, 255, 255 });
+    try env.state.update(&env.t);
+    try testing.expectEqual(vt.Dirty.clean, try env.state.dirty());
+    damage.clearRetainingCapacity();
+    try env.renderNoCursor(&damage);
+    try testing.expect(damage.items.len > 0);
+    try testing.expectEqual(blue, env.f.get(cw + cw / 2, ch + ch / 2));
+}
+
+test "cpu: kitty animation tick advances frames through the cache (M4.4)" {
+    const a = testing.allocator;
+    var env = try kittyEnv(a, 20, 6);
+    defer env.deinit(a);
+    env.cpu.vt = &env.t;
+    const cw = env.cpu.metrics.cell_w;
+    const ch = env.cpu.metrics.cell_h;
+    const red: u32 = 0xFF0000;
+    const blue: u32 = 0x0000FF;
+    const w: u32 = cw;
+    const h: u32 = ch;
+
+    // Root frame (red), then a second frame (blue) with a 40 ms gap,
+    // then run the animation looping (kitty a=f / a=a).
+    try sendKittySolid(a, &env, 1, 0, 0, 1, 1, 0, .{ 255, 0, 0, 255 });
+    const px = try a.alloc(u8, @as(usize, w) * h * 4);
+    defer a.free(px);
+    for (0..@as(usize, w) * h) |i| @memcpy(px[i * 4 ..][0..4], &[_]u8{ 0, 0, 255, 255 });
+    const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(px.len));
+    defer a.free(b64);
+    const encoded = std.base64.standard.Encoder.encode(b64, px);
+    const frame = try std.fmt.allocPrint(
+        a,
+        "\x1b_Ga=f,i=1,f=32,s={d},v={d},r=2,z=40,q=2;{s}\x1b\\",
+        .{ w, h, encoded },
+    );
+    defer a.free(frame);
+    env.t.write(frame);
+    env.t.write("\x1b_Ga=a,i=1,r=1,z=40,q=2\x1b\\"); // root frame gap
+    env.t.write("\x1b_Ga=a,i=1,s=3,q=2\x1b\\"); // run, loop
+
+    var damage: DamageList = .empty;
+    defer damage.deinit(a);
+    try env.renderNoCursor(&damage);
+    try testing.expectEqual(red, env.f.get(cw / 2, ch / 2));
+
+    var kg = try env.t.kittyGraphics();
+    const gen1 = try kg.image(1).?.generation();
+    const next = (try kg.animationTick(0)) orelse return error.TestUnexpectedResult;
+    // The tick at the due time advances to frame 2 and bumps the
+    // generation; the storage handle stays valid across the tick.
+    _ = try kg.animationTick(next);
+    const gen2 = try kg.image(1).?.generation();
+    try testing.expect(gen2 != gen1);
+
+    // No cell changed: the renderer must pick the new frame up through
+    // the placement list's generation and repaint the clean row.
+    damage.clearRetainingCapacity();
+    try env.renderNoCursor(&damage);
+    try testing.expect(damage.items.len > 0);
+    try testing.expectEqual(blue, env.f.get(cw / 2, ch / 2));
+}
+
+test "cpu: kitty placement clips at viewport edges (M4)" {
+    const a = testing.allocator;
+    var env = try kittyEnv(a, 20, 6);
+    defer env.deinit(a);
+    env.cpu.vt = &env.t;
+    const cw = env.cpu.metrics.cell_w;
+    const ch = env.cpu.metrics.cell_h;
+    const bg = env.palette[17];
+    const magenta: u32 = 0xFF00FF;
+    const cyan: u32 = 0x00FFFF;
+
+    // 4x4-cell image at the top-left, then scroll it up three rows: the
+    // top three quarters leave the viewport (negative viewport_row).
+    try sendKittySolid(a, &env, 1, 0, 0, 4, 4, 0, .{ 255, 0, 255, 255 });
+    var damage: DamageList = .empty;
+    defer damage.deinit(a);
+    try env.renderNoCursor(&damage);
+    try testing.expectEqual(magenta, env.f.get(0, 0));
+    try testing.expectEqual(magenta, env.f.get(0, 3 * ch));
+
+    env.t.write("\x1b[1;1H"); // cursor home, independent of C=1
+    env.t.write("\n\n\n\n\n\n\n\n"); // 8 newlines on 6 rows: scroll 3
+    damage.clearRetainingCapacity();
+    try env.renderNoCursor(&damage);
+    // Only the image's bottom cell-row remains, at viewport row 0.
+    try testing.expectEqual(magenta, env.f.get(0, 0));
+    try testing.expectEqual(magenta, env.f.get(3 * cw, ch - 1));
+    try testing.expectEqual(bg, env.f.get(0, ch));
+
+    // Right-edge overflow: a 4-cell-wide image at column 18 shows 2
+    // columns; the dst is clipped, the source crop mapped to match.
+    try sendKittySolid(a, &env, 2, 18, 2, 4, 1, 0, .{ 0, 255, 255, 255 });
+    damage.clearRetainingCapacity();
+    try env.renderNoCursor(&damage);
+    try testing.expectEqual(cyan, env.f.get(18 * cw, 2 * ch + ch / 2));
+    try testing.expectEqual(cyan, env.f.get(20 * cw - 1, 2 * ch + ch / 2));
+    var clipped_w: u32 = 0;
+    for (env.cpu.prev_placements.items) |p| {
+        if (p.key.id == 2) clipped_w = p.dst.w;
+    }
+    try testing.expectEqual(@as(u32, 2) * cw, clipped_w);
 }
