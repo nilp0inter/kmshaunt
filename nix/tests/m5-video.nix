@@ -38,9 +38,15 @@
 #                           (kmscon config.c:627-750; kmshaunt
 #                           src/config/display.zig). The global tier (no
 #                           gpu/connector prefix) applies to every screen.
-#                           Orientation is asserted with OCR: the marker is
-#                           readable horizontally only at 0 degrees. The
-#                           rotate grabs (Logo+equal = cw, Logo+minus = ccw;
+#                           Orientation is asserted with a dual OCR oracle
+#                           on one capture: the marker must NOT be readable
+#                           horizontally on the raw frame AND must be
+#                           readable once the frame is de-rotated upright
+#                           (Pillow transpose + the driver's OCR variants),
+#                           so a black or not-yet-drawn frame cannot pass
+#                           vacuously. The marker command is retyped if a
+#                           keystroke is dropped, and every wait is bounded.
+#                           The rotate grabs (Logo+equal = cw, Logo+minus = ccw;
 #                           QEMU key name meta_l) restore normal, and the
 #                           rotate-0 variant cycles all four orientations,
 #                           asserting each step changes the frame and 360
@@ -203,31 +209,114 @@ let
       restoreKey,
       restoreSteps,
     }:
+    let
+      # Pillow transpose that turns the rotated console back upright:
+      # right = content 90 cw -> transpose 90 ccw (ROTATE_90), left = 270 cw
+      # -> transpose 90 cw (ROTATE_270). Empty for degree 0 (unused there).
+      derotate =
+        {
+          "90" = "ROTATE_90";
+          "180" = "ROTATE_180";
+          "270" = "ROTATE_270";
+        }
+        .${toString degree} or "";
+    in
     ''
+      import datetime as dt
+      import shutil
       import subprocess
+      import tempfile
+      import time
+      from pathlib import Path
+      from test_driver.machine.ocr import perform_ocr_variants_on_screenshot
 
       MARKER = "ROTATION-PROBE-42"
       DEGREE = ${toString degree}
       RESTORE_KEY = "${restoreKey}"
       RESTORE_STEPS = ${toString restoreSteps}
 
+      def ocrTexts(ppm):
+          # OCR on a temp copy of the PPM so magick's large upsampled
+          # preprocessing artifacts land in a scratch dir, not the output
+          # (magick reads PPM but has no PNG decode delegate, so OCR must
+          # run on the PPM, exactly like the driver's own wait_for_text).
+          with tempfile.TemporaryDirectory() as tmp:
+              src = Path(tmp) / "screen.ppm"
+              shutil.copyfile(ppm, src)
+              return perform_ocr_variants_on_screenshot(src)
+
+      def goldenCompare(shot, path):
+          golden = GOLDEN_BY_IMPL[impl].get(shot)
+          if golden is None:
+              log.log(f"{NAME}-{impl}-{shot}: no golden yet, screenshot kept in the test output")
+              return
+          subprocess.run([PILLOW_PYTHON, COMPARE_SCRIPT, path, golden, "0.0"], check=True)
+
       with subtest("S1 boot with screen=${orientation}"):
           # waitForLogin's OCR step assumes upright text; rotated variants
           # wait for the shell process instead and prove input works through
           # a file written over the pty (read back over the backdoor).
-          machine.wait_for_unit("default.target")
-          machine.wait_until_succeeds("pgrep -u alice bash")
-          machine.send_chars(f"echo {MARKER} > /tmp/rot; echo {MARKER}\n")
-          machine.wait_until_succeeds("test -s /tmp/rot")
-          machine.sleep(1)
+          machine.wait_for_unit("default.target", timeout=dt.timedelta(seconds=300))
+          machine.wait_until_succeeds("pgrep -u alice bash", timeout=dt.timedelta(seconds=300))
+          # Type the marker, retrying if a keystroke was dropped: a one-shot
+          # send_chars during early boot can lose input under load, which
+          # would leave /tmp/rot unwritten forever (the old 900s hang).
+          # ctrl-c clears any partial line before a retry so the retry
+          # cannot append to garbage. The guarantee is unchanged: the file
+          # must be written by input through the console pty.
+          deadline = time.monotonic() + 120
+          while True:
+              machine.send_chars(f"echo {MARKER} > /tmp/rot; echo {MARKER}\n")
+              attempt = time.monotonic() + 15
+              written = False
+              while time.monotonic() < attempt:
+                  # check_return must stay True: with check_return=False the
+                  # driver skips PIPESTATUS and always returns status -1.
+                  status, _ = machine.execute(
+                      "test -s /tmp/rot", timeout=dt.timedelta(seconds=10)
+                  )
+                  if status == 0:
+                      written = True
+                      break
+                  time.sleep(0.5)
+              if written:
+                  break
+              if time.monotonic() >= deadline:
+                  raise AssertionError(f"[{impl}] console input never wrote /tmp/rot")
+              machine.send_key("ctrl-c")
           if DEGREE == 0:
-              machine.wait_for_text(MARKER)
+              machine.wait_for_text(MARKER, timeout=dt.timedelta(seconds=120))
           else:
-              text = machine.get_screen_text()
-              assert MARKER not in text, (
-                  f"[{impl}] screen=${orientation}: marker still readable "
-                  "horizontally, rotation not applied"
-              )
+              # Dual rotation oracle on one capture: the marker must be
+              # unreadable horizontally on the raw frame AND readable once
+              # the frame is de-rotated upright. Poll both: under load the
+              # redraw can lag the pty echo, and a one-shot check could
+              # pass vacuously on a not-yet-drawn (or black) frame.
+              deadline = time.monotonic() + 120
+              while True:
+                  ppm = f"{machine.out_dir}/{NAME}-{impl}-rotate-{DEGREE}.ppm"
+                  machine.qmp_client.send("screendump", {"filename": ppm, "format": "ppm"})
+                  raw = ocrTexts(ppm)
+                  with tempfile.TemporaryDirectory() as tmp:
+                      derot = Path(tmp) / "derot.ppm"
+                      subprocess.run(
+                          [PILLOW_PYTHON, "-c",
+                           "import sys; from PIL import Image; "
+                           "Image.open(sys.argv[1]).transpose(Image.Transpose.${derotate}).save(sys.argv[2])",
+                           ppm, str(derot)],
+                          check=True,
+                      )
+                      upright = ocrTexts(derot)
+                  if any(MARKER in t for t in upright) and not any(MARKER in t for t in raw):
+                      Path(ppm).unlink()
+                      break
+                  if time.monotonic() >= deadline:
+                      raise AssertionError(
+                          f"[{impl}] screen=${orientation}: marker not readable at "
+                          f"{DEGREE} degrees or still readable horizontally "
+                          f"(raw OCR: {raw!r}, de-rotated OCR: {upright!r})"
+                      )
+                  time.sleep(1)
           screenshotCompare(machine, impl, f"rotate-{DEGREE}")
 
       if DEGREE == 0:
@@ -236,33 +325,45 @@ let
               steps = ["rotate-90", "rotate-180", "rotate-270", "rotate-0-cycle"]
               for i, shot in enumerate(steps, start=1):
                   machine.send_key("meta_l-equal")
-                  machine.sleep(1)
-                  screenshotCompare(machine, impl, shot)
                   cur = f"{machine.out_dir}/{NAME}-{impl}-{shot}.png"
-                  if i < 4:
-                      # Every intermediate orientation must change the frame.
-                      r = subprocess.run(
-                          [PILLOW_PYTHON, COMPARE_SCRIPT, boot, cur, "0.0"],
-                          capture_output=True, text=True,
-                      )
-                      assert r.returncode != 0, (
-                          f"[{impl}] rotation step {i}: frame identical to the "
-                          "0-degree boot frame (grab-rotate-cw not wired?)"
-                      )
-                  else:
-                      # 360 degrees: back to the boot frame (tiny tolerance
-                      # for rasterisation jitter; the diff is printed).
-                      subprocess.run(
-                          [PILLOW_PYTHON, COMPARE_SCRIPT, boot, cur, "0.002"],
-                          check=True,
-                      )
-              machine.wait_for_text(MARKER)
+                  # Poll the frame instead of a fixed sleep: under load the
+                  # redraw can lag the key, and a one-shot capture would
+                  # diff the stale frame. Every intermediate orientation
+                  # must change the frame; 360 degrees must return to the
+                  # boot frame (tiny tolerance for rasterisation jitter;
+                  # the diff is printed).
+                  deadline = time.monotonic() + 60
+                  while True:
+                      machine.sleep(1)
+                      machine.screenshot(f"{NAME}-{impl}-{shot}")
+                      if i < 4:
+                          r = subprocess.run(
+                              [PILLOW_PYTHON, COMPARE_SCRIPT, boot, cur, "0.0"],
+                              capture_output=True, text=True,
+                          )
+                          if r.returncode != 0:
+                              break
+                      else:
+                          r = subprocess.run(
+                              [PILLOW_PYTHON, COMPARE_SCRIPT, boot, cur, "0.002"],
+                              capture_output=True, text=True,
+                          )
+                          if r.returncode == 0:
+                              break
+                      if time.monotonic() >= deadline:
+                          want = "change from" if i < 4 else "return to"
+                          raise AssertionError(
+                              f"[{impl}] rotation step {i}: frame did not {want} "
+                              "the 0-degree boot frame (grab-rotate-cw not wired?)"
+                          )
+                  goldenCompare(shot, cur)
+              machine.wait_for_text(MARKER, timeout=dt.timedelta(seconds=120))
       else:
           with subtest("S2 grab-rotate restores normal"):
               for _ in range(RESTORE_STEPS):
                   machine.send_key(RESTORE_KEY)
                   machine.sleep(1)
-              machine.wait_for_text(MARKER)
+              machine.wait_for_text(MARKER, timeout=dt.timedelta(seconds=120))
               screenshotCompare(machine, impl, f"rotate-{DEGREE}-restored")
     '';
 
