@@ -45,6 +45,8 @@
   harfbuzz,
   libspng,
   seatd,
+  libgbm,
+  libglvnd,
   jetbrains-mono,
   noto-fonts-color-emoji,
   noto-fonts-cjk-sans,
@@ -101,6 +103,8 @@ stdenv.mkDerivation (finalAttrs: {
     harfbuzz # overlaid withRaster
     libspng
     seatd
+    libgbm
+    libglvnd
   ];
 
   postConfigure = ''
