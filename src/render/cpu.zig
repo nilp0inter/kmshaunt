@@ -66,6 +66,7 @@ const sprite = @import("../font/sprite.zig");
 const shaper = @import("../font/shaper.zig");
 const color = @import("../font/color.zig");
 const deco = @import("decorations.zig");
+const layout = @import("../video/layout.zig");
 
 pub const Framebuffer = fb.Framebuffer;
 pub const Damage = fb.Damage;
@@ -96,6 +97,10 @@ pub const CpuRenderer = struct {
     /// Discovery. Cell geometry and decorations use its metrics.
     face: discovery.Face,
     size_px: u16,
+    /// The init configuration, kept so setFontSize can re-initialize at a
+    /// new pixel size. `font_features` borrows the caller's strings (they
+    /// must outlive the renderer, like `discovery`).
+    opts: Options,
     /// Cell geometry from discovery.cellMetrics; resize updates the cell
     /// size, the baseline stays the face's ascender.
     metrics: discovery.CellMetrics,
@@ -166,6 +171,7 @@ pub const CpuRenderer = struct {
             .discovery = d,
             .face = face.*,
             .size_px = opts.size_px,
+            .opts = opts,
             .metrics = metrics,
             .atlas = try atlas.GlyphAtlas.init(allocator, opts.atlas_width, opts.atlas_height),
             .shaper = shaper.Shaper.init(allocator),
@@ -218,6 +224,25 @@ pub const CpuRenderer = struct {
         }
         self.cols = cols;
         self.rows = rows;
+    }
+
+    /// Change the font pixel size (grab-zoom-in / grab-zoom-out, M3.8).
+    /// All size-dependent state (atlas, face table, caches) is rebuilt in
+    /// place at the new size; the renderer's address is unchanged, so
+    /// borrowed vtable pointers stay valid. The grid is preserved at the
+    /// new cell size; the caller recomputes cols/rows from the returned
+    /// metrics and calls resize() again. Returns the new cell metrics.
+    pub fn setFontSize(self: *CpuRenderer, new_size_px: u16) !discovery.CellMetrics {
+        if (new_size_px == self.size_px) return self.metrics;
+        var opts = self.opts;
+        opts.size_px = new_size_px;
+        var fresh = try init(self.allocator, self.discovery, &self.face, opts);
+        errdefer fresh.deinit();
+        try fresh.resize(self.cols, self.rows, fresh.metrics.cell_w, fresh.metrics.cell_h);
+        const metrics = fresh.metrics;
+        self.deinit();
+        self.* = fresh;
+        return metrics;
     }
 
     /// Draw the current snapshot. `state` must already be update()d by
@@ -1100,6 +1125,72 @@ fn fillCell(f: *Framebuffer, x: i32, y: i32, w: u16, h: u16, color_word: u32) vo
     }
 }
 
+/// Rotate-blit the logical (content-space) framebuffer `src` into the
+/// physical framebuffer `dst` (ROADMAP M5.4). `rotation` is the clockwise
+/// turn of the content onto the panel, using the same convention as
+/// video/layout.zig: each physical pixel takes the source pixel at
+/// `rotation.physicalToLogical`. `src` must have the effective (logical)
+/// dimensions of `dst` under `rotation` (the axes swap at 90/270 degrees).
+/// Formats must match; words are copied verbatim (no blending). This is
+/// the renderer-side rotation path used when the DRM backend exposes no
+/// plane rotation (drm2d does not).
+pub fn blitRotated(dst: Framebuffer, src: Framebuffer, rotation: layout.Rotation) void {
+    std.debug.assert(dst.format == src.format);
+    const pw: usize = dst.width;
+    const ph: usize = dst.height;
+    const sw: usize = src.width;
+    const sh: usize = src.height;
+    const dpitch: usize = dst.pitch;
+    const spitch: usize = src.pitch;
+    switch (rotation) {
+        .normal => {
+            std.debug.assert(sw == pw and sh == ph);
+            dst.blitFrom(src, 0, 0, .{ .x = 0, .y = 0, .w = dst.width, .h = dst.height });
+        },
+        .inverted => {
+            std.debug.assert(sw == pw and sh == ph);
+            var y: usize = 0;
+            while (y < ph) : (y += 1) {
+                const drow = dst.mem[y * dpitch ..][0 .. pw * 4];
+                const srow = src.mem[(sh - 1 - y) * spitch ..][0 .. sw * 4];
+                var x: usize = 0;
+                while (x < pw) : (x += 1) {
+                    const word = std.mem.readInt(u32, srow[(sw - 1 - x) * 4 ..][0..4], .little);
+                    std.mem.writeInt(u32, drow[x * 4 ..][0..4], word, .little);
+                }
+            }
+        },
+        .right => {
+            std.debug.assert(sw == ph and sh == pw);
+            var y: usize = 0;
+            while (y < ph) : (y += 1) {
+                const drow = dst.mem[y * dpitch ..][0 .. pw * 4];
+                var x: usize = 0;
+                while (x < pw) : (x += 1) {
+                    // physical (x, y) <- logical (y, pw - 1 - x)
+                    const off = (pw - 1 - x) * spitch + y * 4;
+                    const word = std.mem.readInt(u32, src.mem[off..][0..4], .little);
+                    std.mem.writeInt(u32, drow[x * 4 ..][0..4], word, .little);
+                }
+            }
+        },
+        .left => {
+            std.debug.assert(sw == ph and sh == pw);
+            var y: usize = 0;
+            while (y < ph) : (y += 1) {
+                const drow = dst.mem[y * dpitch ..][0 .. pw * 4];
+                var x: usize = 0;
+                while (x < pw) : (x += 1) {
+                    // physical (x, y) <- logical (ph - 1 - y, x)
+                    const off = x * spitch + (ph - 1 - y) * 4;
+                    const word = std.mem.readInt(u32, src.mem[off..][0..4], .little);
+                    std.mem.writeInt(u32, drow[x * 4 ..][0..4], word, .little);
+                }
+            }
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests: real libghostty-vt terminal + real host fonts. Run via
 // src/test_cpu.zig (command in that file's header).
@@ -1634,4 +1725,86 @@ test "cpu: invalid font-feature string fails init" {
         .size_px = 16,
         .font_features = &.{"liga=abc"},
     }));
+}
+
+test "cpu: setFontSize re-initializes at the new pixel size (M3.8)" {
+    const a = testing.allocator;
+    var d = try discovery.Discovery.init(a);
+    defer d.deinit();
+    var face = try d.primaryFace(null, 16);
+    var cpu = try CpuRenderer.init(a, &d, &face, .{ .size_px = 16 });
+    defer cpu.deinit();
+    try cpu.resize(20, 5, cpu.metrics.cell_w, cpu.metrics.cell_h);
+    const m16 = cpu.metrics;
+    try testing.expectEqual(@as(u16, 16), cpu.size_px);
+
+    const m32 = try cpu.setFontSize(32);
+    try testing.expectEqual(@as(u16, 32), cpu.size_px);
+    try testing.expectEqual(m32.cell_w, cpu.metrics.cell_w);
+    try testing.expectEqual(m32.cell_h, cpu.metrics.cell_h);
+    // Grid preserved; reconfigure to the new cell size and render.
+    try cpu.resize(20, 5, m32.cell_w, m32.cell_h);
+
+    var t = try vt.Vt.init(20, 5);
+    defer t.deinit();
+    var state = try vt.RenderState.new();
+    defer state.deinit();
+    var f = try Framebuffer.create(a, 20 * @as(u32, m32.cell_w), 5 * @as(u32, m32.cell_h), .xrgb8888, null);
+    defer f.destroy(a);
+    t.write("zoom");
+    try state.update(&t);
+    var damage: DamageList = .empty;
+    defer damage.deinit(a);
+    var palette: [18]u32 = undefined;
+    for (&palette, presets.Preset.legacy.get()) |*dst, cc| dst.* = cc.xrgb();
+    const opts: RenderOpts = .{
+        .cursor_visible = true,
+        .cursor_style = .block,
+        .cursor_blink_on = null,
+        .palette = &palette,
+        .default_fg = palette[16],
+        .default_bg = palette[17],
+        .bg_opacity = 255,
+    };
+    try cpu.renderFrame(&state, &f, &damage, opts);
+    try testing.expect(damage.items.len > 0);
+
+    // Round-trip back to 16 reproduces the original metrics.
+    const m16b = try cpu.setFontSize(16);
+    try testing.expectEqual(@as(u16, 16), cpu.size_px);
+    try testing.expectEqual(m16.cell_w, m16b.cell_w);
+    try testing.expectEqual(m16.cell_h, m16b.cell_h);
+
+    // No-op when the size is unchanged.
+    const same = try cpu.setFontSize(16);
+    try testing.expectEqual(m16b.cell_w, same.cell_w);
+}
+
+test "cpu: blitRotated matches layout.physicalToLogical for all rotations (M5.4)" {
+    const a = testing.allocator;
+    const lw: u32 = 6;
+    const lh: u32 = 4;
+    var src = try Framebuffer.create(a, lw, lh, .xrgb8888, null);
+    defer src.destroy(a);
+    for (0..lh) |y| {
+        for (0..lw) |x| {
+            const idx: u32 = @intCast(y * @as(usize, lw) + x);
+            src.set(@intCast(x), @intCast(y), idx + 1);
+        }
+    }
+    for (std.meta.tags(layout.Rotation)) |rot| {
+        // effectiveDimensions swaps the axes at 90/270 and is its own
+        // inverse, so it maps logical -> physical here as well.
+        const phys = rot.effectiveDimensions(lw, lh);
+        var dst = try Framebuffer.create(a, phys.w, phys.h, .xrgb8888, null);
+        defer dst.destroy(a);
+        blitRotated(dst, src, rot);
+        for (0..phys.h) |py| {
+            for (0..phys.w) |px| {
+                const lp = rot.physicalToLogical(@intCast(px), @intCast(py), phys.w, phys.h);
+                const want = src.get(@intCast(lp.x), @intCast(lp.y));
+                try testing.expectEqual(want, dst.get(@intCast(px), @intCast(py)));
+            }
+        }
+    }
 }

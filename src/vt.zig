@@ -230,6 +230,25 @@ pub const Scrollbar = extern struct {
     len: u64,
 };
 
+/// Viewport scroll behavior (§2.5). The viewport is the visible window
+/// into the active screen plus its scrollback; scrolling it moves what is
+/// displayed without touching the cursor or the program. `delta` and
+/// `delta_prompt` are signed line counts (up/back is negative); `row` is
+/// an absolute offset from the top of the scrollable area, in the same
+/// space as `Scrollbar.offset` (clamped by the library).
+pub const ScrollViewport = union(enum) {
+    /// Jump to the top of the scrollback.
+    top,
+    /// Jump to the bottom (the active area).
+    bottom,
+    /// Scroll by a signed number of lines (up is negative).
+    delta: isize,
+    /// Scroll to an absolute row (clamped to the active area).
+    row: usize,
+    /// Scroll by whole prompts (OSC 133 markers); a no-op without them.
+    delta_prompt: isize,
+};
+
 /// DA reply constants (device.h). Fill DeviceAttributes with these and
 /// return true from the callback, or return false for the built-in VT220
 /// answers (§8.3).
@@ -1366,6 +1385,53 @@ pub const Vt = struct {
         if (r == c.GHOSTTY_NO_VALUE) return null;
         try check(r);
         return out;
+    }
+
+    // -- viewport scrolling (§2.5) -----------------------------------------
+
+    /// Scroll the viewport. On the alternate screen (no scrollback) the
+    /// viewport stays on the active area. A moved viewport marks the whole
+    /// render frame dirty, so the next RenderState.update repaints it.
+    pub fn scrollViewport(self: *Vt, behavior: ScrollViewport) Error!void {
+        const b: c.GhosttyTerminalScrollViewport = switch (behavior) {
+            .top => .{ .tag = @intCast(c.GHOSTTY_TERMINAL_SCROLL_VIEWPORT_TOP) },
+            .bottom => .{ .tag = @intCast(c.GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM) },
+            .delta => |d| .{
+                .tag = @intCast(c.GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA),
+                .value = .{ .delta = d },
+            },
+            .row => |r| .{
+                .tag = @intCast(c.GHOSTTY_TERMINAL_SCROLL_VIEWPORT_ROW),
+                .value = .{ .row = r },
+            },
+            .delta_prompt => |d| .{
+                .tag = @intCast(c.GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA_PROMPT),
+                .value = .{ .delta_prompt = d },
+            },
+        };
+        try check(c.ghostty_terminal_scroll_viewport(self.handle, b));
+    }
+
+    /// Jump to the top of the scrollback.
+    pub fn scrollTop(self: *Vt) Error!void {
+        try self.scrollViewport(.top);
+    }
+
+    /// Jump to the bottom (the active area).
+    pub fn scrollBottom(self: *Vt) Error!void {
+        try self.scrollViewport(.bottom);
+    }
+
+    /// Scroll back one full viewport page (grab-page-up).
+    pub fn pageUp(self: *Vt) Error!void {
+        const page_rows: isize = @intCast(try self.rows());
+        try self.scrollViewport(.{ .delta = -page_rows });
+    }
+
+    /// Scroll forward one full viewport page (grab-page-down).
+    pub fn pageDown(self: *Vt) Error!void {
+        const page_rows: isize = @intCast(try self.rows());
+        try self.scrollViewport(.{ .delta = page_rows });
     }
 
     // -- selection (§6) -----------------------------------------------------
@@ -3361,6 +3427,48 @@ test "scrollback options and generic escape hatches" {
     const sb = try vt.scrollbar();
     try testing.expectEqual(@as(u64, 24), sb.len);
     try testing.expect(try vt.viewportActive());
+}
+
+test "viewport scrolling: top/bottom/delta/page (§2.5)" {
+    var vt = try Vt.init(10, 4);
+    defer vt.deinit();
+    try vt.setScrollbackMaxLines(100);
+
+    // Feed 20 lines into a 4-row viewport so most scroll into history.
+    vt.write("1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9\r\n10\r\n" ++
+        "11\r\n12\r\n13\r\n14\r\n15\r\n16\r\n17\r\n18\r\n19\r\n20\r\n");
+    try testing.expect(try vt.viewportActive());
+    const bottom = try vt.scrollbar();
+    try testing.expectEqual(@as(u64, 4), bottom.len);
+    try testing.expect(bottom.total > bottom.len); // scrollback exists
+    try testing.expect(bottom.offset >= 4); // room to scroll up
+
+    // Top: viewport leaves the active area, offset 0.
+    try vt.scrollTop();
+    try testing.expect(!try vt.viewportActive());
+    try testing.expectEqual(@as(u64, 0), (try vt.scrollbar()).offset);
+
+    // Bottom: back to the active area.
+    try vt.scrollBottom();
+    try testing.expect(try vt.viewportActive());
+    try testing.expectEqual(bottom.offset, (try vt.scrollbar()).offset);
+
+    // Delta up by 2 lines.
+    try vt.scrollViewport(.{ .delta = -2 });
+    try testing.expect(!try vt.viewportActive());
+    try testing.expectEqual(bottom.offset - 2, (try vt.scrollbar()).offset);
+
+    // Page up/down move by the viewport height (4 rows).
+    try vt.scrollBottom();
+    try vt.pageUp();
+    try testing.expectEqual(bottom.offset - 4, (try vt.scrollbar()).offset);
+    try vt.pageDown();
+    try testing.expect(try vt.viewportActive());
+    try testing.expectEqual(bottom.offset, (try vt.scrollbar()).offset);
+
+    // Absolute row round-trips through the scrollbar offset space.
+    try vt.scrollViewport(.{ .row = 1 });
+    try testing.expectEqual(@as(u64, 1), (try vt.scrollbar()).offset);
 }
 
 test "mode helpers and reset semantics" {

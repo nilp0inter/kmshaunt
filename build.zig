@@ -71,13 +71,20 @@ const CInterop = struct {
         // libghostty-vt, pinned to 1.0.1 in build.zig.zon. The C API is the
         // stable surface (D1): translate the shim header into the `vt-c`
         // module and link the library artifact.
+        //
+        // Link the STATIC artifact: ghostty's build.zig installs
+        // "ghostty-vt-static" for dependents (bundled compiler-rt, PIC, and
+        // the vendored simdutf/highway archives propagate through
+        // linkLibrary). The shared artifact would leave a runtime
+        // dependency on libghostty-vt.so.1, which the nix package does not
+        // ship; static linking keeps the binary standalone.
         var vt_c: ?*std.Build.Module = null;
         var ghostty_vt: ?*std.Build.Step.Compile = null;
         if (b.lazyDependency("ghostty", .{})) |dep| {
             const vt = translateC(b, target, optimize, "src/vt-c.h", &.{});
             vt.addIncludePath(dep.path("include"));
             vt_c = vt.createModule();
-            ghostty_vt = dep.artifact("ghostty-vt");
+            ghostty_vt = dep.artifact("ghostty-vt-static");
         }
 
         const drm = translateC(b, target, optimize, "src/drm-c.h", &.{"libdrm"});

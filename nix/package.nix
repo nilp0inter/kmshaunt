@@ -1,5 +1,11 @@
 # kmshaunt, built offline against the pinned libghostty-vt 1.0.1.
 #
+# libghostty-vt is linked STATICALLY (build.zig links the dependency's
+# "ghostty-vt-static" artifact, which bundles compiler-rt and the vendored
+# simdutf/highway archives). $out/bin/kmshaunt is therefore standalone:
+# no libghostty-vt.so.1 is needed at runtime and the package ships bin/
+# only.
+#
 # This nixpkgs has no `zig.buildPackage`; the zig derivation provides a
 # setup hook instead (zigConfigurePhase/zigBuildPhase/zigCheckPhase/
 # zigInstallPhase), which is what nixpkgs' own zig packages use.
@@ -129,6 +135,24 @@ stdenv.mkDerivation (finalAttrs: {
     "-Doptimize=ReleaseFast"
   ];
 
+  # `zig build test` spawns hermetic children (src/misc/pty.zig,
+  # src/session/terminal.zig) that assume a host-like environment, which
+  # the standard sandbox does not provide:
+  # - the OSC52 clipboard test uses the bash builtin `read -t 0.3`, but the
+  #   sandbox's /bin/sh is the minimal busybox from the daemon's
+  #   `sandbox-paths` setting, which rejects fractional timeouts;
+  # - the pty resize test runs `stty size`, looked up under
+  #   /run/current-system/sw/bin, /usr/bin or /bin; none carries coreutils
+  #   inside the sandbox.
+  # Nix (2.34) has no per-derivation override for the sandbox shell or
+  # /bin contents, so the package cannot fix this itself. Build with either:
+  #   nix build --option sandbox false .#kmshaunt
+  # or, keeping the sandbox, mount a full bash and stty (stty must be the
+  # coreutils multicall binary: the bin/stty symlink loses its target when
+  # bind-mounted):
+  #   nix build --option sandbox-paths \
+  #     "/bin/sh=$(nix eval --raw nixpkgs#bash.outPath)/bin/bash /bin/stty=$(nix eval --raw nixpkgs#coreutils.outPath)/bin/coreutils" \
+  #     .#kmshaunt
   doCheck = true;
 
   preCheck = ''

@@ -65,6 +65,9 @@ const fbdev = @import("video/fbdev.zig");
 const render = @import("render.zig");
 const cpu = @import("render/cpu.zig");
 const discovery = @import("font/discovery.zig");
+const vt = @import("vt.zig");
+const layout = @import("video/layout.zig");
+const atlas = @import("font/atlas.zig");
 const sess = @import("session.zig");
 const terminal = @import("session/terminal.zig");
 const manager = @import("session/manager.zig");
@@ -201,6 +204,10 @@ const kdmktone: u32 = 0x4B30;
 const blink_interval_ns: u64 = 500 * std.time.ns_per_ms;
 /// Throttle before respawning a login child that exited (non-oneshot).
 const respawn_delay_ns: u64 = 500 * std.time.ns_per_ms;
+/// Zoom bounds (px) for grab-zoom-in/out. kmscon floors zoom-out at 1 px;
+/// no max is configured, so kmshaunt caps at a readable upper bound (M3.8).
+const min_font_px: u16 = 1;
+const max_font_px: u16 = 128;
 
 /// One registered pty master. Heap-allocated so the epoll userdata pointer
 /// stays stable across list growth.
@@ -234,6 +241,10 @@ const Console = struct {
     backend: video.Backend = undefined,
     drm_token: ?loop.Token = null,
     mode: video.Mode = .{ .width_px = 0, .height_px = 0, .refresh_mhz = 0, .width_mm = 0, .height_mm = 0 },
+    /// Content rotation applied at present time (M5.4); initial value from
+    /// cfg.screen, cycled by grab-rotate-cw/ccw. Renderer-side (drm2d has
+    /// no plane rotation).
+    rotation: layout.Rotation = .normal,
 
     // Font + renderer.
     disc: ?discovery.Discovery = null,
@@ -474,6 +485,7 @@ const Console = struct {
             if (!conn.connected or conn.modes.len == 0) continue;
             const screen = self.cfg.getScreen(conn.card_name, conn.name);
             if (!screen.enabled) continue;
+            self.rotation = orientationToRotation(screen.orientation);
             var mi: usize = conn.preferred_mode orelse 0;
             if (self.cfg.getMode(conn.card_name, conn.name)) |want| {
                 for (conn.modes, 0..) |m, j| {
@@ -501,15 +513,16 @@ const Console = struct {
         self.cell = try discovery.cellMetrics(self.face);
         if (self.cell.cell_w == 0 or self.cell.cell_h == 0) return error.InvalidCellMetrics;
 
-        self.cols = @intCast(@max(1, @min(self.mode.width_px / self.cell.cell_w, std.math.maxInt(u16))));
-        self.rows = @intCast(@max(1, @min(self.mode.height_px / self.cell.cell_h, std.math.maxInt(u16))));
+        const eff = self.rotation.effectiveDimensions(self.mode.width_px, self.mode.height_px);
+        self.cols = @intCast(@max(1, @min(eff.w / self.cell.cell_w, std.math.maxInt(u16))));
+        self.rows = @intCast(@max(1, @min(eff.h / self.cell.cell_h, std.math.maxInt(u16))));
 
         self.renderer = try cpu.CpuRenderer.init(self.alloc, &self.disc.?, &self.face, .{
             .size_px = self.size_px,
         });
         try self.renderer.?.resize(self.cols, self.rows, self.cell.cell_w, self.cell.cell_h);
 
-        self.shadow = try video.Framebuffer.create(self.alloc, self.mode.width_px, self.mode.height_px, .xrgb8888, null);
+        self.shadow = try video.Framebuffer.create(self.alloc, eff.w, eff.h, .xrgb8888, null);
     }
 
     fn setupSessions(self: *Console) !void {
@@ -640,9 +653,15 @@ const Console = struct {
             log.warn("render: {t}", .{err});
             return;
         };
-        // The shadow holds the complete image; blit it into the back buffer.
-        fb.blitFrom(shadow.*, 0, 0, .{ .x = 0, .y = 0, .w = shadow.width, .h = shadow.height });
-        const dmg: []const video.Damage = if (self.full_redraw) &.{} else self.damage.items;
+        // The shadow holds the complete image in logical (content) space;
+        // blit it into the physical back buffer, rotating if needed (M5.4).
+        if (self.rotation == .normal) {
+            fb.blitFrom(shadow.*, 0, 0, .{ .x = 0, .y = 0, .w = shadow.width, .h = shadow.height });
+        } else {
+            cpu.blitRotated(fb.*, shadow.*, self.rotation);
+        }
+        // Rotated frames are fully repainted, so present the whole frame.
+        const dmg: []const video.Damage = if (self.full_redraw or self.rotation != .normal) &.{} else self.damage.items;
         self.backend.endFrame(dmg) catch |err| {
             log.warn("endFrame: {t}", .{err});
             return;
@@ -698,12 +717,84 @@ const Console = struct {
                 // reboot(2): LINUX_REBOOT_MAGIC1/2 + RB_AUTOBOOT (linux/reboot.h).
                 _ = linux.syscall4(.reboot, 0xfee1dead, 0x28121969, 0x01234567, 0);
             },
-            // scroll (1-4), zoom (5-6), rotate (11-12): the underlying
-            // module APIs land in M2/M3/M5 (vt.zig exposes no viewport
-            // scroll, drm2d no rotation). Reported, not silently dropped.
-            else => log.debug("grab {d}: action pending module support", .{id}),
+            1, 2, 3, 4 => self.handleScroll(id), // scroll/page (M2.2)
+            5, 6 => self.handleZoom(id), // zoom in/out (M3.8)
+            11, 12 => self.handleRotate(id), // rotate cw/ccw (M5.4)
+            else => log.debug("grab {d}: unknown action", .{id}),
         }
         self.markDirty();
+    }
+
+    /// The focused terminal session, or null when there is none.
+    fn activeTerminal(self: *Console) ?*terminal.TerminalSession {
+        const m = &self.mgr.?;
+        const s = m.activeSession() orelse return null;
+        return @ptrCast(@alignCast(s.ptr));
+    }
+
+    /// grab-scroll-up/down (1 line) and grab-page-up/down (full page) on
+    /// the active session's viewport (M2.2). A moved viewport marks the
+    /// whole frame dirty, so markDirty below repaints it.
+    fn handleScroll(self: *Console, id: u16) void {
+        const ts = self.activeTerminal() orelse return;
+        const result = switch (id) {
+            1 => ts.vt.scrollViewport(.{ .delta = -1 }),
+            2 => ts.vt.scrollViewport(.{ .delta = 1 }),
+            3 => ts.vt.pageUp(),
+            4 => ts.vt.pageDown(),
+            else => return,
+        };
+        result catch |err| log.warn("scroll grab: {t}", .{err});
+    }
+
+    /// grab-zoom-in/out: step the font size, then reconfigure the grid and
+    /// every session (M3.8).
+    fn handleZoom(self: *Console, id: u16) void {
+        const steps: i32 = if (id == 5) 1 else -1;
+        const next = atlas.applyZoom(
+            @floatFromInt(self.size_px),
+            steps,
+            @floatFromInt(min_font_px),
+            @floatFromInt(max_font_px),
+        );
+        const new_px: u16 = @intFromFloat(next);
+        if (new_px == self.size_px) return;
+        const metrics = self.renderer.?.setFontSize(new_px) catch |err| {
+            log.warn("zoom: {t}", .{err});
+            return;
+        };
+        self.size_px = new_px;
+        self.cell = metrics;
+        self.reconfigureGrid() catch |err| log.warn("zoom regrid: {t}", .{err});
+        self.full_redraw = true;
+    }
+
+    /// grab-rotate-cw/ccw: cycle the screen rotation and reconfigure (M5.4).
+    fn handleRotate(self: *Console, id: u16) void {
+        self.rotation = if (id == 11) self.rotation.rotateCw() else self.rotation.rotateCcw();
+        self.reconfigureGrid() catch |err| {
+            log.warn("rotate regrid: {t}", .{err});
+            return;
+        };
+        self.full_redraw = true;
+    }
+
+    /// Recompute the grid from the current cell size and rotation, resize
+    /// the renderer and every session, and rebuild the shadow framebuffer
+    /// when the logical (post-rotation) size changed. Shared by zoom/rotate.
+    fn reconfigureGrid(self: *Console) !void {
+        const eff = self.rotation.effectiveDimensions(self.mode.width_px, self.mode.height_px);
+        self.cols = @intCast(@max(1, @min(eff.w / self.cell.cell_w, std.math.maxInt(u16))));
+        self.rows = @intCast(@max(1, @min(eff.h / self.cell.cell_h, std.math.maxInt(u16))));
+        try self.renderer.?.resize(self.cols, self.rows, self.cell.cell_w, self.cell.cell_h);
+        try self.mgr.?.resize(self.cols, self.rows);
+        if (self.shadow) |*s| {
+            if (s.width != eff.w or s.height != eff.h) {
+                s.destroy(self.alloc);
+                self.shadow = null;
+                self.shadow = try video.Framebuffer.create(self.alloc, eff.w, eff.h, .xrgb8888, null);
+            }
+        }
     }
 
     fn respawn(self: *Console, ts: *terminal.TerminalSession) void {
@@ -1041,6 +1132,16 @@ fn autoFontSize(mode: video.Mode) u16 {
     return @intCast(std.math.clamp(px, 8, 72));
 }
 
+/// Map the config `--screen` orientation to the layout rotation (M5.4).
+fn orientationToRotation(o: config.Orientation) layout.Rotation {
+    return switch (o) {
+        .normal => .normal,
+        .left => .left,
+        .right => .right,
+        .upside_down => .inverted,
+    };
+}
+
 /// config.vt is a device path ("/dev/ttyN"); VtReal.openVt wants the number.
 fn vtNumber(vt_path: ?[]const u8) !?u8 {
     const p = vt_path orelse return null;
@@ -1119,15 +1220,15 @@ fn runDaemon(io: std.Io, alloc: std.mem.Allocator, cfg: *const config.Config) !v
                 log.warn("seat {s} needs a fake VT worker (M6); skipping", .{s.name});
                 return;
             }
-            const vt = self.next_vt;
+            const worker_vt = self.next_vt;
             self.next_vt +|= 1;
             var vt_buf: [16]u8 = undefined;
-            const vt_arg = std.fmt.bufPrint(&vt_buf, "{d}", .{vt}) catch return;
+            const vt_arg = std.fmt.bufPrint(&vt_buf, "{d}", .{worker_vt}) catch return;
             const child = std.process.spawn(self.io, .{ .argv = &.{ "kmshaunt", "--vt", vt_arg } }) catch |err| {
                 log.err("spawn worker for {s}: {t}", .{ s.name, err });
                 return;
             };
-            log.info("spawned worker for {s} on vt {d} (pid {d})", .{ s.name, vt, child.id orelse 0 });
+            log.info("spawned worker for {s} on vt {d} (pid {d})", .{ s.name, worker_vt, child.id orelse 0 });
         }
     };
 
