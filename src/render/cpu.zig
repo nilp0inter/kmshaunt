@@ -892,8 +892,12 @@ pub const CpuRenderer = struct {
                     try self.drawSprite(f, @as(i32, @intCast(i)) * cw, y_px, cp, rc.fg);
                     continue;
                 }
-                const shapeable = rc.width != 0 and !rc.invisible and
-                    rc.n_cps == 1 and self.row_cps.items[rc.cps_start] != 0;
+                // Wide continuations carry no glyph of their own (the
+                // shaper skips width==0 cells), so they extend the span
+                // instead of breaking it: a CJK row would otherwise shape
+                // one cell per HarfBuzz call (M8.1 unicode).
+                const shapeable = rc.width == 0 or (!rc.invisible and
+                    rc.n_cps == 1 and self.row_cps.items[rc.cps_start] != 0);
                 if (shapeable) {
                     if (span_start == null) span_start = i;
                     continue;
@@ -1237,16 +1241,7 @@ pub const CpuRenderer = struct {
                 while (r < c.h) : (r += 1) {
                     const src = region.data[(@as(usize, c.src_y) + r) * region.stride + c.src_x ..][0..c.w];
                     const dst = fbRow(f, c.x, c.y + r, c.w);
-                    for (src, 0..) |a, i| {
-                        if (a == 0) continue;
-                        const off = i * 4;
-                        if (a == 255) {
-                            std.mem.writeInt(u32, dst[off..][0..4], color_word, .little);
-                            continue;
-                        }
-                        const d = std.mem.readInt(u32, dst[off..][0..4], .little);
-                        std.mem.writeInt(u32, dst[off..][0..4], blendPixel(color_word, d, a), .little);
-                    }
+                    blendA8Row(dst, src, color_word);
                 }
             },
             .bgra8 => {
@@ -1545,6 +1540,42 @@ fn blendPixel(fg: u32, bg: u32, a: u8) u32 {
     const g = blendChannel((fg >> 8) & 0xff, (bg >> 8) & 0xff, a);
     const b = blendChannel(fg & 0xff, bg & 0xff, a);
     return (r << 16) | (g << 8) | b;
+}
+
+/// Vectorized a8 coverage blend for one glyph row: `src` holds one coverage
+/// byte per pixel, `dst` the xrgb pixels. Blends `fg` over the existing dst
+/// (a==0 leaves dst, a==255 writes fg), 4 pixels per SIMD step; the result
+/// is bit-identical to blendPixel. The scalar tail handles the remainder.
+/// M8.1: the unicode benchmark blits the same .notdef raster into thousands
+/// of CJK cells per frame, so the per-pixel blend is the frame bottleneck.
+fn blendA8Row(dst: []u8, src: []const u8, fg: u32) void {
+    const V = @Vector(4, u32);
+    const n = src.len;
+    const fgr: V = @splat((fg >> 16) & 0xff);
+    const fgg: V = @splat((fg >> 8) & 0xff);
+    const fgb: V = @splat(fg & 0xff);
+    const mask: V = @splat(0xff);
+    const round: V = @splat(127);
+    const k255: V = @splat(255);
+    const s16: V = @splat(16);
+    const s8: V = @splat(8);
+    var i: usize = 0;
+    while (i + 4 <= n) : (i += 4) {
+        const av: V = .{ src[i], src[i + 1], src[i + 2], src[i + 3] };
+        const dv = @as(*align(1) const V, @ptrCast(dst[i * 4 ..].ptr)).*;
+        const inv = k255 - av;
+        const rr = (fgr * av + ((dv >> s16) & mask) * inv + round) / k255;
+        const gg = (fgg * av + ((dv >> s8) & mask) * inv + round) / k255;
+        const bb = (fgb * av + (dv & mask) * inv + round) / k255;
+        @as(*align(1) V, @ptrCast(dst[i * 4 ..].ptr)).* = (rr << s16) | (gg << s8) | bb;
+    }
+    while (i < n) : (i += 1) {
+        const a = src[i];
+        if (a == 0) continue;
+        const off = i * 4;
+        const d = std.mem.readInt(u32, dst[off..][0..4], .little);
+        std.mem.writeInt(u32, dst[off..][0..4], if (a == 255) fg else blendPixel(fg, d, a), .little);
+    }
 }
 
 /// Source-over of one PREMULTIPLIED source channel over an opaque dst

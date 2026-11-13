@@ -64,11 +64,13 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const builtin = @import("builtin");
 
 const config = @import("config/config.zig");
 const loop = @import("loop.zig");
 const seat = @import("seat.zig");
 const vt_real = @import("seat/vt_real.zig");
+const vt_fake = @import("seat/vt_fake.zig");
 const libseat = @import("seat/libseat.zig");
 const multiseat = @import("seat/multiseat.zig");
 const video = @import("video.zig");
@@ -192,12 +194,22 @@ pub fn main(init: std.process.Init) !void {
     log_filter = if (cfg.debug) .debug else if (cfg.verbose) .info else if (cfg.silent) .err else .warn;
     for (cfg.warnings.items) |w| log.warn("{s}", .{w});
 
+    // Seat workers (KMSHAUNT_SEAT set by runDaemon) always run the
+    // console, whatever the inherited config says; layer their per-seat
+    // config (CLI lock < main < <seat>.seat.conf, kmscon config.c:1167).
+    const worker_seat = multiseat.workerSeat(init.minimal.environ);
+    if (worker_seat) |name| {
+        const seat_cfg = try cfg.loadSeat(arena, io, name);
+        cfg.deinit();
+        cfg = seat_cfg;
+    }
+
     // Multi-seat daemon: libseat without a pinned VT (kmshaunt.service).
     // The single-seat path is selected whenever a VT is requested.
-    const result = if (cfg.libseat and cfg.vt == null)
-        runDaemon(io, arena, &cfg)
+    const result = if (worker_seat == null and cfg.libseat and cfg.vt == null)
+        runDaemon(io, arena, &cfg, init.minimal.environ)
     else
-        runConsole(io, arena, &cfg);
+        runConsole(io, arena, &cfg, worker_seat);
 
     result catch |err| {
         log.err("console failed: {t}", .{err});
@@ -451,9 +463,13 @@ const Console = struct {
     lp: loop.Loop = .{ .epoll_fd = -1 },
     signals: ?*loop.SignalSource = null,
 
-    // Seat (exactly one of vt / libseat).
+    // Seat (exactly one of vt / libseat / fake_vt).
     vt: ?vt_real.VtReal = null,
     ls: ?*libseat.LibseatSeat = null,
+    fake_vt: ?vt_fake.FakeVt = null,
+    /// Daemon-spawned seat worker: the seat name from KMSHAUNT_SEAT.
+    /// null for the daemon itself and ordinary single-seat consoles.
+    worker_seat: ?[:0]const u8 = null,
     seat_handle: seat.Seat = undefined,
     seat_cbs: seat.Seat.Callbacks = .{},
     seat_token: ?loop.Token = null,
@@ -618,6 +634,13 @@ const Console = struct {
             v.deinit();
             self.vt = null;
         }
+        if (self.fake_vt) |*f| {
+            // deactivate before deinit (vt_fake.zig deinit contract);
+            // deinit fires no callbacks.
+            self.seat_handle.deactivate() catch {};
+            f.deinit();
+            self.fake_vt = null;
+        }
 
         if (self.signals) |s| {
             s.deinit();
@@ -700,7 +723,16 @@ const Console = struct {
             .activated = onSeatActivated,
             .deactivated = onSeatDeactivated,
         };
-        if (self.cfg.libseat) {
+        if (self.worker_seat != null and self.cfg.vt == null) {
+            // Fake-VT worker (M6.7): this seat has no kernel VT. FakeVt
+            // starts active and is never switched (vt_fake.zig header,
+            // kmscon vt_fake.c:39-41). No fd to register. session-control
+            // stays enabled: kmscon only force-disables it on real VTs
+            // (seat.c:780, uterm_vt_get_num > 0).
+            self.fake_vt = vt_fake.FakeVt.init(self.alloc);
+            self.seat_handle = self.fake_vt.?.seat();
+            self.seat_handle.setCallbacks(&self.seat_cbs, @intFromPtr(self));
+        } else if (self.cfg.libseat) {
             const ls = try libseat.LibseatSeat.init(self.alloc, libseat.LibseatOps.real);
             self.ls = ls;
             self.seat_handle = ls.seat();
@@ -1064,7 +1096,9 @@ const Console = struct {
             .keymap_file = self.cfg.xkb_keymap,
         });
         self.keymap = try xkb.Keymap.init(self.io, self.alloc, self.xkb_effective);
-        self.input = try libinput.Input.init(self.alloc, self.io, &self.keymap.?, self.cfg, libinput.LibinputOps.real);
+        var li_ops = libinput.LibinputOps.real;
+        if (self.worker_seat != null) li_ops.udev_assign_seat = workerAssignSeat;
+        self.input = try libinput.Input.init(self.alloc, self.io, &self.keymap.?, self.cfg, li_ops);
         self.input.?.setSink(onInput, @intFromPtr(self));
 
         const ra = try self.alloc.create(RepeatAdapter);
@@ -1166,8 +1200,7 @@ const Console = struct {
     }
 
     fn seatName(self: *const Console) []const u8 {
-        _ = self;
-        return "seat0";
+        return self.worker_seat orelse "seat0";
     }
 
     fn vtNr(self: *const Console) ?u32 {
@@ -1411,7 +1444,7 @@ const Console = struct {
     ) void {
         const full = video.Damage{ .x = 0, .y = 0, .w = shadow.width, .h = shadow.height };
         if (self.full_redraw) {
-            fb.blitFrom(shadow.*, 0, 0, full);
+            self.blitBand(fb, shadow, 0, shadow.height);
             self.setPrevDamage(prev_damage, &.{full});
             return;
         }
@@ -1433,7 +1466,7 @@ const Console = struct {
             }
         }
         if (overflow) {
-            fb.blitFrom(shadow.*, 0, 0, full);
+            self.blitBand(fb, shadow, 0, shadow.height);
             self.setPrevDamage(prev_damage, &.{full});
             return;
         }
@@ -1461,14 +1494,38 @@ const Console = struct {
             }
         }
         for (iv[0..m]) |band| {
-            fb.blitFrom(shadow.*, 0, 0, .{
-                .x = 0,
-                .y = band[0],
-                .w = shadow.width,
-                .h = band[1] - band[0],
-            });
+            self.blitBand(fb, shadow, band[0], band[1] - band[0]);
         }
         self.setPrevDamage(prev_damage, self.damage.items);
+    }
+
+    /// Copy full-width shadow rows [y, y+h) into the back buffer. The
+    /// dumb-buffer mapping is write-combining: regular stores flush
+    /// partial WC buffers through the cache hierarchy (~0.5 GB/s), while
+    /// non-temporal stores combine full lines in the WC buffers
+    /// themselves (several GB/s). x86-64 has SSE2 at baseline; other
+    /// targets and unaligned pitches keep the plain memcpy (M8.1).
+    fn blitBand(_: *Console, fb: *video.Framebuffer, shadow: *const video.Framebuffer, y: u32, h: u32) void {
+        if (comptime builtin.cpu.arch == .x86_64) {
+            const row_bytes: usize = @as(usize, shadow.width) * 4;
+            // movntdq needs 16-byte-aligned destinations: the mmap base
+            // is page-aligned, so a 16-aligned pitch keeps every row
+            // start aligned.
+            if (shadow.pitch % 16 == 0 and fb.pitch % 16 == 0 and
+                @intFromPtr(fb.mem.ptr) % 16 == 0)
+            {
+                var r: u32 = 0;
+                while (r < h) : (r += 1) {
+                    const row = y + r;
+                    const src = shadow.mem[@as(usize, row) * shadow.pitch ..][0..row_bytes];
+                    const dst = fb.mem[@as(usize, row) * fb.pitch ..][0..row_bytes];
+                    copyRowNT(dst, src);
+                }
+                asm volatile ("sfence" ::: .{ .memory = true });
+                return;
+            }
+        }
+        fb.blitFrom(shadow.*, 0, 0, .{ .x = 0, .y = y, .w = shadow.width, .h = h });
     }
 
     /// Append one full-width row band to the merge buffer; false when the
@@ -2031,6 +2088,36 @@ const Console = struct {
     }
 };
 
+/// Non-temporal row copy: 64-byte unrolled movntdq stores with a regular
+/// memcpy tail. `dst` must be 16-byte aligned (movntdq requirement);
+/// `src` may be unaligned. Caller issues one sfence after the last row.
+fn copyRowNT(dst: []u8, src: []const u8) void {
+    var i: usize = 0;
+    while (i + 64 <= dst.len) : (i += 64) {
+        ntStore16(dst[i..], load16(src[i..]));
+        ntStore16(dst[i + 16 ..], load16(src[i + 16 ..]));
+        ntStore16(dst[i + 32 ..], load16(src[i + 32 ..]));
+        ntStore16(dst[i + 48 ..], load16(src[i + 48 ..]));
+    }
+    while (i + 16 <= dst.len) : (i += 16) {
+        ntStore16(dst[i..], load16(src[i..]));
+    }
+    if (i < dst.len) @memcpy(dst[i..], src[i..][0 .. dst.len - i]);
+}
+
+fn load16(p: []const u8) @Vector(16, u8) {
+    return @as(*align(1) const @Vector(16, u8), @ptrCast(p.ptr)).*;
+}
+
+fn ntStore16(p: []u8, v: @Vector(16, u8)) void {
+    asm volatile ("movntdq %[v], (%[p])"
+        :
+        : [p] "r" (p.ptr),
+          [v] "x" (v),
+        : .{ .memory = true }
+    );
+}
+
 /// Milliseconds on the monotonic clock: the time base for kitty
 /// animationTick, which requires a monotonic clock stable for the
 /// terminal's lifetime.
@@ -2051,6 +2138,16 @@ fn kittyRedrawDelayNs(now_ms: u64, next_ms: u64) u64 {
 /// The active console for the session factory (a plain fn pointer with no
 /// closure). One console per process; the daemon spawns separate workers.
 var current: ?*Console = null;
+
+/// libinput seat assignment for seat workers: Input.init passes "seat0";
+/// a worker must enumerate its own seat's devices (ID_SEAT filtering,
+/// docs/reference/libseat-sdlogin.md §6.4). The seat name is NUL-terminated
+/// (it came from getenv via multiseat.workerSeat).
+fn workerAssignSeat(li: *libinput.Libinput, _: [*:0]const u8) callconv(.c) c_int {
+    const c = current orelse return -1;
+    const name = c.worker_seat orelse return libinput.LibinputOps.real.udev_assign_seat(li, "seat0");
+    return libinput.LibinputOps.real.udev_assign_seat(li, name.ptr);
+}
 
 /// loop.Timer -> libinput.RepeatTimerOps adapter (libinput.zig header).
 const RepeatAdapter = struct {
@@ -2308,10 +2405,15 @@ fn parseCtrlAltDel(bytes: []const u8) ?i32 {
 // Run paths
 // ---------------------------------------------------------------------------
 
-fn runConsole(io: std.Io, alloc: std.mem.Allocator, cfg: *config.Config) !void {
+fn runConsole(io: std.Io, alloc: std.mem.Allocator, cfg: *config.Config, worker_seat: ?[:0]const u8) !void {
     const c = try alloc.create(Console);
     defer alloc.destroy(c);
-    c.* = .{ .alloc = alloc, .io = io, .cfg = cfg };
+    c.* = .{
+        .alloc = alloc,
+        .io = io,
+        .cfg = cfg,
+        .worker_seat = worker_seat,
+    };
     errdefer c.deinit();
     current = c;
     defer current = null;
@@ -2326,11 +2428,12 @@ fn runConsole(io: std.Io, alloc: std.mem.Allocator, cfg: *config.Config) !void {
 
 /// Multi-seat daemon (kmshaunt.service: `--libseat`, no pinned VT). A
 /// simplified supervision path: SeatMonitor reports seat add/remove and we
-/// spawn one pinned-VT worker process per seat (a worker with `--vt` runs the
-/// single-seat console, so there is no recursion). Full udev ID_SEAT filtering
-/// and fake-VT workers for non-seat0 seats are M6; this supervises seat0-class
-/// seats with real VTs.
-fn runDaemon(io: std.Io, alloc: std.mem.Allocator, cfg: *const config.Config) !void {
+/// spawn one worker process per seat (a worker runs the single-seat console,
+/// so there is no recursion). Seats with a real VT get a pinned-VT worker
+/// (`--vt N --no-libseat`); seats without one get a fake-VT worker (M6.7,
+/// no `--vt`, KMSHAUNT_SEAT selects FakeVt). Each worker inherits the daemon
+/// environment plus KMSHAUNT_SEAT and the shared `--configdir`.
+fn runDaemon(io: std.Io, alloc: std.mem.Allocator, cfg: *const config.Config, environ: std.process.Environ) !void {
     var lp = try loop.Loop.init();
     defer lp.deinit();
 
@@ -2342,6 +2445,8 @@ fn runDaemon(io: std.Io, alloc: std.mem.Allocator, cfg: *const config.Config) !v
         mon: *multiseat.SeatMonitor,
         alloc: std.mem.Allocator,
         io: std.Io,
+        environ: std.process.Environ,
+        configdir: []const u8,
         next_vt: u8 = 2,
 
         fn onSignal(_: *loop.SignalSource, info: loop.SignalSource.Info, ud: usize) void {
@@ -2368,15 +2473,32 @@ fn runDaemon(io: std.Io, alloc: std.mem.Allocator, cfg: *const config.Config) !v
             };
         }
         fn spawnWorker(self: *@This(), s: multiseat.SeatInfo) void {
+            var env = multiseat.workerEnviron(self.environ, self.alloc, s.name) catch |err| {
+                log.err("worker environment for {s}: {t}", .{ s.name, err });
+                return;
+            };
+            defer env.deinit();
             if (s.needsFakeVt()) {
-                log.warn("seat {s} needs a fake VT worker (M6); skipping", .{s.name});
+                // M6.7: no kernel VT on this seat -> worker without --vt;
+                // KMSHAUNT_SEAT makes it run the console on FakeVt.
+                const child = std.process.spawn(self.io, .{
+                    .argv = &.{ multiseat.worker_exe, "--configdir", self.configdir },
+                    .environ_map = &env,
+                }) catch |err| {
+                    log.err("spawn fake-VT worker for {s}: {t}", .{ s.name, err });
+                    return;
+                };
+                log.info("spawned fake-VT worker for {s} (pid {d})", .{ s.name, child.id orelse 0 });
                 return;
             }
             const worker_vt = self.next_vt;
             self.next_vt +|= 1;
             var vt_buf: [16]u8 = undefined;
             const vt_arg = std.fmt.bufPrint(&vt_buf, "{d}", .{worker_vt}) catch return;
-            const child = std.process.spawn(self.io, .{ .argv = &.{ "kmshaunt", "--vt", vt_arg } }) catch |err| {
+            const child = std.process.spawn(self.io, .{
+                .argv = &.{ multiseat.worker_exe, "--configdir", self.configdir, "--no-libseat", "--no-switchvt", "--vt", vt_arg },
+                .environ_map = &env,
+            }) catch |err| {
                 log.err("spawn worker for {s}: {t}", .{ s.name, err });
                 return;
             };
@@ -2384,18 +2506,30 @@ fn runDaemon(io: std.Io, alloc: std.mem.Allocator, cfg: *const config.Config) !v
         }
     };
 
-    var d = Daemon{ .lp = &lp, .mon = &mon, .alloc = alloc, .io = io };
+    var d = Daemon{ .lp = &lp, .mon = &mon, .alloc = alloc, .io = io, .environ = environ, .configdir = cfg.configdir };
     var ss: loop.SignalSource = undefined;
     try ss.init(&lp, .{ .callback = Daemon.onSignal, .userdata = @intFromPtr(&d), .signals = &.{ .TERM, .INT, .CHLD } });
     defer ss.deinit();
 
     const fd = try mon.fd();
     _ = try lp.addSource(fd, loop.ev.in_, Daemon.onSeat, @intFromPtr(&d));
-    _ = mon.process() catch |err| log.warn("initial seat enumerate: {t}", .{err});
+    // Seats present at daemon startup are reported as `.added` on the
+    // first process(); spawn their workers now (M6.7 S4), not only on the
+    // next seat event.
+    const initial = mon.process() catch |err| blk: {
+        log.warn("initial seat enumerate: {t}", .{err});
+        break :blk @as([]const multiseat.SeatChange, &.{});
+    };
+    for (initial) |ch| switch (ch) {
+        .added => |s| {
+            log.info("seat added: {s} (has_vt={})", .{ s.name, s.has_vt });
+            d.spawnWorker(s);
+        },
+        .removed => {},
+    };
 
     log.info("kmshaunt daemon: supervising seats", .{});
     try lp.run();
-    _ = cfg;
 }
 
 // ---------------------------------------------------------------------------
