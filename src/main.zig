@@ -1072,6 +1072,7 @@ const Console = struct {
         const cell = layout.Cell{ .w = self.cell.cell_w, .h = self.cell.cell_h };
         const canvas = layout.computeLayout(conns[0..n], cell, mmMode(self.cfg.multi_monitor), plans[0..n]);
         self.canvas = canvas;
+        if (self.input) |*in| in.setScreenSize(canvas.width, canvas.height);
         self.cols = @intCast(@max(1, @min(canvas.cols, std.math.maxInt(u16))));
         self.rows = @intCast(@max(1, @min(canvas.rows, std.math.maxInt(u16))));
         if (self.fb != null) {
@@ -1122,6 +1123,7 @@ const Console = struct {
         if (self.worker_seat != null) li_ops.udev_assign_seat = workerAssignSeat;
         self.input = try libinput.Input.init(self.alloc, self.io, &self.keymap.?, self.cfg, li_ops);
         self.input.?.setSink(onInput, @intFromPtr(self));
+        self.input.?.setScreenSize(self.canvas.width, self.canvas.height);
 
         const ra = try self.alloc.create(RepeatAdapter);
         errdefer self.alloc.destroy(ra);

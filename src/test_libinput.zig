@@ -166,6 +166,8 @@ const Fake = struct {
             .pointer_get_dy = fakePointerGetDy,
             .pointer_get_absolute_x = fakePointerGetAbsoluteX,
             .pointer_get_absolute_y = fakePointerGetAbsoluteY,
+            .pointer_get_absolute_x_transformed = fakePointerGetAbsoluteXTransformed,
+            .pointer_get_absolute_y_transformed = fakePointerGetAbsoluteYTransformed,
             .pointer_get_button = fakePointerGetButton,
             .pointer_get_button_state = fakePointerGetButtonState,
             .pointer_get_axis_value = fakePointerGetAxisValue,
@@ -283,6 +285,14 @@ fn fakePointerGetAbsoluteX(ev: *libinput.Event) callconv(.c) f64 {
 
 fn fakePointerGetAbsoluteY(ev: *libinput.Event) callconv(.c) f64 {
     return fromEv(ev).abs_y;
+}
+
+fn fakePointerGetAbsoluteXTransformed(ev: *libinput.Event, width: u32) callconv(.c) f64 {
+    return fromEv(ev).abs_x * @as(f64, @floatFromInt(width)) / 1000.0;
+}
+
+fn fakePointerGetAbsoluteYTransformed(ev: *libinput.Event, height: u32) callconv(.c) f64 {
+    return fromEv(ev).abs_y * @as(f64, @floatFromInt(height)) / 1000.0;
 }
 
 fn fakePointerGetButton(ev: *libinput.Event) callconv(.c) u32 {
@@ -908,6 +918,18 @@ test "pointer: relative motion accumulates; absolute reports device position" {
     try testing.expectEqual(@as(f64, 10.0), a2.dx);
     try testing.expectEqual(@as(f64, -10.0), a2.dy);
     try testing.expectEqual(@as(f64, 110.0), a2.x);
+}
+
+test "pointer: setScreenSize transforms absolute coords to pixels" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    h.input.setScreenSize(1000, 1000);
+    h.fake.pushAbsolute(500.0, 250.0);
+    try h.input.dispatch();
+    const m = h.rec.last().pointer_motion;
+    try testing.expect(m.absolute);
+    try testing.expectEqual(@as(f64, 500.0), m.x);
+    try testing.expectEqual(@as(f64, 250.0), m.y);
 }
 
 test "pointer: buttons carry position; double/triple click window per button" {

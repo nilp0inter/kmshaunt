@@ -319,6 +319,8 @@ pub const LibinputOps = struct {
     pointer_get_dy: *const fn (ev: *Event) callconv(.c) f64,
     pointer_get_absolute_x: *const fn (ev: *Event) callconv(.c) f64,
     pointer_get_absolute_y: *const fn (ev: *Event) callconv(.c) f64,
+    pointer_get_absolute_x_transformed: *const fn (ev: *Event, width: u32) callconv(.c) f64,
+    pointer_get_absolute_y_transformed: *const fn (ev: *Event, height: u32) callconv(.c) f64,
     pointer_get_button: *const fn (ev: *Event) callconv(.c) u32,
     pointer_get_button_state: *const fn (ev: *Event) callconv(.c) c_int,
     pointer_get_axis_value: *const fn (ev: *Event, which: c_int) callconv(.c) f64,
@@ -348,6 +350,8 @@ pub const LibinputOps = struct {
         .pointer_get_dy = Real.pointerGetDy,
         .pointer_get_absolute_x = Real.pointerGetAbsoluteX,
         .pointer_get_absolute_y = Real.pointerGetAbsoluteY,
+        .pointer_get_absolute_x_transformed = Real.pointerGetAbsoluteXTransformed,
+        .pointer_get_absolute_y_transformed = Real.pointerGetAbsoluteYTransformed,
         .pointer_get_button = Real.pointerGetButton,
         .pointer_get_button_state = Real.pointerGetButtonState,
         .pointer_get_axis_value = Real.pointerGetAxisValue,
@@ -439,6 +443,14 @@ const Real = struct {
 
     fn pointerGetAbsoluteY(ev: *Event) callconv(.c) f64 {
         return c.libinput_event_pointer_get_absolute_y(@ptrCast(ev));
+    }
+
+    fn pointerGetAbsoluteXTransformed(ev: *Event, width: u32) callconv(.c) f64 {
+        return c.libinput_event_pointer_get_absolute_x_transformed(@ptrCast(ev), width);
+    }
+
+    fn pointerGetAbsoluteYTransformed(ev: *Event, height: u32) callconv(.c) f64 {
+        return c.libinput_event_pointer_get_absolute_y_transformed(@ptrCast(ev), height);
     }
 
     fn pointerGetButton(ev: *Event) callconv(.c) u32 {
@@ -560,6 +572,10 @@ pub const Input = struct {
     /// position; carried on button events.
     ptr_x: f64 = 0,
     ptr_y: f64 = 0,
+    /// Output size in pixels for absolute-pointer transformation (M5.7);
+    /// 0 = unknown, absolute coords stay in device space.
+    screen_w: u32 = 0,
+    screen_h: u32 = 0,
     clicks: [mouse_button_count]ClickState = @splat(.{}),
     /// Monotonic millisecond clock; injectable for hermetic click tests.
     now_ms: *const fn () i64 = monotonicNowMs,
@@ -830,8 +846,14 @@ pub const Input = struct {
         var dx: f64 = 0;
         var dy: f64 = 0;
         if (absolute) {
-            const x = self.ops.pointer_get_absolute_x(ev);
-            const y = self.ops.pointer_get_absolute_y(ev);
+            const x = if (self.screen_w != 0)
+                self.ops.pointer_get_absolute_x_transformed(ev, self.screen_w)
+            else
+                self.ops.pointer_get_absolute_x(ev);
+            const y = if (self.screen_h != 0)
+                self.ops.pointer_get_absolute_y_transformed(ev, self.screen_h)
+            else
+                self.ops.pointer_get_absolute_y(ev);
             dx = x - self.ptr_x;
             dy = y - self.ptr_y;
             self.ptr_x = x;
@@ -849,6 +871,13 @@ pub const Input = struct {
             .x = self.ptr_x,
             .y = self.ptr_y,
         } });
+    }
+
+    /// Set the output size in pixels so absolute (tablet) coordinates are
+    /// transformed to framebuffer pixels (M5.7 absolute-pointer transform).
+    pub fn setScreenSize(self: *Input, w: u32, h: u32) void {
+        self.screen_w = w;
+        self.screen_h = h;
     }
 
     fn handleButton(self: *Input, ev: *Event) void {
