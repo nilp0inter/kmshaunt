@@ -9,7 +9,7 @@ Last updated: 2026-11-13. This file is ticked as features land; `nix flake check
 | Feature | Status | Evidence / gap |
 |---|---|---|
 | `kmshaunt-vt@.service` as autovt@, getty fallback | ✅ | M1.7/M1.8; T4 m1-login green |
-| Multi-seat `kmshaunt.service` (sd-login) | 🟡 | M6.2 daemon; fake-VT worker wiring in flight; T4 m6-seats S1/S2 green, S3/S4 in flight |
+| Multi-seat `kmshaunt.service` (sd-login) | ✅ | M6.2 daemon + M6.7 fake-VT worker (`KMSHAUNT_SEAT` contract, `worker_exe` spawn, initial-enumerate); T4 m6-seats S1–S4 green BOTH nodes on tensor: S3 session grabs (libseat/fake-VT), S4 second seat gets its own console (Q1 pci-bridge-seat + secondary-vga + usb-kbd; card1 modeset, autologin prompt on video.2, QMP input isolation) |
 | PAM service, locale1 xkb | ✅ | M1.7, M6.5; startup layout now applied |
 | `session-max`, `session-control` | ✅ | M6.3 manager; real-VT gate added |
 | `libseat` backend | ✅ | Startup crash fixed: `setCallbacks` no longer fires queued enable, `activate()` delivers it; T1 real-ops regression + T3 m6-libseat-startup green on tensor (unit active, no segfault, logind greeter seat, autologin shell) |

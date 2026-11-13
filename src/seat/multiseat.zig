@@ -89,7 +89,7 @@
 //! daemon can log it, test for it, or pass it to `configdir` joining
 //! without duplicating the naming rule.
 //!
-//! # Daemon wiring contract (main.zig, later)
+//! # Daemon wiring contract (main.zig runDaemon)
 //!
 //! ```zig
 //! var mon = try multiseat.SeatMonitor.init(alloc, multiseat.SdLoginOps.real);
@@ -102,11 +102,16 @@
 //! // on EPOLLIN (and once at startup):
 //! for (try mon.process()) |change| switch (change) {
 //!     .added => |seat| {
-//!         // config.loadSeat(main, alloc, io, seat.name) gives the merged
-//!         // per-seat config (CLI lock < main < <seat>.seat.conf).
-//!         // Seat backend: FakeVt when seat.needsFakeVt(), else the real
-//!         // VT / libseat backend. The worker also filters udev devices by
-//!         // ID_SEAT == seat.name (reference §6.4).
+//!         // One worker process per seat. The seat name travels in the
+//!         // worker environment (worker_seat_env / workerEnviron below);
+//!         // a worker never re-enters the daemon.
+//!         //   seat.needsFakeVt(): spawn WITHOUT --vt; the worker's
+//!         //     setupSeat selects src/seat/vt_fake.zig (start active,
+//!         //     never switch). config.loadSeat(main, alloc, io,
+//!         //     seat.name) layers <seat>.seat.conf for the worker.
+//!         //   else: spawn with --vt N --no-libseat as before.
+//!         // The worker filters udev devices by ID_SEAT == seat.name
+//!         // (reference §6.4) and reports the name as XDG_SEAT.
 //!         _ = spawnSeatWorker(seat);
 //!     },
 //!     .removed => |seat| stopSeatWorker(seat.name),
@@ -333,6 +338,63 @@ pub fn hasVt(seat_name: []const u8) bool {
 /// joins it with its `configdir`. Caller owns the result.
 pub fn seatConfigName(allocator: std.mem.Allocator, seat_name: []const u8) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(allocator, "{s}.seat.conf", .{seat_name});
+}
+
+// ---------------------------------------------------------------------------
+// Per-seat workers (ROADMAP M6.7): the daemon -> worker contract
+// ---------------------------------------------------------------------------
+
+/// Environment variable carrying the seat name from the daemon to the
+/// worker process it spawns (one process per seat, kmscon's model).
+///
+/// A kmshaunt process started with this variable set is a seat worker:
+/// main.zig runs the single-seat console for it -- never the daemon,
+/// whatever `libseat`/`vt` the inherited config says -- and the console
+/// takes its seat identity from the value, not from the VT backend
+/// (reference G20: real and fake VT backends cannot report a seat name).
+///
+/// The daemon sets it on EVERY worker it spawns:
+///   * seats with a real VT (seat0): the worker keeps `--vt N`; the name
+///     feeds the per-seat config layer and XDG_SEAT.
+///   * seats without a kernel VT (`SeatInfo.needsFakeVt`): the worker is
+///     spawned WITHOUT `--vt`, and the console selects
+///     `src/seat/vt_fake.zig` -- activated once at startup, never
+///     switched (kmscon vt_fake.c:39-41).
+pub const worker_seat_env = "KMSHAUNT_SEAT";
+
+/// argv[0] for a spawned seat worker: the daemon's own executable. A
+/// systemd service's PATH does not reliably contain the kmshaunt binary,
+/// so a bare `"kmshaunt"` fails to resolve (`std.process.spawn` ->
+/// FileNotFound). `/proc/self/exe` is an absolute path to the running
+/// daemon image, which is exactly the program a worker runs (one process
+/// per seat, same binary); `.detect` execs it directly, no PATH lookup.
+pub const worker_exe = "/proc/self/exe";
+
+/// Worker side: the seat this process serves, or null when it was not
+/// spawned by the daemon (the daemon itself, or an ordinary single-seat
+/// console). `environ` is `init.minimal.environ` from main. An empty
+/// value counts as unset: a nameless worker could neither load its
+/// per-seat config nor filter devices by ID_SEAT.
+pub fn workerSeat(environ: std.process.Environ) ?[:0]const u8 {
+    const value = std.process.Environ.getPosix(environ, worker_seat_env) orelse return null;
+    return if (value.len == 0) null else value;
+}
+
+/// Daemon side: the environment for one seat worker -- a copy of the
+/// daemon's own environment plus `KMSHAUNT_SEAT=<seat_name>`. The caller
+/// owns the returned map (`deinit`) and passes it to `std.process.spawn`
+/// as `.environ_map`. Inheriting the daemon environment keeps PATH,
+/// XKB_CONFIG_ROOT and the locale intact for the worker and its login
+/// child; only the seat identity is added.
+pub fn workerEnviron(
+    base: std.process.Environ,
+    allocator: std.mem.Allocator,
+    seat_name: []const u8,
+) std.process.Environ.CreateMapError!std.process.Environ.Map {
+    var map = try std.process.Environ.createMap(base, allocator);
+    errdefer map.deinit();
+    try map.put(worker_seat_env, seat_name);
+    return map;
 }
 
 // ---------------------------------------------------------------------------
@@ -705,3 +767,61 @@ const c_api = struct {
         std.c.free(ptr);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Worker contract tests (hermetic: a static environ block, no C calls).
+// Pulled in by src/test_multiseat.zig and src/tests.zig.
+// ---------------------------------------------------------------------------
+
+/// Build an `Environ` over static `KEY=VALUE` entries. The block is
+/// borrowed, never freed -- exactly the shape the OS hands to main.
+fn testEnviron(comptime entries: []const [:0]const u8) std.process.Environ {
+    const storage = struct {
+        var slice: [entries.len:null]?[*:0]const u8 = undefined;
+    };
+    inline for (entries, 0..) |entry, i| storage.slice[i] = entry.ptr;
+    return .{ .block = .{ .slice = &storage.slice } };
+}
+
+test "workerSeat: reads the daemon-provided seat name" {
+    const env = testEnviron(&.{ "PATH=/bin", "KMSHAUNT_SEAT=seat-pci-0000_00_12_0", "LANG=C" });
+    const name = workerSeat(env) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("seat-pci-0000_00_12_0", name);
+}
+
+test "workerSeat: null without the variable and on an empty value" {
+    try std.testing.expect(workerSeat(testEnviron(&.{"PATH=/bin"})) == null);
+    try std.testing.expect(workerSeat(testEnviron(&.{})) == null);
+    // An empty name cannot identify a seat: treat it as unset.
+    try std.testing.expect(workerSeat(testEnviron(&.{"KMSHAUNT_SEAT="})) == null);
+}
+
+test "workerEnviron: inherits the daemon environment and adds the seat" {
+    const a = std.testing.allocator;
+    const base = testEnviron(&.{ "PATH=/bin", "XKB_CONFIG_ROOT=/xkb", "KMSHAUNT_SEAT=stale" });
+    var map = try workerEnviron(base, a, "seat1");
+    defer map.deinit();
+
+    // Everything the daemon had survives (the worker's login child needs
+    // PATH and XKB_CONFIG_ROOT), and the seat identity is the new name --
+    // a stale value from the daemon's own environment is overwritten.
+    try std.testing.expectEqualStrings("/bin", map.get("PATH").?);
+    try std.testing.expectEqualStrings("/xkb", map.get("XKB_CONFIG_ROOT").?);
+    try std.testing.expectEqualStrings("seat1", map.get(worker_seat_env).?);
+    try std.testing.expectEqual(@as(usize, 3), map.count());
+}
+
+test "workerEnviron: round-trips through workerSeat" {
+    const a = std.testing.allocator;
+    var map = try workerEnviron(testEnviron(&.{}), a, "seat-pci-0000_00_12_0");
+    defer map.deinit();
+
+    // The map is what std.process.spawn hands to the child; rebuild the
+    // child-side view (a POSIX block) and read it back the way main.zig
+    // does. This pins the daemon -> worker direction end to end.
+    const block = try map.createPosixBlock(a, .{});
+    defer block.deinit(a);
+    const child_env = std.process.Environ{ .block = .{ .slice = block.slice } };
+    const name = workerSeat(child_env) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("seat-pci-0000_00_12_0", name);
+}
