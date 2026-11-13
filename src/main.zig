@@ -33,8 +33,10 @@
 //!     repeat through a `loop.Timer` adapter, VT-switch grabs handled here.
 //!  9. Each terminal's pty master registered EPOLLIN edge-triggered.
 //! 10. Frame loop paced by a one-shot frame timer (one display refresh)
-//!     plus DRM page-flip completion events; DPMS + cursor-blink +
-//!     kitty-animation timers.
+//!     plus DRM page-flip completion events; under a sustained output burst
+//!     the frame period stretches so render+present occupies a bounded
+//!     fraction of the loop and the pty keeps draining (M8.1). DPMS +
+//!     cursor-blink + kitty-animation timers.
 //! 11. issue text, asciicast playback, locale1 live keymap follow.
 //! 12. `loop.run`; SIGTERM/INT (or oneshot child exit) stops it; everything
 //!     is deinitialised in reverse order.
@@ -229,6 +231,17 @@ const kdmktone: u32 = 0x4B30;
 const blink_interval_ns: u64 = 500 * std.time.ns_per_ms;
 /// Throttle before respawning a login child that exited (non-oneshot).
 const respawn_delay_ns: u64 = 500 * std.time.ns_per_ms;
+/// M8.1 burst pacing: render+present runs in the single-threaded loop, so
+/// rendering every refresh while output floods in caps pty consumption at
+/// parse_rate * (1 - render_duty). While a burst is active the frame period
+/// stretches so rendering occupies at most ~1/(1+factor) of the loop time
+/// and the pty drains during the deferral. Cheap frames (small damage) keep
+/// the refresh period, and idle/interactive damage is never delayed: the
+/// burst gate requires a pty pump within the last refresh.
+const burst_stretch_factor: u64 = 9;
+/// Cap on the burst stretch: even a pathologically expensive frame must
+/// not hold the visible console still longer than this.
+const max_frame_stretch_ns: u64 = 1 * std.time.ns_per_s;
 /// Zoom bounds (px) for grab-zoom-in/out. kmscon floors zoom-out at 1 px;
 /// no max is configured, so kmshaunt caps at a readable upper bound (M3.8).
 const min_font_px: u16 = 1;
@@ -545,6 +558,15 @@ const Console = struct {
     respawn_pending: ?*terminal.TerminalSession = null,
     /// A frame timer arm is in flight (pins the deadline under load).
     frame_armed: bool = false,
+    /// EWMA render+present cost (ns); drives the burst frame stretch.
+    frame_cost_ns: u64 = 0,
+    /// Monotonic deadline before which a burst frame may be deferred.
+    frame_due_ns: i64 = 0,
+    /// When the armed frame timer fires (ns); lets a pending full redraw
+    /// preempt a burst-deferred arm without re-arming on every markDirty.
+    frame_arm_deadline_ns: i64 = 0,
+    /// Last pty pump completion (ns); the burst-activity gate.
+    last_pump_ns: i64 = 0,
 
     // -- lifecycle ---------------------------------------------------------
 
@@ -1287,12 +1309,22 @@ const Console = struct {
     /// Re-arming on every markDirty would push the deadline back forever
     /// under continuous output (starvation), so the armed flag pins it.
     fn scheduleFrame(self: *Console) void {
-        if (self.frame_armed) return;
-        self.frame_timer.armOneShot(self.frameIntervalNs()) catch |err| {
+        const interval = self.frameIntervalNs();
+        const now = monotonicNs();
+        if (self.frame_armed) {
+            // A pending full redraw must not wait out a burst deferral: if
+            // the current arm fires later than one refresh from now, re-arm
+            // promptly. Once re-armed at `interval` the deadline is pinned
+            // again, so repeated markDirty cannot starve it.
+            const prompt = now + @as(i64, @intCast(interval));
+            if (!(self.full_redraw and self.frame_arm_deadline_ns > prompt)) return;
+        }
+        self.frame_timer.armOneShot(interval) catch |err| {
             log.warn("frame timer: {t}", .{err});
             return;
         };
         self.frame_armed = true;
+        self.frame_arm_deadline_ns = now + @as(i64, @intCast(interval));
     }
 
     /// One display refresh, clamped to 4..50 ms so a bogus mode can neither
@@ -1302,6 +1334,29 @@ const Console = struct {
         if (mhz == 0) return 16_666_667;
         const ns = @as(u64, 1_000_000_000_000) / @as(u64, mhz);
         return std.math.clamp(ns, 4 * std.time.ns_per_ms, 50 * std.time.ns_per_ms);
+    }
+
+    /// Burst frame deferral (M8.1). While pty output is flooding in, hold
+    /// the frame until `frame_due_ns` so render+present occupies a bounded
+    /// fraction of the loop; the pty drains during the deferral, which is
+    /// what output-throughput benchmarks measure. Returns true when the
+    /// frame was deferred (the frame timer is armed for the deadline).
+    /// Full redraws and interactive damage (no pump within the last
+    /// refresh) render immediately, and a due deadline always renders, so
+    /// the last frame of a burst is at most one stretch late.
+    fn deferBurstFrame(self: *Console) bool {
+        if (self.full_redraw) return false;
+        const now = monotonicNs();
+        if (now >= self.frame_due_ns) return false;
+        const interval: i64 = @intCast(self.frameIntervalNs());
+        if (now - self.last_pump_ns >= interval) return false;
+        self.frame_timer.armOneShot(@intCast(self.frame_due_ns - now)) catch |err| {
+            log.warn("frame timer: {t}", .{err});
+            return false;
+        };
+        self.frame_armed = true;
+        self.frame_arm_deadline_ns = self.frame_due_ns;
+        return true;
     }
 
     fn onFrameTimer(_: *loop.Timer, expirations: u64, ud: usize) void {
@@ -1339,11 +1394,13 @@ const Console = struct {
     /// flip was in flight); fbdev is synchronous (flipPending always false).
     /// The session renders once into the shared shadow canvas, which is then
     /// presented into every output's back buffer through its viewport plan
-    /// (M5.4).
+    /// (M5.4). While a burst is active the frame may be deferred to its
+    /// stretch deadline (deferBurstFrame) so the pty drains between frames.
     fn renderIfDirty(self: *Console) void {
         if (!self.dirty or self.dpms_off or !self.seat_active) return;
         if (self.anyFlipPending()) return;
         if (self.mgr == null or self.shadow == null) return;
+        if (self.deferBurstFrame()) return;
         const m = &self.mgr.?;
         const shadow = &self.shadow.?;
 
@@ -1359,6 +1416,7 @@ const Console = struct {
         // Kitty pixels come from the active session's terminal (M4);
         // the render state alone cannot reach the storage.
         self.renderer.?.vt = if (self.activeTerminal()) |ts| &ts.vt else null;
+        const t0 = monotonicNs();
         m.render(&ctx) catch |err| {
             log.warn("render: {t}", .{err});
             return;
@@ -1374,6 +1432,15 @@ const Console = struct {
                 self.present(DrmFrame{ .drm = o.drm, .ci = o.ci }, o.plan, &o.prev_damage);
             }
         }
+        const t2 = monotonicNs();
+        // Burst pacing: remember the frame cost and set the next frame's
+        // earliest due time. The EWMA rises slowly and falls fast (capped
+        // at 2x the last frame), so a burst that turns into a trickle
+        // re-paces to per-refresh rendering within a frame or two.
+        const cost: u64 = @intCast(t2 - t0);
+        self.frame_cost_ns = burstCostEwma(self.frame_cost_ns, cost);
+        const stretch = burstStretchNs(self.frame_cost_ns, self.frameIntervalNs());
+        self.frame_due_ns = t2 + @as(i64, @intCast(stretch));
         self.dirty = false;
         self.full_redraw = false;
     }
@@ -1957,6 +2024,7 @@ const Console = struct {
             log.warn("pty pump: {t}", .{err});
             return;
         };
+        self.last_pump_ns = monotonicNs();
         self.markDirty();
         if (more) {
             // Budget exhausted: re-arm the edge-triggered source. MOD
@@ -2058,6 +2126,11 @@ const Console = struct {
         // terminal.c:978); the key itself still reaches the session.
         if (event == .key) self.stopPlayback();
         if (self.mgr) |*m| m.onInput(event) catch |err| log.warn("onInput: {t}", .{err});
+        // Interactive input is never held by the burst stretch: clear the
+        // deferral deadline and re-arm the frame timer at the normal refresh
+        // (a deferred arm would otherwise keep the echo waiting).
+        self.frame_due_ns = 0;
+        self.frame_armed = false;
         self.markDirty();
     }
 
@@ -2087,6 +2160,25 @@ const Console = struct {
         }
     }
 };
+
+/// Blend a frame's measured render+present cost into the running estimate.
+/// The EWMA rises slowly (1/4 weight on the new sample) but falls fast: it
+/// is capped at 2x the latest frame, so a burst that turns into a trickle
+/// re-paces to per-refresh rendering within a frame or two. A zero estimate
+/// (first frame) adopts the sample outright.
+fn burstCostEwma(prev_ns: u64, cost_ns: u64) u64 {
+    const avg = if (prev_ns == 0) cost_ns else (3 * prev_ns + cost_ns) / 4;
+    return @min(avg, cost_ns * 2);
+}
+
+/// Earliest delay before the next burst frame: the measured cost scaled so
+/// render+present occupies ~1/(1+factor) of the loop, never shorter than one
+/// display refresh and never longer than the stretch cap. Cheap frames thus
+/// keep the refresh period; only expensive frames stretch the frame clock.
+fn burstStretchNs(cost_ns: u64, interval_ns: u64) u64 {
+    const scaled = @min(cost_ns * burst_stretch_factor, max_frame_stretch_ns);
+    return @max(interval_ns, scaled);
+}
 
 /// Non-temporal row copy: 64-byte unrolled movntdq stores with a regular
 /// memcpy tail. `dst` must be 16-byte aligned (movntdq requirement);
@@ -2126,6 +2218,13 @@ fn monotonicMs() u64 {
     _ = linux.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s +
         @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
+
+/// Monotonic clock in nanoseconds (same source as monotonicMs).
+fn monotonicNs() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
 /// Delay until the next animation frame is due, floored at 1 ms: a due
@@ -2761,4 +2860,28 @@ test "rebootAction: 0 soft, nonzero hard, unreadable defaults soft (kmscon)" {
     try std.testing.expectEqual(RebootAction.hard, rebootAction(2));
     try std.testing.expectEqual(RebootAction.hard, rebootAction(-1));
     try std.testing.expectEqual(RebootAction.soft, rebootAction(null));
+}
+
+test "burstCostEwma: first sample adopted, rises slowly, falls fast" {
+    // First frame adopts the sample outright.
+    try std.testing.expectEqual(@as(u64, 8_000_000), burstCostEwma(0, 8_000_000));
+    // Rising: 1/4 weight on the new sample (3*8 + 16)/4 = 10.
+    try std.testing.expectEqual(@as(u64, 10_000_000), burstCostEwma(8_000_000, 16_000_000));
+    // Falling: capped at 2x the latest frame, so a cheap frame after a burst
+    // collapses the estimate immediately (min((3*16+1)/4=12, 2*1=2) = 2).
+    try std.testing.expectEqual(@as(u64, 2_000_000), burstCostEwma(16_000_000, 1_000_000));
+    // A zero-cost frame drives the estimate to zero.
+    try std.testing.expectEqual(@as(u64, 0), burstCostEwma(16_000_000, 0));
+}
+
+test "burstStretchNs: refresh floor, cost scaling, stretch cap" {
+    const refresh: u64 = 16_666_667;
+    // Cheap frame: never shorter than one refresh.
+    try std.testing.expectEqual(refresh, burstStretchNs(1_000_000, refresh));
+    // Expensive frame: cost * factor (8 ms * 9 = 72 ms).
+    try std.testing.expectEqual(@as(u64, 72_000_000), burstStretchNs(8_000_000, refresh));
+    // Pathological frame: capped at the stretch ceiling.
+    try std.testing.expectEqual(max_frame_stretch_ns, burstStretchNs(10 * std.time.ns_per_s, refresh));
+    // Zero cost still yields one refresh.
+    try std.testing.expectEqual(refresh, burstStretchNs(0, refresh));
 }

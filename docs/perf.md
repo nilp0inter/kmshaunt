@@ -7,7 +7,7 @@ Status of the M8 items:
 
 | Item | Status |
 |---|---|
-| M8.1 vtebench throughput vs kmscon | kmscon measured (full suite); kmshaunt suite did not finish in 900 s — GAP, see below |
+| M8.1 vtebench throughput vs kmscon | cell/unicode gap closed by burst coalescing (FramePacing, see below); all 10 benchmarks at or above kmscon |
 | M8.2 damage-only presentation | drm2d + drm3d implemented (evidence below) |
 | M8.3 memory @ 10k scrollback | measured: kmscon 57.7 MiB, kmshaunt 34.7 MiB peak RSS; sb-size byte-cap fixed (setScrollbackMaxBytes), re-measure pending |
 | M8.4 T5 real hardware | HARDWARE-BLOCKED for the ≥2-vendor exit criterion (assessment below) |
@@ -169,6 +169,65 @@ Raw data: test output `kmscon.dat` (221 lines of per-sample ms),
 screenshots `m8-{kmscon,kmshaunt}-login.png`,
 `m8-kmscon-vtebench-results.png`. The kmshaunt memory subtest and both
 logins passed; VT switching between the two consoles in one VM works.
+
+### Frame pacing: burst coalescing (2026-11-13, FramePacing)
+
+The remaining cell/unicode gap after PerfFix was **render duty**, not
+collection or parse speed. `renderIfDirty` (render + shadow→back-buffer
+present) runs synchronously in the single-threaded epoll loop, so while a
+burst renders every display refresh the pty pump only runs in the gaps:
+`throughput = parse_rate × (1 − render_duty)`. Loop instrumentation (2 s
+windows, `src/main.zig` probe) showed the cell benchmarks spending ~32% of
+the loop in render+present (the write-combining back-buffer blit is
+~7–8 ms/frame in the VM even with non-temporal stores) and unicode ~90%+
+(glyph rasterization ~40–190 ms/frame), starving the pump. vtebench times
+how long writes block, i.e. how fast the console *consumes* — so the
+render path, not the parser, was the cap.
+
+Fix (`src/main.zig`): **adaptive burst coalescing**. Each frame's
+render+present cost is tracked (`burstCostEwma`); while pty output is
+flooding in, the next frame is deferred to a deadline that stretches the
+frame period (`burstStretchNs`, factor 9, cap 1 s) so render+present
+occupies ≤ ~10% of the loop and the pty drains during the deferral.
+Correctness/latency guards:
+
+- Idle/interactive damage is never delayed: the burst gate requires a pty
+  pump within the last refresh, and input clears the deadline and re-arms.
+- A pending full redraw (VT switch, DPMS wake, zoom/rotate, hotplug)
+  preempts a deferred arm (`frame_arm_deadline_ns`).
+- Every frame is still a tear-free double-buffered page flip; when idle no
+  timer is armed (no busy-loop). Cheap frames keep the refresh period.
+
+Full harness re-run (`just m8-perf`, ONE VM, both consoles, default
+`--min-bytes 1048576 --max-secs 10 --warmup 1`, mode 1280x800, grid 50x160,
+sb-size=10000) — the authoritative same-VM comparison:
+
+| benchmark | kmscon MiB/s | kmshaunt MiB/s | ratio |
+|---|---|---|---|
+| cursor_motion | 34.8 | 61.1 | 1.76 |
+| dense_cells | 39.4 | 66.2 | 1.68 |
+| light_cells | 76.9 | 108.2 | 1.41 |
+| scrolling | 4.2 | 6.0 | 1.43 |
+| scrolling_bottom_region | 5.2 | 7.1 | 1.37 |
+| scrolling_bottom_small_region | 5.2 | 7.2 | 1.39 |
+| scrolling_fullscreen | 33.1 | 54.1 | 1.64 |
+| scrolling_top_region | 5.4 | 7.1 | 1.31 |
+| scrolling_top_small_region | 5.2 | 7.2 | 1.40 |
+| unicode | 60.3 | 72.3 | 1.20 |
+
+**All 10 benchmarks meet or exceed kmscon (1.20–1.76×): the M8.1 target is
+met.** Before the fix (pre-fix tree, same-config pacing probe) the five gap
+benchmarks were cursor_motion 24.2, dense_cells 22.6, light_cells 39.7,
+scrolling_fullscreen 21.8, unicode 2.7 MiB/s. Pump duty rose from ~66% to
+~90% (cells) and ~10% to ~85% (unicode); render frequency dropped ~10×.
+Both logins, VT switching, and the memory subtest passed; kmshaunt peak RSS
+after seq was 38,884 kB vs kmscon 59,200 kB.
+
+Tradeoff: during a sustained burst the visible console updates at the
+stretched frame rate (down to ~1/s for expensive unicode frames) rather
+than every refresh — a throughput-vs-display-latency trade, **not** tearing
+(flips stay vblank-synced). Interactive echo and full redraws are exempt;
+idle rendering is unchanged.
 
 ## M8.3 — memory with 10,000 lines of scrollback
 
