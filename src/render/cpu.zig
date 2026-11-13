@@ -31,13 +31,15 @@
 //!
 //! # Text pipeline (M3)
 //!
-//! The redraw set is collected ONCE per frame into a row-major snapshot
-//! (a single render-state cell walk): the FULL grapheme cluster from
-//! `GRAPHEMES_UTF8` is decoded into codepoints, colors are resolved once,
-//! and each base codepoint is assigned a face-table slot (style variant
-//! first, then the per-codepoint fontconfig fallback). Backgrounds paint
-//! from the snapshot and the text pass reuses it, so the per-cell C API
-//! is walked once per frame, not twice (M8.1).
+//! The redraw set is collected ONCE per frame into a row-major snapshot.
+//! Collection reads each row's packed cells through the bulk `CELLS_RAW`
+//! view (one FFI call per row) and decodes them in Zig; plain cells need
+//! no per-cell C API at all, styled/grapheme cells fall back to the
+//! iterator's batched read (M8.1). The FULL grapheme cluster is decoded
+//! into codepoints, colors are resolved once, and each base codepoint is
+//! assigned a face-table slot (style variant first, then the per-codepoint
+//! fontconfig fallback). Backgrounds paint from the snapshot (runs of
+//! equal background collapse to one fill) and the text pass reuses it.
 //! `shaper.groupRuns` splits the row into same-face/same-style runs with
 //! the cursor isolated; each run is shaped with HarfBuzz and the glyphs
 //! are mapped back to cells through their cluster values:
@@ -57,6 +59,10 @@
 //!   both through font/color.zig) land on the atlas bgra8 page as
 //!   premultiplied BGRA and composite source-over onto the cell
 //!   background. Sprites (font/sprite.zig) take precedence over shaping.
+//! * Repeated (glyph, fg, bg) tuples over an untouched uniform background
+//!   (the unicode benchmark's .notdef tofu across CJK cells) blend ONCE
+//!   into a cached bitmap and memcpy-blit thereafter (M8.1 composited
+//!   cache); bit-identical to the per-pixel source-over blend.
 //!
 //! Font features: `Options.font_features` carries the session's
 //! font-features strings, parsed with `shaper.Feature.parse` on top of the
@@ -195,6 +201,14 @@ pub const CpuRenderer = struct {
     cluster_descs: std.ArrayListUnmanaged(shaper.CellDesc) = .empty,
     /// M8.1: shaped complex clusters, reused across cells/frames.
     cluster_cache: ClusterCache,
+    /// M8.1: composited (glyph, fg, bg) bitmaps; a repeated tuple blends
+    /// once and memcpy-blits thereafter (the unicode benchmark's tofu).
+    composite: CompositeCache,
+    /// Per-cell "already drawn on this frame" flags, row-major rows×cols.
+    /// The background pass clears each redrawn row; every glyph/sprite
+    /// blit marks the cells it covers, so the composited cache only ever
+    /// replaces pixels that still show the uniform collected background.
+    cell_inked: []bool = &.{},
 
     // ---- M4 kitty image state ----
 
@@ -214,6 +228,10 @@ pub const CpuRenderer = struct {
     prev_placements: std.ArrayListUnmanaged(image.Placement) = .empty,
     /// Per-row redraw flags for the current frame, sized to `rows`.
     redraw_rows: []bool = &.{},
+    /// Per-row flags: a kitty placement touches the row (this frame's or
+    /// the previous frame's list). Image pixels under the text break the
+    /// uniform-background assumption of the composited cache.
+    image_rows: []bool = &.{},
     /// Per-row flags: the row holds SGR-blink cells. collectRow refreshes
     /// the flag of every drawn row; a blink-phase flip repaints the marked
     /// rows even when the render state is clean (M2.4).
@@ -265,6 +283,7 @@ pub const CpuRenderer = struct {
             .image_cache = image.ImageCache.init(allocator, image_cache_limit_bytes),
             .shaper = shaper.Shaper.init(allocator),
             .cluster_cache = ClusterCache.init(allocator),
+            .composite = CompositeCache.init(allocator),
             .style_faces = .{ face.*, null, null, null },
         };
         errdefer self.deinit();
@@ -285,6 +304,7 @@ pub const CpuRenderer = struct {
         self.sprite_cps.deinit(self.allocator);
         self.shaper.deinit();
         self.cluster_cache.deinit();
+        self.composite.deinit();
         self.features.deinit(self.allocator);
         self.faces.deinit(self.allocator);
         self.fallback_faces.deinit(self.allocator);
@@ -294,6 +314,7 @@ pub const CpuRenderer = struct {
         if (self.grid_cells.len > 0) self.allocator.free(self.grid_cells);
         if (self.grid_descs.len > 0) self.allocator.free(self.grid_descs);
         if (self.row_lens.len > 0) self.allocator.free(self.row_lens);
+        if (self.cell_inked.len > 0) self.allocator.free(self.cell_inked);
         self.row_cps.deinit(self.allocator);
         self.cluster_descs.deinit(self.allocator);
         self.image_cache.deinit();
@@ -301,6 +322,7 @@ pub const CpuRenderer = struct {
         self.prev_placements.deinit(self.allocator);
         if (self.redraw_rows.len > 0) self.allocator.free(self.redraw_rows);
         if (self.blink_rows.len > 0) self.allocator.free(self.blink_rows);
+        if (self.image_rows.len > 0) self.allocator.free(self.image_rows);
     }
 
     pub fn renderer(self: *CpuRenderer) render.Renderer {
@@ -325,6 +347,8 @@ pub const CpuRenderer = struct {
         if (grid_n != self.grid_cells.len) {
             self.grid_cells = try self.allocator.realloc(self.grid_cells, grid_n);
             self.grid_descs = try self.allocator.realloc(self.grid_descs, grid_n);
+            self.cell_inked = try self.allocator.realloc(self.cell_inked, grid_n);
+            @memset(self.cell_inked, false);
         }
         if (rows != self.row_lens.len) {
             self.row_lens = try self.allocator.realloc(self.row_lens, rows);
@@ -334,9 +358,11 @@ pub const CpuRenderer = struct {
         if (rows != self.redraw_rows.len) {
             self.redraw_rows = try self.allocator.realloc(self.redraw_rows, rows);
             self.blink_rows = try self.allocator.realloc(self.blink_rows, rows);
+            self.image_rows = try self.allocator.realloc(self.image_rows, rows);
             // Row indices shift with the grid; the next redraw rebuilds
             // the flags from the cells.
             @memset(self.blink_rows, false);
+            @memset(self.image_rows, false);
         }
         self.cols = cols;
         self.rows = rows;
@@ -406,6 +432,7 @@ pub const CpuRenderer = struct {
                 if (vy >= 0 and vy < self.rows) self.redraw_rows[@intCast(vy)] = true;
             }
         }
+        @memset(self.image_rows, false);
         for (self.placements.items) |p| self.markImageRows(p.dst);
         for (self.prev_placements.items) |p| self.markImageRows(p.dst);
         if (blink_changed) {
@@ -427,7 +454,7 @@ pub const CpuRenderer = struct {
         // background pass collects the whole redraw set into the frame
         // snapshot; the text pass draws from it (one cell walk, M8.1).
         try self.compositeImages(f, .below_background);
-        try self.collectAndDrawBackgrounds(f, state, opts, cursor);
+        try self.collectAndDrawBackgrounds(f, state, opts, cursor, colors);
         try self.compositeImages(f, .below_text);
         try self.drawRowsText(f, opts, cursor);
         try self.compositeImages(f, .above_text);
@@ -471,6 +498,7 @@ pub const CpuRenderer = struct {
         state: *vt.RenderState,
         opts: RenderOpts,
         cursor: CursorDraw,
+        colors: vt.Colors,
     ) !void {
         // Collection writes into the per-row scratch; the text pass
         // re-points row_cells/descs at the snapshot rows.
@@ -486,17 +514,34 @@ pub const CpuRenderer = struct {
             if (vy < 0 or vy >= self.rows) continue; // overscan row
             const y: u16 = @intCast(vy);
             if (!self.redraw_rows[y]) continue;
-            const n = try self.collectRow(&row, y, opts, cursor);
+            const n = try self.collectRow(&row, y, opts, cursor, colors);
             self.row_lens[y] = @intCast(n);
             const base = @as(usize, y) * self.cols;
             @memcpy(self.grid_cells[base..][0..n], self.row_scratch[0..n]);
             @memcpy(self.grid_descs[base..][0..n], self.desc_scratch[0..n]);
+            // The row is rebuilt from its background: drop last frame's
+            // ink marks so the composited cache may serve it again.
+            @memset(self.cell_inked[base..][0..self.cols], false);
             const y_px: i32 = @as(i32, y) * ch;
-            for (self.grid_cells[base..][0..n], 0..) |*rc, x| {
-                const x_px: i32 = @as(i32, @intCast(x)) * cw;
-                fillCell(f, x_px, y_px, cw, ch, rc.bg);
-                if (rc.is_cursor and cursor.style == .block)
-                    deco.drawCursor(f.*, x_px, y_px, cw, ch, .block, cursor.color, true);
+            const row_cells = self.grid_cells[base..][0..n];
+            // Paint runs of equal background as one rect (M8.1): plain
+            // rows collapse to a single fill instead of one per cell.
+            var x: usize = 0;
+            while (x < n) {
+                const bg = row_cells[x].bg;
+                var x1 = x + 1;
+                while (x1 < n and row_cells[x1].bg == bg) : (x1 += 1) {}
+                const run_w: u16 = @intCast((x1 - x) * @as(usize, cw));
+                fillCell(f, @as(i32, @intCast(x)) * cw, y_px, run_w, ch, bg);
+                for (row_cells[x..x1], x..) |*rc, cx| {
+                    if (rc.is_cursor and cursor.style == .block) {
+                        const x_px: i32 = @as(i32, @intCast(cx)) * cw;
+                        deco.drawCursor(f.*, x_px, y_px, cw, ch, .block, cursor.color, true);
+                        // The overlay replaces the collected background.
+                        self.cell_inked[base + cx] = true;
+                    }
+                }
+                x = x1;
             }
         }
     }
@@ -706,7 +751,10 @@ pub const CpuRenderer = struct {
         if (y0 >= self.rows) return; // stale rect from a larger grid
         const y1 = @min((dst.y + dst.h - 1) / ch, self.rows - 1);
         var y = y0;
-        while (y <= y1) : (y += 1) self.redraw_rows[y] = true;
+        while (y <= y1) : (y += 1) {
+            self.redraw_rows[y] = true;
+            self.image_rows[y] = true;
+        }
     }
 
     /// One interleaving pass over the drawing list. CacheFull degrades
@@ -736,7 +784,75 @@ pub const CpuRenderer = struct {
     /// (the render state's borrowed text dies on the next `cells.next`;
     /// the caller clears `row_cps` once per frame). Colors resolve once
     /// per cell; the block-cursor overlay applies to the glyph foreground.
+    ///
+    /// M8.1 bulk path: one CELLS_RAW read fetches the whole row's packed
+    /// cells; plain cells (default style, single codepoint or background
+    /// only) decode in Zig with ZERO per-cell FFI. Styled cells and
+    /// grapheme clusters fall back to the iterator's batched read.
     fn collectRow(
+        self: *CpuRenderer,
+        row: *const vt.Row,
+        y: u16,
+        opts: RenderOpts,
+        cursor: CursorDraw,
+        colors: vt.Colors,
+    ) !usize {
+        const raws = row.cellsRaw() catch |err| switch (err) {
+            error.Unsupported => return self.collectRowIter(row, y, opts, cursor),
+            else => return err,
+        };
+        const cell_layout = vt.cellLayout() catch return self.collectRowIter(row, y, opts, cursor);
+        const sel = try row.selection();
+        const blink_off = if (opts.cursor_blink_on) |on| !on else false;
+        var row_blink = false;
+        var cells: ?vt.Cells = null; // positioned lazily on the first slow cell
+        const n = @min(raws.len, self.cols);
+        for (raws[0..n], 0..) |raw, xi| {
+            const x: u16 = @intCast(xi);
+            const dec = cell_layout.decode(raw);
+            if (dec.style_id != 0 or dec.tag == .codepoint_grapheme) {
+                if (cells == null) cells = try row.cells();
+                const bs = try cells.?.selectForBulk(x, dec);
+                const cell: vt.Cell = .{
+                    .text = bs.text,
+                    .style = bs.style,
+                    .fg = null,
+                    .bg = bs.bg,
+                    .wide = dec.wide,
+                    .selected = if (sel) |s| x >= s.start_x and x <= s.end_x else false,
+                    .has_styling = dec.style_id != 0,
+                };
+                // Grapheme clusters decode from the borrowed UTF-8; every
+                // other cell uses the raw codepoint directly (no roundtrip).
+                const direct_cp: ?u21 = if (dec.tag == .codepoint_grapheme) null else dec.codepoint;
+                try self.collectOne(x, y, &cell, direct_cp, opts, cursor, blink_off, &row_blink);
+            } else {
+                // Plain cell: the default style and the raw codepoint are
+                // the whole story; background-color content resolves through
+                // the render palette exactly like the library's BG_COLOR.
+                const bg: ?vt.Rgb = switch (dec.tag) {
+                    .bg_color_palette => colors.palette[dec.bg_palette],
+                    .bg_color_rgb => dec.bg_rgb,
+                    else => null,
+                };
+                const cell: vt.Cell = .{
+                    .text = &.{},
+                    .style = vt.Style.default,
+                    .fg = null,
+                    .bg = bg,
+                    .wide = dec.wide,
+                    .selected = if (sel) |s| x >= s.start_x and x <= s.end_x else false,
+                    .has_styling = false,
+                };
+                try self.collectOne(x, y, &cell, dec.codepoint, opts, cursor, blink_off, &row_blink);
+            }
+        }
+        self.blink_rows[y] = row_blink;
+        return n;
+    }
+
+    /// Iterator fallback for libraries without the bulk view / manifest.
+    fn collectRowIter(
         self: *CpuRenderer,
         row: *const vt.Row,
         y: u16,
@@ -749,64 +865,86 @@ pub const CpuRenderer = struct {
         var x: u16 = 0;
         while (try cells.next()) |cell| {
             if (x >= self.cols) break;
-            const cc = resolveColors(&cell, opts);
-            const is_cursor = cursor.active and x == cursor.x and y == cursor.y;
-            var fg = cc.fg;
-            if (is_cursor and cursor.style == .block)
-                fg = deco.cursorOverlayColor(cc.bg, cursor.color);
-
-            const cps_start: u32 = @intCast(self.row_cps.items.len);
-            var n_cps: u32 = 0;
-            if (cell.text.len > 0) {
-                if (std.unicode.Utf8View.init(cell.text)) |view| {
-                    var it = view.iterator();
-                    while (it.nextCodepoint()) |cp| {
-                        try self.row_cps.append(self.allocator, cp);
-                        n_cps += 1;
-                    }
-                } else |_| {} // malformed UTF-8: draw nothing (M1 behavior)
-            }
-            const base_cp: u21 = if (n_cps > 0) self.row_cps.items[cps_start] else 0;
-            const width: u8 = switch (cell.wide) {
-                .narrow => 1,
-                .wide => 2,
-                .spacer_tail, .spacer_head => 0,
-            };
-            // SGR blink hides the glyph on the off-phase, like invisible
-            // (the background still paints; M2.4).
-            if (cell.style.flags.blink) row_blink = true;
-            const invisible = !deco.shouldDraw(cell.style.flags.invisible) or
-                (blink_off and cell.style.flags.blink);
-            const is_sprite = n_cps > 0 and sprite.isSprite(base_cp);
-            const bold = cell.style.flags.bold;
-            const italic = cell.style.flags.italic;
-            var face_id: u16 = 0;
-            if (base_cp != 0 and !is_sprite and !invisible and width != 0)
-                face_id = try self.faceForCell(base_cp, bold, italic);
-
-            self.row_cells[x] = .{
-                .style = cell.style,
-                .fg = fg,
-                .bg = cc.bg,
-                .cps_start = cps_start,
-                .n_cps = n_cps,
-                .face_id = face_id,
-                .width = width,
-                .is_cursor = is_cursor,
-                .sprite = is_sprite,
-                .invisible = invisible,
-            };
-            self.descs[x] = .{
-                .face_id = face_id,
-                .style_flags = @as(u8, @intFromBool(bold)) | (@as(u8, @intFromBool(italic)) << 1),
-                .codepoint = base_cp,
-                .is_cursor = is_cursor,
-                .width = width,
-            };
+            try self.collectOne(x, y, &cell, null, opts, cursor, blink_off, &row_blink);
             x += 1;
         }
         self.blink_rows[y] = row_blink;
         return x;
+    }
+
+    /// Per-cell collection shared by the bulk and iterator paths.
+    /// `direct_cp` is the bulk path's decoded codepoint (0 = no text);
+    /// null decodes the cluster from the cell's borrowed UTF-8 instead.
+    fn collectOne(
+        self: *CpuRenderer,
+        x: u16,
+        y: u16,
+        cell: *const vt.Cell,
+        direct_cp: ?u21,
+        opts: RenderOpts,
+        cursor: CursorDraw,
+        blink_off: bool,
+        row_blink: *bool,
+    ) !void {
+        const cc = resolveColors(cell, opts);
+        const is_cursor = cursor.active and x == cursor.x and y == cursor.y;
+        var fg = cc.fg;
+        if (is_cursor and cursor.style == .block)
+            fg = deco.cursorOverlayColor(cc.bg, cursor.color);
+
+        const cps_start: u32 = @intCast(self.row_cps.items.len);
+        var n_cps: u32 = 0;
+        if (direct_cp) |cp| {
+            if (cp != 0) {
+                try self.row_cps.append(self.allocator, cp);
+                n_cps = 1;
+            }
+        } else if (cell.text.len > 0) {
+            if (std.unicode.Utf8View.init(cell.text)) |view| {
+                var it = view.iterator();
+                while (it.nextCodepoint()) |cp| {
+                    try self.row_cps.append(self.allocator, cp);
+                    n_cps += 1;
+                }
+            } else |_| {} // malformed UTF-8: draw nothing (M1 behavior)
+        }
+        const base_cp: u21 = if (n_cps > 0) self.row_cps.items[cps_start] else 0;
+        const width: u8 = switch (cell.wide) {
+            .narrow => 1,
+            .wide => 2,
+            .spacer_tail, .spacer_head => 0,
+        };
+        // SGR blink hides the glyph on the off-phase, like invisible
+        // (the background still paints; M2.4).
+        if (cell.style.flags.blink) row_blink.* = true;
+        const invisible = !deco.shouldDraw(cell.style.flags.invisible) or
+            (blink_off and cell.style.flags.blink);
+        const is_sprite = n_cps > 0 and sprite.isSprite(base_cp);
+        const bold = cell.style.flags.bold;
+        const italic = cell.style.flags.italic;
+        var face_id: u16 = 0;
+        if (base_cp != 0 and !is_sprite and !invisible and width != 0)
+            face_id = try self.faceForCell(base_cp, bold, italic);
+
+        self.row_cells[x] = .{
+            .style = cell.style,
+            .fg = fg,
+            .bg = cc.bg,
+            .cps_start = cps_start,
+            .n_cps = n_cps,
+            .face_id = face_id,
+            .width = width,
+            .is_cursor = is_cursor,
+            .sprite = is_sprite,
+            .invisible = invisible,
+        };
+        self.descs[x] = .{
+            .face_id = face_id,
+            .style_flags = @as(u8, @intFromBool(bold)) | (@as(u8, @intFromBool(italic)) << 1),
+            .codepoint = base_cp,
+            .is_cursor = is_cursor,
+            .width = width,
+        };
     }
 
     // ------------------------------------------------------------------
@@ -1066,7 +1204,22 @@ pub const CpuRenderer = struct {
         };
         const dst_x = x_px + @as(i32, entry.bearing_x) + roundI32(g.x_offset);
         const dst_y = y_px + @as(i32, self.metrics.baseline) - @as(i32, entry.bearing_y) - roundI32(g.y_offset);
+        // M8.1 composited cache: a repeated (glyph, fg, bg) tuple over an
+        // untouched uniform background blends once, memcpy-blits after.
+        // Native-size a8 only; downscaled/color rasters blend normally.
+        if (entry.format == .a8 and entry.width > 0 and entry.height > 0 and
+            entry.width <= max_w and
+            @as(usize, entry.width) * entry.height <= @as(usize, self.metrics.cell_w) * self.metrics.cell_h * 4)
+        {
+            if (self.compositeBg(dst_x, dst_y, entry.width, entry.height, y_px)) |bg| {
+                if (self.blitComposited(f, dst_x, dst_y, entry, key, fg, bg)) {
+                    self.markInked(dst_x, dst_y, entry.width, entry.height);
+                    return;
+                }
+            }
+        }
         self.blitFit(f, dst_x, dst_y, entry, fg, max_w);
+        self.markInkedFit(dst_x, dst_y, entry, max_w);
     }
 
     /// Rasterize a code-drawn sprite into the atlas and blit it. Sprites
@@ -1088,6 +1241,112 @@ pub const CpuRenderer = struct {
             });
         };
         self.blitEntry(f, x_px, y_px, entry, fg);
+        self.markInked(x_px, y_px, cw, ch);
+    }
+
+    /// The uniform background word under a native-size glyph when the
+    /// composited cache may serve it: the glyph fits the current row band,
+    /// the row holds no kitty image pixels, and every covered cell still
+    /// shows its collected background (no earlier glyph, sprite or block
+    /// cursor drew there). Null when the glyph must blend normally.
+    fn compositeBg(self: *const CpuRenderer, dst_x: i32, dst_y: i32, w: u16, h: u16, y_px: i32) ?u32 {
+        const cw: i32 = self.metrics.cell_w;
+        const ch: i32 = self.metrics.cell_h;
+        if (dst_x < 0 or dst_y < y_px or dst_y + @as(i32, h) > y_px + ch) return null;
+        const y: usize = @intCast(@divTrunc(y_px, ch));
+        if (self.image_rows[y]) return null;
+        const x0: usize = @intCast(@divTrunc(dst_x, cw));
+        const x1: usize = @intCast(@divTrunc(dst_x + @as(i32, w) - 1, cw));
+        if (x1 >= self.row_lens[y]) return null;
+        const base = y * self.cols;
+        var bg: ?u32 = null;
+        for (x0..x1 + 1) |x| {
+            if (self.cell_inked[base + x]) return null;
+            const b = self.row_cells[x].bg;
+            if (bg) |b0| {
+                if (b != b0) return null;
+            } else bg = b;
+        }
+        return bg;
+    }
+
+    /// Draw a native-size a8 glyph from the composited cache. The first
+    /// use of a (glyph, fg, bg) tuple only records it (the caller blends
+    /// normally); the second blends it ONCE into a cached bitmap over the
+    /// uniform background, and every later use memcpy-blits that bitmap.
+    /// Bit-identical to blendA8Row over the same background: the bitmap
+    /// is built with the very same blend. False when the cache cannot
+    /// serve the glyph (allocation failure); nothing was drawn then.
+    fn blitComposited(
+        self: *CpuRenderer,
+        f: *Framebuffer,
+        dst_x: i32,
+        dst_y: i32,
+        entry: atlas.AtlasEntry,
+        key: atlas.GlyphKey,
+        fg: u32,
+        bg: u32,
+    ) bool {
+        const ckey = CompositeCache.Key{ .glyph = key, .fg = fg, .bg = bg };
+        const slot = self.composite.slot(ckey);
+        if (!slot.used or !slot.key.eql(ckey)) {
+            self.composite.record(slot, ckey);
+            return false;
+        }
+        const w: usize = entry.width;
+        const h: usize = entry.height;
+        if (slot.bitmap.len == 0) {
+            const bmp = self.allocator.alloc(u8, w * h * 4) catch return false;
+            const region = self.atlas.a8Region(entry);
+            var r: usize = 0;
+            while (r < h) : (r += 1) {
+                const dst = bmp[r * w * 4 ..][0 .. w * 4];
+                var i: usize = 0;
+                while (i < dst.len) : (i += 4) std.mem.writeInt(u32, dst[i..][0..4], bg, .little);
+                const src = region.data[r * region.stride ..][0..w];
+                blendA8Row(dst, src, fg);
+            }
+            slot.bitmap = bmp;
+        }
+        const c = clipToFb(f, dst_x, dst_y, entry.width, entry.height) orelse return true;
+        var r: u32 = 0;
+        while (r < c.h) : (r += 1) {
+            const src = slot.bitmap[(@as(usize, c.src_y) + r) * w * 4 + @as(usize, c.src_x) * 4 ..][0 .. @as(usize, c.w) * 4];
+            @memcpy(fbRow(f, c.x, c.y + r, c.w), src);
+        }
+        return true;
+    }
+
+    /// Mark the cells a glyph blit covers as drawn-on (see cell_inked).
+    /// Mirrors blitFit's geometry: native size, or box-filtered down to
+    /// max_w when the raster is wider than its cell span.
+    fn markInkedFit(self: *CpuRenderer, dst_x: i32, dst_y: i32, entry: atlas.AtlasEntry, max_w: u32) void {
+        var w: u32 = entry.width;
+        var h: u32 = entry.height;
+        if (max_w > 0 and entry.width > max_w) {
+            w = max_w;
+            const scale = @as(f32, @floatFromInt(max_w)) / @as(f32, @floatFromInt(entry.width));
+            h = @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(entry.height)) * scale))));
+        }
+        self.markInked(dst_x, dst_y, w, h);
+    }
+
+    /// Mark every grid cell a pixel rect touches as drawn-on. Conservative
+    /// (over-marking only costs cache misses), clipped to the grid.
+    fn markInked(self: *CpuRenderer, dst_x: i32, dst_y: i32, w: u32, h: u32) void {
+        if (w == 0 or h == 0) return;
+        const cw: i32 = self.metrics.cell_w;
+        const ch: i32 = self.metrics.cell_h;
+        const x0 = @max(@divFloor(dst_x, cw), 0);
+        const y0 = @max(@divFloor(dst_y, ch), 0);
+        const x1 = @min(@divFloor(dst_x + @as(i32, @intCast(w)) - 1, cw), @as(i32, self.cols) - 1);
+        const y1 = @min(@divFloor(dst_y + @as(i32, @intCast(h)) - 1, ch), @as(i32, self.rows) - 1);
+        if (x1 < x0 or y1 < y0) return;
+        var y = y0;
+        while (y <= y1) : (y += 1) {
+            const base = @as(usize, @intCast(y)) * self.cols;
+            @memset(self.cell_inked[base + @as(usize, @intCast(x0)) .. base + @as(usize, @intCast(x1)) + 1], true);
+        }
     }
 
     /// Copy a freshly rasterized glyph into the atlas. The borrowed
@@ -1462,6 +1721,80 @@ const ClusterCache = struct {
         h.update(std.mem.asBytes(&style_flags));
         h.update(std.mem.sliceAsBytes(cps));
         return h.final();
+    }
+};
+
+/// M8.1 composited-glyph cache: the unicode benchmark blits the same
+/// .notdef raster into thousands of CJK cells with identical (fg, bg),
+/// and per-pixel source-over dominates the frame. A repeated
+/// (glyph, fg, bg) tuple is blended ONCE into a glyph-sized xrgb bitmap
+/// and memcpy-blits thereafter (bit-identical: the bitmap is built with
+/// the same blendA8Row over a buffer filled with the same background).
+///
+/// Direct-mapped with a fixed slot count: a collision evicts the slot
+/// (freeing its bitmap), so memory is bounded and a workload of mostly
+/// unique tuples (dense_cells' per-cell colors) degrades to the normal
+/// blend path instead of churning composites. The FIRST use of a tuple
+/// only records the key; the SECOND composites it. Valid for the
+/// renderer's lifetime: the key carries the full atlas glyph key (face,
+/// glyph index, pixel size, synthesis flags), so atlas eviction or face
+/// growth cannot alias a bitmap; setFontSize re-initializes the renderer.
+const CompositeCache = struct {
+    const Key = struct {
+        glyph: atlas.GlyphKey,
+        fg: u32,
+        bg: u32,
+
+        fn eql(a: Key, b: Key) bool {
+            return a.fg == b.fg and a.bg == b.bg and
+                a.glyph.face_id == b.glyph.face_id and
+                a.glyph.glyph_index == b.glyph.glyph_index and
+                a.glyph.size_px == b.glyph.size_px and
+                a.glyph.subpixel_x == b.glyph.subpixel_x and
+                a.glyph.flags == b.glyph.flags;
+        }
+    };
+
+    const Slot = struct {
+        used: bool = false,
+        key: Key = undefined,
+        /// Empty until the second use composites it; owned by the slot.
+        bitmap: []u8 = &.{},
+    };
+
+    const slot_count = 256; // power of two
+
+    allocator: std.mem.Allocator,
+    slots: [slot_count]Slot = undefined,
+
+    fn init(allocator: std.mem.Allocator) CompositeCache {
+        var self = CompositeCache{ .allocator = allocator };
+        for (&self.slots) |*s| s.* = .{};
+        return self;
+    }
+
+    fn deinit(self: *CompositeCache) void {
+        for (&self.slots) |*s| {
+            if (s.bitmap.len > 0) self.allocator.free(s.bitmap);
+        }
+    }
+
+    fn slot(self: *CompositeCache, key: Key) *Slot {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&key.glyph.face_id));
+        h.update(std.mem.asBytes(&key.glyph.glyph_index));
+        h.update(std.mem.asBytes(&key.glyph.size_px));
+        h.update(std.mem.asBytes(&key.glyph.subpixel_x));
+        h.update(std.mem.asBytes(&key.glyph.flags));
+        h.update(std.mem.asBytes(&key.fg));
+        h.update(std.mem.asBytes(&key.bg));
+        return &self.slots[h.final() & (slot_count - 1)];
+    }
+
+    /// Claim a slot for a key, evicting (and freeing) whatever it held.
+    fn record(self: *CompositeCache, s: *Slot, key: Key) void {
+        if (s.bitmap.len > 0) self.allocator.free(s.bitmap);
+        s.* = .{ .used = true, .key = key };
     }
 };
 
@@ -2770,4 +3103,100 @@ test "cpu: kitty placement clips at viewport edges (M4)" {
         if (p.key.id == 2) clipped_w = p.dst.w;
     }
     try testing.expectEqual(@as(u32, 2) * cw, clipped_w);
+}
+
+test "cpu: composited-glyph cache is bit-identical cold vs warm (M8.1)" {
+    const a = testing.allocator;
+    var env = try Env.init(a, 40, 4);
+    defer env.deinit(a);
+    env.f.fill(env.palette[17]);
+
+    // Repeating glyphs over uniform and alternating backgrounds, plus a
+    // wide CJK run (tofu when the host lacks a CJK face): every repeated
+    // (glyph, fg, bg) tuple exercises the composited cache.
+    const content =
+        "\x1b[?25h" ++
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n" ++
+        "\x1b[41mB\x1b[44mB\x1b[41mB\x1b[44mB\x1b[41mB\x1b[44mB\x1b[41mB\x1b[44mB\x1b[0m\r\n" ++
+        "中中中中中中中中中中中中中中中中中中中中";
+    env.t.write(content);
+    var damage: DamageList = .empty;
+    defer damage.deinit(a);
+    try env.renderNoCursor(&damage);
+    const cold = try a.dupe(u8, env.f.mem);
+    defer a.free(cold);
+
+    // The cache must have composited at least one repeated tuple.
+    var composited: usize = 0;
+    for (&env.cpu.composite.slots) |*s| {
+        if (s.bitmap.len > 0) composited += 1;
+    }
+    try testing.expect(composited > 0);
+
+    // Rewrite the same content: the warm frame draws every repeated cell
+    // from the cached bitmaps (memcpy) instead of blending. Pixels must
+    // be byte-identical to the cold frame.
+    env.t.write("\x1b[1;1H");
+    env.t.write(content);
+    damage.clearRetainingCapacity();
+    try env.renderNoCursor(&damage);
+    try testing.expect(damage.items.len > 0);
+    try testing.expectEqualSlices(u8, cold, env.f.mem);
+
+    // A third frame stays identical (cache hits only).
+    env.t.write("\x1b[1;1H");
+    env.t.write(content);
+    damage.clearRetainingCapacity();
+    try env.renderNoCursor(&damage);
+    try testing.expectEqualSlices(u8, cold, env.f.mem);
+}
+
+test "cpu: bulk collection handles bg-color, styled, grapheme and wide cells (M8.1)" {
+    const a = testing.allocator;
+    var env = try Env.init(a, 20, 3);
+    defer env.deinit(a);
+    const cw = env.cpu.metrics.cell_w;
+    const ch = env.cpu.metrics.cell_h;
+    const bg = env.palette[17];
+    env.f.fill(bg);
+
+    // Row 0: styled text, then an erase that leaves palette-bg cells.
+    // Row 1: RGB-bg cells. Row 2: grapheme + wide + plain.
+    env.t.write("\x1b[?25h\x1b[1;31mXY\x1b[0m\x1b[48;5;2m\x1b[K");
+    env.t.write("\r\n\x1b[48;2;10;20;30m\x1b[K");
+    env.t.write("\r\ne\u{0301}中Z");
+    var damage: DamageList = .empty;
+    defer damage.deinit(a);
+    try env.renderNoCursor(&damage);
+
+    // Palette-bg erase cells paint the library-resolved palette color
+    // (capture it; the render palette is the library's, not the session
+    // preset's). RGB-bg cells paint the exact RGB value.
+    const erase_bg = env.f.get(5 * cw + cw / 2, ch / 2);
+    try testing.expect(erase_bg != bg);
+    try testing.expectEqual(@as(u32, (10 << 16) | (20 << 8) | 30), env.f.get(cw / 2, ch + ch / 2));
+    // Styled text drew ink; the grapheme cell drew ink; 'Z' after the
+    // wide cell drew ink (width comes from libghostty, R1).
+    try testing.expect(env.cellHasInk(0, 0));
+    try testing.expect(env.cellHasInk(0, 2));
+    try testing.expect(env.cellHasInk(3, 2));
+    // The erase covers the rest of the row: the last cell carries the
+    // same background.
+    try testing.expectEqual(erase_bg, env.f.get(19 * cw + cw / 2, ch / 2));
+
+    // Selection inverts the bulk-collected cells exactly like the
+    // iterator path (row range comes from the row, not per-cell FFI).
+    // Select the empty erase cells (2..4): no glyph ink, so the inverted
+    // background is exactly the default foreground.
+    const start = try env.t.gridRef(.viewport, .{ .x = 2, .y = 0 });
+    const end = try env.t.gridRef(.viewport, .{ .x = 4, .y = 0 });
+    const sel: vt.Selection = .{ .start = start, .end = end };
+    try env.t.setSelection(&sel);
+    damage.clearRetainingCapacity();
+    try env.renderNoCursor(&damage);
+    try testing.expect(damage.items.len > 0);
+    // Selected erase cells invert: bg swaps with fg (the default fg).
+    try testing.expectEqual(env.palette[16], env.f.get(3 * cw + cw / 2, ch / 2));
+    // Cell 5 is outside the selection: keeps the erase background.
+    try testing.expectEqual(erase_bg, env.f.get(5 * cw + cw / 2, ch / 2));
 }

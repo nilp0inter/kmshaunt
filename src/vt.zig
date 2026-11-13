@@ -1614,6 +1614,9 @@ pub const Cursor = struct {
 /// RenderState.update. Empty for cells without text. `fg`/`bg` null = draw
 /// with Colors.foreground/background; bold color handling is NOT applied
 /// by the library. Width comes from `wide`, never from the font (R1).
+/// `fg` is always null: the library resolves it from the style, so a style
+/// fg color is the only source (resolve it first); `bg` is set only for
+/// background-color content cells, whose color lives in the cell itself.
 pub const Cell = struct {
     text: []const u8,
     style: Style,
@@ -1836,6 +1839,19 @@ pub const Row = struct {
         try check(c.ghostty_render_state_row_get(self.state.row_iter, c.GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, @ptrCast(&self.state.cells_handle)));
         return .{ .state = self.state, .x = 0 };
     }
+
+    /// Borrowed view of the row's packed cells, one u64 per column (§4.2
+    /// CELLS_RAW): the bulk read for renderers, one FFI call per row
+    /// instead of one iterator step per cell (M8.1). Valid until the next
+    /// RenderState.update. Decode with cellLayout().decode(); cells with
+    /// styling or grapheme clusters still need the Cells iterator for the
+    /// resolved style / full cluster.
+    pub fn cellsRaw(self: *const Row) Error![]const u64 {
+        var view: c.GhosttyCellsView = undefined;
+        try check(c.ghostty_render_state_row_get(self.state.row_iter, c.GHOSTTY_RENDER_STATE_ROW_DATA_CELLS_RAW, &view));
+        const ptr = view.ptr orelse return &.{};
+        return ptr[0..view.len];
+    }
 };
 
 /// Cell iterator for one row. `next` walks columns left to right; `select`
@@ -1859,15 +1875,54 @@ pub const Cells = struct {
 
     fn read(self: *Cells) Error!Cell {
         const h = self.state.cells_handle;
-
+        // Per-key gets: on native targets the library's get_multi dispatch
+        // loop measures ~2x SLOWER than separate calls (M8.1 probe), so the
+        // hot path stays per-key. FG_COLOR is never fetched: the library
+        // resolves it FROM the style, so a null style fg always means
+        // NO_VALUE (Cell.fg stays null; resolve the style color first).
+        // BG_COLOR only matters for background-color content cells.
         var raw: c.GhosttyCell = 0;
         try check(c.ghostty_render_state_row_cells_get(h, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw));
-        var wide: c.GhosttyCellWide = 0;
-        try check(c.ghostty_cell_get(raw, c.GHOSTTY_CELL_DATA_WIDE, &wide));
+        var style: c.GhosttyStyle = undefined;
+        try check(c.ghostty_render_state_row_cells_get(h, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style));
+        const text = try self.readGraphemes();
+        var selected: bool = false;
+        try check(c.ghostty_render_state_row_cells_get(h, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_SELECTED, &selected));
+        var has_styling: bool = false;
+        try check(c.ghostty_render_state_row_cells_get(h, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HAS_STYLING, &has_styling));
 
-        // Whole cluster as UTF-8 into the shared scratch buffer; on
-        // OUT_OF_SPACE the library reports the exact size needed (it writes
-        // nothing), so grow once and retry.
+        var wide: Wide = undefined;
+        var bg_content = false;
+        if (decodeRawCell(raw)) |dec| {
+            wide = dec.wide;
+            bg_content = dec.tag == .bg_color_palette or dec.tag == .bg_color_rgb;
+        } else |_| {
+            // No manifest layout (future/trimmed library): per-key decode.
+            var w: c.GhosttyCellWide = 0;
+            try check(c.ghostty_cell_get(raw, c.GHOSTTY_CELL_DATA_WIDE, &w));
+            wide = @enumFromInt(w);
+            var tag: c.GhosttyCellContentTag = 0;
+            try check(c.ghostty_cell_get(raw, c.GHOSTTY_CELL_DATA_CONTENT_TAG, &tag));
+            bg_content = tag == c.GHOSTTY_CELL_CONTENT_BG_COLOR_PALETTE or
+                tag == c.GHOSTTY_CELL_CONTENT_BG_COLOR_RGB;
+        }
+
+        return .{
+            .text = text,
+            .style = styleFromC(style),
+            .fg = null,
+            .bg = if (bg_content) try self.readBg() else null,
+            .wide = wide,
+            .selected = selected,
+            .has_styling = has_styling,
+        };
+    }
+
+    /// The current cell's cluster UTF-8 in the shared scratch buffer;
+    /// grows once and retries on OUT_OF_SPACE. Valid until the next
+    /// next/select on this iterator.
+    fn readGraphemes(self: *Cells) Error![]const u8 {
+        const h = self.state.cells_handle;
         var buf: c.GhosttyBuffer = .{ .ptr = self.state.text_ptr, .cap = self.state.text_cap };
         var r = c.ghostty_render_state_row_cells_get(h, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &buf);
         if (r == c.GHOSTTY_OUT_OF_SPACE) {
@@ -1876,34 +1931,195 @@ pub const Cells = struct {
             r = c.ghostty_render_state_row_cells_get(h, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &buf);
         }
         try check(r);
+        return buf.ptr[0..buf.len];
+    }
 
+    /// The current cell's resolved background; null for NO_VALUE.
+    fn readBg(self: *Cells) Error!?Rgb {
+        var bg_rgb: c.GhosttyColorRgb = undefined;
+        const r = c.ghostty_render_state_row_cells_get(self.state.cells_handle, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg_rgb);
+        if (r == c.GHOSTTY_NO_VALUE) return null;
+        try check(r);
+        return rgbFromC(bg_rgb);
+    }
+
+    /// What the bulk renderer still needs from a styled/grapheme cell
+    /// after decoding its raw value (M8.1).
+    pub const BulkStyled = struct {
+        style: Style,
+        /// Cluster UTF-8; empty unless the cell is a grapheme cluster.
+        text: []const u8,
+        /// Resolved bg; null unless the cell is background-color content.
+        bg: ?Rgb,
+    };
+
+    /// Bulk-renderer slow path: position at x and read ONLY what the raw
+    /// cell view cannot provide — the resolved style, plus the cluster
+    /// UTF-8 for grapheme cells and the resolved bg for background-color
+    /// content. Codepoint, width and selection come from the raw view, so
+    /// a styled text cell costs just select + STYLE (two FFI calls).
+    pub fn selectForBulk(self: *Cells, x: u16, raw: RawCell) Error!BulkStyled {
+        try check(c.ghostty_render_state_row_cells_select(self.state.cells_handle, x));
+        self.x = x;
         var style: c.GhosttyStyle = undefined;
-        try check(c.ghostty_render_state_row_cells_get(h, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style));
-
-        var fg: c.GhosttyColorRgb = undefined;
-        const fg_r = c.ghostty_render_state_row_cells_get(h, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg);
-        if (fg_r != c.GHOSTTY_NO_VALUE) try check(fg_r);
-
-        var bg: c.GhosttyColorRgb = undefined;
-        const bg_r = c.ghostty_render_state_row_cells_get(h, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg);
-        if (bg_r != c.GHOSTTY_NO_VALUE) try check(bg_r);
-
-        var selected: bool = false;
-        try check(c.ghostty_render_state_row_cells_get(h, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_SELECTED, &selected));
-        var has_styling: bool = false;
-        try check(c.ghostty_render_state_row_cells_get(h, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HAS_STYLING, &has_styling));
-
-        return .{
-            .text = buf.ptr[0..buf.len],
-            .style = styleFromC(style),
-            .fg = if (fg_r == c.GHOSTTY_SUCCESS) rgbFromC(fg) else null,
-            .bg = if (bg_r == c.GHOSTTY_SUCCESS) rgbFromC(bg) else null,
-            .wide = @enumFromInt(wide),
-            .selected = selected,
-            .has_styling = has_styling,
-        };
+        try check(c.ghostty_render_state_row_cells_get(self.state.cells_handle, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style));
+        var text: []const u8 = &.{};
+        if (raw.tag == .codepoint_grapheme) text = try self.readGraphemes();
+        var bg: ?Rgb = null;
+        if (raw.tag == .bg_color_palette or raw.tag == .bg_color_rgb) bg = try self.readBg();
+        return .{ .style = styleFromC(style), .text = text, .bg = bg };
     }
 };
+
+// ---------------------------------------------------------------------------
+// Raw cell decoding (§4.3) -- the packed GhosttyCell bit layout
+// ---------------------------------------------------------------------------
+
+/// What a raw cell holds (§4.3 GhosttyCellContentTag).
+pub const ContentTag = enum(u2) {
+    /// A single codepoint (may be 0 for an empty cell).
+    codepoint = 0,
+    /// Base of a multi-codepoint cluster; extras live in the grapheme
+    /// store (fetch through the Cells iterator).
+    codepoint_grapheme = 1,
+    /// No text; background from a palette index.
+    bg_color_palette = 2,
+    /// No text; background as RGB.
+    bg_color_rgb = 3,
+};
+
+/// One decoded packed cell. `codepoint` is 0 for empty and background
+/// cells; `bg_palette`/`bg_rgb` are only meaningful for the matching tag;
+/// `style_id` 0 means the default style (no Cells lookup needed).
+pub const RawCell = struct {
+    tag: ContentTag,
+    codepoint: u21,
+    bg_palette: u8,
+    bg_rgb: Rgb,
+    style_id: u16,
+    wide: Wide,
+
+    /// True when the cell draws text (a non-zero codepoint tag).
+    pub fn hasText(self: RawCell) bool {
+        return (self.tag == .codepoint or self.tag == .codepoint_grapheme) and self.codepoint != 0;
+    }
+};
+
+/// Bit layout of the packed GhosttyCell, parsed once from the ABI manifest
+/// (`ghostty_type_json`, §4.3). Bit positions are NOT ABI-stable, so they
+/// are read from the manifest rather than hardcoded; the manifest is valid
+/// for the process lifetime.
+pub const CellLayout = struct {
+    tag: Field,
+    content: Field,
+    style_id: Field,
+    wide: Field,
+    // Content union arms (offsets relative to the content field).
+    codepoint: Field,
+    bg_index: Field,
+    bg_r: Field,
+    bg_g: Field,
+    bg_b: Field,
+
+    pub const Field = struct {
+        shift: u6,
+        mask: u64,
+
+        fn get(self: Field, raw: u64) u64 {
+            return (raw >> self.shift) & self.mask;
+        }
+    };
+
+    /// Decode one packed cell value. Infallible: the layout was validated
+    /// against the manifest when parsed.
+    pub fn decode(self: CellLayout, raw: u64) RawCell {
+        const tag: ContentTag = @enumFromInt(@as(u2, @truncate(self.tag.get(raw))));
+        const content = self.content.get(raw);
+        var out: RawCell = .{
+            .tag = tag,
+            .codepoint = 0,
+            .bg_palette = 0,
+            .bg_rgb = .{ .r = 0, .g = 0, .b = 0 },
+            .style_id = @truncate(self.style_id.get(raw)),
+            .wide = @enumFromInt(@as(u2, @truncate(self.wide.get(raw)))),
+        };
+        switch (tag) {
+            .codepoint, .codepoint_grapheme => out.codepoint = @truncate(self.codepoint.get(content)),
+            .bg_color_palette => out.bg_palette = @truncate(self.bg_index.get(content)),
+            .bg_color_rgb => out.bg_rgb = .{
+                .r = @truncate(self.bg_r.get(content)),
+                .g = @truncate(self.bg_g.get(content)),
+                .b = @truncate(self.bg_b.get(content)),
+            },
+        }
+        return out;
+    }
+
+    fn parse() Error!CellLayout {
+        const json = std.mem.span(c.ghostty_type_json());
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{}) catch
+            return Error.Unsupported;
+        const types = objectField(parsed.value, "types") orelse return Error.Unsupported;
+        const cell = objectField(types, "GhosttyCell") orelse return Error.Unsupported;
+        const kind = objectField(cell, "kind") orelse return Error.Unsupported;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "packed")) return Error.Unsupported;
+        const bits = objectField(cell, "bits") orelse return Error.Unsupported;
+        const content = objectField(bits, "content") orelse return Error.Unsupported;
+        const arms = objectField(content, "arms") orelse return Error.Unsupported;
+        const cp_arm = objectField(arms, "CODEPOINT") orelse return Error.Unsupported;
+        const pal_arm = objectField(arms, "BG_COLOR_PALETTE") orelse return Error.Unsupported;
+        const rgb_arm = objectField(arms, "BG_COLOR_RGB") orelse return Error.Unsupported;
+        return .{
+            .tag = try parseField(bits, "content_tag"),
+            .content = try parseField(bits, "content"),
+            .style_id = try parseField(bits, "style_id"),
+            .wide = try parseField(bits, "wide"),
+            .codepoint = try parseField(objectField(cp_arm, "bits") orelse return Error.Unsupported, "codepoint"),
+            .bg_index = try parseField(objectField(pal_arm, "bits") orelse return Error.Unsupported, "index"),
+            .bg_r = try parseField(objectField(rgb_arm, "bits") orelse return Error.Unsupported, "r"),
+            .bg_g = try parseField(objectField(rgb_arm, "bits") orelse return Error.Unsupported, "g"),
+            .bg_b = try parseField(objectField(rgb_arm, "bits") orelse return Error.Unsupported, "b"),
+        };
+    }
+
+    fn parseField(bits: std.json.Value, name: []const u8) Error!Field {
+        const obj = objectField(bits, name) orelse return Error.Unsupported;
+        const lsb = objectField(obj, "lsb") orelse return Error.Unsupported;
+        const width = objectField(obj, "width") orelse return Error.Unsupported;
+        if (lsb != .integer or width != .integer) return Error.Unsupported;
+        if (lsb.integer < 0 or width.integer <= 0 or width.integer >= 64 or
+            lsb.integer + width.integer > 64) return Error.Unsupported;
+        return .{
+            .shift = @intCast(lsb.integer),
+            .mask = (@as(u64, 1) << @intCast(width.integer)) - 1,
+        };
+    }
+
+    fn objectField(v: std.json.Value, name: []const u8) ?std.json.Value {
+        if (v != .object) return null;
+        return v.object.get(name);
+    }
+};
+
+var cell_layout: ?CellLayout = null;
+
+/// The process-wide packed-cell layout, parsed from the ABI manifest on
+/// first use. error.Unsupported when the manifest cannot be decoded;
+/// callers fall back to the per-key Cells iterator then.
+pub fn cellLayout() Error!CellLayout {
+    if (cell_layout) |l| return l;
+    const l = try CellLayout.parse();
+    cell_layout = l;
+    return l;
+}
+
+/// Decode one packed cell with the manifest layout. Convenience wrapper
+/// around cellLayout().decode for one-off reads.
+pub fn decodeRawCell(raw: u64) Error!RawCell {
+    return (try cellLayout()).decode(raw);
+}
 
 /// One image placement from the render state (§9.6). Texture cache key:
 /// (protocol, image_id, image_generation); fetch pixels through
@@ -3207,7 +3423,6 @@ test "render state: styles, resolved colors, graphemes, wide cells" {
     vt.write("界");
 
     try rs.update(&vt);
-    const colors = try rs.colors();
     var rows = try rs.rowsIter();
     const row = (try rows.nextDirty()) orelse return error.TestUnexpectedResult;
     var cells = try row.cells();
@@ -3216,8 +3431,12 @@ test "render state: styles, resolved colors, graphemes, wide cells" {
     try testing.expectEqualStrings("X", x_cell.text);
     try testing.expect(x_cell.style.flags.bold);
     try testing.expect(x_cell.has_styling);
-    try testing.expectEqual(colors.palette[1], x_cell.fg.?);
-    try testing.expectEqual(colors.palette[4], x_cell.bg.?);
+    // Colors resolve from the style (the batched read leaves fg null and
+    // only carries a resolved bg for background-color content cells).
+    try testing.expectEqual(@as(?StyleColor, .{ .palette = 1 }), x_cell.style.fg());
+    try testing.expectEqual(@as(?StyleColor, .{ .palette = 4 }), x_cell.style.bg());
+    try testing.expect(x_cell.fg == null);
+    try testing.expect(x_cell.bg == null);
 
     const grapheme = (try cells.next()) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("e\u{0301}", grapheme.text);
@@ -3232,6 +3451,69 @@ test "render state: styles, resolved colors, graphemes, wide cells" {
     // Random access via select.
     const again = try cells.select(0);
     try testing.expectEqualStrings("X", again.text);
+}
+
+test "render state: bulk cellsRaw decode matches the per-cell iterator" {
+    var vt = try Vt.init(80, 24);
+    defer vt.deinit();
+    var rs = try RenderState.new();
+    defer rs.deinit();
+
+    // Plain, styled, grapheme, wide, background-only and empty cells.
+    vt.write("\x1b[?25h");
+    vt.write("A\x1b[1;38;5;196;48;5;21mB\x1b[0me\u{0301}界");
+    vt.write("\x1b[48;5;1m\x1b[K"); // erase rest of line: palette-bg cells
+    vt.write("\r\n\x1b[48;2;10;20;30m\x1b[K"); // row 1: RGB-bg cells
+    try rs.update(&vt);
+    const colors = try rs.colors();
+    const layout = try cellLayout();
+
+    var rows = try rs.rowsIter();
+    while (try rows.next()) |row| {
+        const raws = try row.cellsRaw();
+        try testing.expectEqual(@as(usize, 80), raws.len);
+        var cells = try row.cells();
+        var x: u16 = 0;
+        while (try cells.next()) |cell| : (x += 1) {
+            const dec = layout.decode(raws[x]);
+            try testing.expectEqual(cell.wide, dec.wide);
+            try testing.expectEqual(cell.has_styling, dec.style_id != 0);
+            if (dec.tag == .codepoint) {
+                if (dec.codepoint == 0) {
+                    try testing.expectEqual(@as(usize, 0), cell.text.len);
+                } else {
+                    // Single-codepoint cluster: the UTF-8 text decodes back
+                    // to the raw codepoint.
+                    const view = try std.unicode.Utf8View.init(cell.text);
+                    var it = view.iterator();
+                    try testing.expectEqual(dec.codepoint, it.nextCodepoint().?);
+                    try testing.expect(it.nextCodepoint() == null);
+                }
+            }
+            if (dec.tag == .bg_color_palette) {
+                try testing.expectEqual(colors.palette[dec.bg_palette], cell.bg.?);
+            }
+            if (dec.tag == .bg_color_rgb) {
+                try testing.expectEqual(dec.bg_rgb, cell.bg.?);
+            }
+        }
+        try testing.expectEqual(@as(u16, 80), x);
+    }
+
+    // Spot-check the styled cell through select (batched read path).
+    var rows2 = try rs.rowsIter();
+    const row0 = (try rows2.next()) orelse return error.TestUnexpectedResult;
+    var cells = try row0.cells();
+    const b = try cells.select(1);
+    try testing.expectEqualStrings("B", b.text);
+    try testing.expect(b.style.flags.bold);
+    try testing.expectEqual(@as(?StyleColor, .{ .palette = 196 }), b.style.fg());
+    try testing.expectEqual(@as(?StyleColor, .{ .palette = 21 }), b.style.bg());
+    const grapheme = try cells.select(2);
+    try testing.expectEqualStrings("e\u{0301}", grapheme.text);
+    const wide = try cells.select(3);
+    try testing.expectEqual(Wide.wide, wide.wide);
+    try testing.expectEqualStrings("界", wide.text);
 }
 
 test "selection: gesture press/drag, install, row range, selected text" {
