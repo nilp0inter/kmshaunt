@@ -60,11 +60,17 @@
 #                           re-blanks after the last keypress; bochs blanking
 #                           only gates the DAC, so screendumps stay readable
 #                           while dpms is Off.
-#   clone / scaled          two VGA cards: the default std VGA (1024x768) plus
+#   clone / scaled          two explicit std VGA cards:
+#                           `-device VGA,id=video0,xres=1024,yres=768` plus
 #                           `-device VGA,id=video1,xres=800,yres=600` (EDID
-#                           preferred mode 800x600). Both connectors must be
-#                           enabled (sysfs), the secondary QMP screendump must
-#                           be 800x600 and show the same terminal text (OCR),
+#                           preferred modes 1024x768 / 800x600). Both cards
+#                           must be declared explicitly: any `-device VGA`
+#                           clears QEMU's default-VGA flag (system/vl.c
+#                           default_devices[]), so the implicit std VGA
+#                           disappears and a lone video1 would be the guest's
+#                           ONLY card. Both connectors must be enabled
+#                           (sysfs), the secondary QMP screendump must be
+#                           800x600 and show the same terminal text (OCR),
 #                           and both outputs are captured as goldens. clone:
 #                           smallest output sets the grid, larger ones get
 #                           margins; scaled: larger outputs scale the content
@@ -327,23 +333,47 @@ let
         screenshotCompare(machine, impl, "dpms-on")
   '';
 
-  # Two-card multi-monitor variant (clone or scaled). The secondary output is
-  # dumped through QMP with the explicit qdev id of the second VGA device;
-  # the primary uses the harness screenshot (default console).
+  # Two-card multi-monitor variant (clone or scaled). Both outputs are dumped
+  # through QMP with the explicit qdev id of their VGA device (video0 primary,
+  # video1 secondary) and OCR'd with the driver's preprocessing variants. The
+  # terminal is asserted via the typed all-caps marker, not the autologin
+  # prompt: in clone mode the larger primary keeps the base font, whose "@"
+  # is not OCR-reliable (see S1).
   multiMonitorScenario = mode: ''
+    import shutil
     import subprocess
+    import tempfile
+    import time
     from pathlib import Path
-    from test_driver.machine.ocr import perform_ocr_on_screenshot
+    from test_driver.machine.ocr import perform_ocr_variants_on_screenshot
 
     MARKER = "MULTIMON-PROBE-7"
 
     def consoleShot(device, shot):
-        """QMP screendump of one display device, saved as PNG in the output."""
+        """QMP screendump of one display device, saved as PNG in the output.
+
+        Returns (png_path, ppm_path). The test QEMU is built without libpng,
+        so screendump's png format is rejected ("Enable PNG support with
+        libpng for screendump"); dump PPM instead — the same fallback the
+        driver's own screenshot() uses via pnmtopng — and convert to PNG with
+        the harness Pillow. The PPM is kept because the environment's magick
+        (used by the OCR preprocessing) reads PPM but has no PNG decode
+        delegate, so OCR must run on the PPM, exactly as the driver's own
+        wait_for_text does on its temporary PPM screendump.
+        """
         path = f"{machine.out_dir}/{NAME}-{impl}-{shot}.png"
+        ppm = f"{machine.out_dir}/{NAME}-{impl}-{shot}.ppm"
         machine.qmp_client.send(
-            "screendump", {"filename": path, "device": device, "format": "png"}
+            "screendump", {"filename": ppm, "device": device, "format": "ppm"}
         )
-        return path
+        subprocess.run(
+            [PILLOW_PYTHON, "-c",
+             "import sys; from PIL import Image; "
+             "Image.open(sys.argv[1]).save(sys.argv[2])",
+             ppm, path],
+            check=True,
+        )
+        return path, ppm
 
     def pngSize(path):
         out = subprocess.run(
@@ -364,34 +394,81 @@ let
         subprocess.run([PILLOW_PYTHON, COMPARE_SCRIPT, path, golden, "0.0"], check=True)
 
     with subtest("S1 autologin on the primary output"):
-        waitForLogin(machine)
+        machine.wait_for_unit("default.target")
+        machine.wait_until_succeeds("pgrep -u alice bash")
         machine.send_chars(f"echo {MARKER}\n")
-        machine.wait_for_text(MARKER)
+        # Clone keeps the base font on the larger primary (the grid comes from
+        # the smallest output) with black margins around it. At that size the
+        # autologin prompt's "@" is not OCR-reliable — kmscon's 7px-wide cell
+        # reads it as "aliceg…" and the driver's preprocessing variants drop the
+        # small text — so assert on the typed marker instead: all-caps and
+        # OCR-reliable, the same oracle S2 uses for the secondary. The marker
+        # appearing proves autologin produced a shell that renders and accepts
+        # input on the primary. Poll the explicit video0 screendump + the
+        # driver's OCR preprocessing variants, exactly like S2's secondary.
+        deadline = time.monotonic() + 120
+        while True:
+            shot0, ppm0 = consoleShot("video0", "output0")
+            # OCR on a temp copy of the PPM so magick's large upsampled
+            # preprocessing artifacts land in a scratch dir, not the output.
+            with tempfile.TemporaryDirectory() as tmp:
+                ocr_src = Path(tmp) / "screen.ppm"
+                shutil.copyfile(ppm0, ocr_src)
+                texts0 = perform_ocr_variants_on_screenshot(ocr_src)
+            if any(MARKER in t for t in texts0):
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"[{impl}] primary output does not show the terminal "
+                    f"(OCR: {texts0!r})"
+                )
+            time.sleep(1)
+        Path(ppm0).unlink()
 
     with subtest("S2 both outputs scan out the terminal (multi-monitor=${mode})"):
         # Scanout oracle: both cards' connectors are enabled (CRTC active).
         # Connector names are not hardcoded; the screendump sizes below tell
-        # the outputs apart.
+        # the outputs apart. Both consoles modeset every card during startup,
+        # so this is settled by the time S1 finishes; the explicit timeout
+        # fails fast instead of burning the 900s default on a missing card.
         machine.wait_until_succeeds(
-            "test $(grep -lx enabled /sys/class/drm/card*-*/enabled | wc -l) -ge 2"
+            "test $(grep -lx enabled /sys/class/drm/card*-*/enabled | wc -l) -ge 2",
+            timeout=120,
         )
-        # Primary: the default std VGA, 1024x768.
+        # Primary: video0, the first std VGA, 1024x768.
         screenshotCompare(machine, impl, "output0")
         shot0 = f"{machine.out_dir}/{NAME}-{impl}-output0.png"
         assert pngSize(shot0) == (1024, 768), (
             f"[{impl}] primary output is {pngSize(shot0)}, expected (1024, 768)"
         )
-        # Secondary: the second VGA card, EDID preferred mode 800x600. It
-        # must show the same terminal text, not a frozen boot frame.
-        shot1 = consoleShot("video1", "output1")
-        assert pngSize(shot1) == (800, 600), (
-            f"[{impl}] secondary output is {pngSize(shot1)}, expected (800, 600)"
-        )
-        text1 = perform_ocr_on_screenshot(Path(shot1))
-        assert MARKER in text1, (
-            f"[{impl}] secondary output does not show the terminal "
-            f"(OCR: {text1!r})"
-        )
+        # Secondary: video1, the second VGA card, EDID preferred mode
+        # 800x600. It must show the same terminal text, not a frozen boot
+        # frame. Its redraw can lag the primary's under load, so poll the
+        # screendump + OCR until the marker appears (the size is stable once
+        # the connector is enabled above). OCR uses the driver's preprocessing
+        # variants, exactly like S1 on the primary: the secondary keeps the
+        # base font size (16px here), which raw tesseract garbles.
+        deadline = time.monotonic() + 120
+        while True:
+            shot1, ppm1 = consoleShot("video1", "output1")
+            assert pngSize(shot1) == (800, 600), (
+                f"[{impl}] secondary output is {pngSize(shot1)}, expected (800, 600)"
+            )
+            # OCR on a temp copy of the PPM so magick's large upsampled
+            # preprocessing artifacts land in a scratch dir, not the output.
+            with tempfile.TemporaryDirectory() as tmp:
+                ocr_src = Path(tmp) / "screen.ppm"
+                shutil.copyfile(ppm1, ocr_src)
+                texts1 = perform_ocr_variants_on_screenshot(ocr_src)
+            if any(MARKER in t for t in texts1):
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"[{impl}] secondary output does not show the terminal "
+                    f"(OCR: {texts1!r})"
+                )
+            time.sleep(1)
+        Path(ppm1).unlink()
         goldenCompare("output1", shot1)
   '';
 
@@ -412,15 +489,27 @@ let
         };
     };
 
-  # Two-card multi-monitor guest config: a second std VGA whose EDID asks for
-  # 800x600, plus the same multi-monitor mode and a pinned font size on both
-  # services.
+  # Two-card multi-monitor guest config: two explicit std VGAs whose EDID
+  # preferred modes are 1024x768 and 800x600, plus the same multi-monitor mode
+  # and a pinned font size on both services.
+  #
+  # Both cards must be explicit: any `-device VGA` clears QEMU's default-VGA
+  # flag (system/vl.c default_devices[]), so the implicit std VGA is not
+  # created alongside it — a lone `-device VGA,id=video1` leaves the guest
+  # with a single 800x600 card and the two-output assertions wait forever on
+  # a second connector that does not exist. mkBefore keeps video0/video1 at
+  # the front of the option list so they take the first free PCI slots in
+  # order: video0 -> card0 -> primary (default screendump), video1 -> card1
+  # -> secondary (QMP screendump device=video1).
   multiMonitorConfig = mode:
     { options, lib, ... }:
     {
       config =
         {
-          virtualisation.qemu.options = [ "-device VGA,id=video1,xres=800,yres=600" ];
+          virtualisation.qemu.options = lib.mkBefore [
+            "-device VGA,id=video0,xres=1024,yres=768"
+            "-device VGA,id=video1,xres=800,yres=600"
+          ];
         }
         // lib.optionalAttrs (options.services ? kmscon) {
           services.kmscon.config = {
