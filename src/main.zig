@@ -14,12 +14,18 @@
 //!  4. Seat: `LibseatSeat` when `--libseat`, else `VtReal.openVt`. Callbacks
 //!     activated/deactivated drive DRM master take/drop. The VT/libseat fd
 //!     is registered with the loop.
-//!  5. Video: `Fbdev` when `--no-drm`, else `Drm2d` (`--hwaccel` requests
-//!     Drm3d, whose GBM/EGL/GL bindings are not wired into build.zig yet, so
-//!     it falls back to Drm2d with a warning). First connected connector +
-//!     preferred mode, with `--mode`/`--screen` overrides; `setMode`.
-//!  6. Font: `Discovery.primaryFace` + `cellMetrics`; grid = mode / cell.
-//!     `--font-size 0` derives a size from the connector's physical mm.
+//!  5. Video: `Fbdev` when `--no-drm`, else one `Drm2d` per GPU selected by
+//!     `--gpus` (master is per device; `--hwaccel` requests Drm3d, whose
+//!     GBM/EGL/GL bindings are not wired into build.zig yet, so it falls back
+//!     to Drm2d with a warning). Each card is modeset to its first enabled
+//!     connector via `selectModeIndex` (`--mode`/`--use-original-mode`/
+//!     preferred), `--screen` rotation/disable, `--soft-cursor` force, and a
+//!     udev hotplug monitor. The backend is single-active-connector, so one
+//!     output per card is driven (M5.4 multi-output scanout gap).
+//!  6. Font: `Discovery.primaryFace` + `cellMetrics`; the shared grid and
+//!     per-connector viewports come from `computeLayout` (`--multi-monitor`
+//!     clone/largest/scaled). `--font-size 0` derives a size from the primary
+//!     connector's physical mm.
 //!  7. `CpuRenderer`, `Manager` + heap-allocated `TerminalSession` factory,
 //!     terminal hooks, `openInitial`.
 //!  8. Input: `xkb.Keymap` + `Input` (libinput), sink routes to the manager,
@@ -37,7 +43,8 @@
 //! |-----------------------|-----------------|--------------------------|
 //! | signalfd              | IN              | onSignal                 |
 //! | VT fd / libseat fd    | IN (+HUP VT)    | onVtEvent / onSeatEvent  |
-//! | DRM event fd          | IN              | onDrmEvent               |
+//! | DRM event fd (each)   | IN              | onDrmEvent               |
+//! | udev hotplug fd (each)| IN              | onHotplugEvent           |
 //! | libinput fd           | IN              | onInputEvent             |
 //! | each pty master       | IN \| ET        | onPtyEvent               |
 //! | locale1 bus fd        | IN              | onLocale1Event           |
@@ -46,10 +53,11 @@
 //! | repeat timerfd        | IN              | RepeatAdapter.fired      |
 //! | kitty timerfd         | IN              | onKittyTimer             |
 //!
-//! Rendering uses a persistent shadow framebuffer: the CPU renderer paints
-//! only dirty rows, so the shadow accumulates the full image across frames
-//! and is blitted into the backend's alternating back buffer before each
-//! flip (the back buffer must hold a complete frame).
+//! Rendering uses a persistent shadow framebuffer sized to the shared canvas:
+//! the CPU renderer paints only dirty rows, so the shadow accumulates the full
+//! image across frames. Each output presents its viewport of the shadow
+//! (crop/scale/rotate per its layout.Plan) into the backend's alternating back
+//! buffer before each flip (the back buffer must hold a complete frame).
 
 const std = @import("std");
 const posix = std.posix;
@@ -218,6 +226,38 @@ const PtyReg = struct {
     token: loop.Token,
 };
 
+/// One driven DRM output: a Drm2d instance (one per card — DRM master is per
+/// device) modeset to a single connector, plus its viewport into the shared
+/// canvas. No pointer into `outputs` is ever handed to the loop: every fd
+/// callback uses the Console as userdata and drains all outputs, so the list
+/// may grow/reorder freely (ROADMAP M5.4).
+const Output = struct {
+    drm: *drm2d.Drm2d,
+    event_token: ?loop.Token = null,
+    hotplug_token: ?loop.Token = null,
+    /// Driven connector index in the last connectors() probe.
+    ci: usize = 0,
+    /// Connector name, borrowed from the backend's last connectors() result
+    /// (refreshed whenever the output is re-selected).
+    name: []const u8 = "",
+    mode: video.Mode = .{ .width_px = 0, .height_px = 0, .refresh_mhz = 0, .width_mm = 0, .height_mm = 0 },
+    rotation: layout.Rotation = .normal,
+    plan: layout.Plan = .{},
+};
+
+/// A connector + mode chosen for one output (selectForCard/selectFbMode).
+const ModeSelection = struct {
+    ci: usize,
+    mi: usize,
+    mode: video.Mode,
+    rotation: layout.Rotation,
+    name: []const u8 = "",
+};
+
+/// Upper bound on simultaneous outputs: the GPU selection buffer holds 8
+/// cards (one output each); fbdev adds at most one. Headroom for both.
+const max_outputs = 16;
+
 /// The single-seat console. Heap-allocated and never moved: every callback
 /// userdata pointer and every borrowed sub-object address derives from it.
 /// Value-type sub-objects are embedded as optionals (their address is stable
@@ -237,16 +277,25 @@ const Console = struct {
     seat_cbs: seat.Seat.Callbacks = .{},
     seat_token: ?loop.Token = null,
 
-    // Video (exactly one of drm / fb).
-    drm: ?*drm2d.Drm2d = null,
+    // Video. DRM: one Drm2d per selected card, each modeset to one connector
+    // (`outputs`, in card order). fbdev: a single output via `fb`. `backend`,
+    // `mode` and `rotation` describe the primary (first) output for font
+    // auto-sizing, DPMS and logging.
+    outputs: std.ArrayListUnmanaged(Output) = .empty,
     fb: ?fbdev.Fbdev = null,
     backend: video.Backend = undefined,
-    drm_token: ?loop.Token = null,
     mode: video.Mode = .{ .width_px = 0, .height_px = 0, .refresh_mhz = 0, .width_mm = 0, .height_mm = 0 },
-    /// Content rotation applied at present time (M5.4); initial value from
-    /// cfg.screen, cycled by grab-rotate-cw/ccw. Renderer-side (drm2d has
-    /// no plane rotation).
+    /// Primary content rotation (M5.4); from cfg.screen, cycled by
+    /// grab-rotate-cw/ccw. Per-output rotations live in Output.rotation.
     rotation: layout.Rotation = .normal,
+    /// Shared terminal canvas from computeLayout (M5.4).
+    canvas: layout.Canvas = .{},
+    /// fbdev single-output viewport (DRM outputs use Output.plan).
+    fb_plan: layout.Plan = .{},
+    /// Scratch physical damage for the viewport present path.
+    phys_damage: sess.DamageList = .empty,
+    /// Hotplug arrived while the seat was inactive; reprobe on activation.
+    reprobe_pending: bool = false,
 
     // Font + renderer.
     disc: ?discovery.Discovery = null,
@@ -346,16 +395,18 @@ const Console = struct {
             self.shadow = null;
         }
         self.damage.deinit(self.alloc);
+        self.phys_damage.deinit(self.alloc);
         if (self.disc) |*d| {
             d.deinit();
             self.disc = null;
         }
 
-        if (self.drm_token) |t| self.lp.removeSource(t);
-        if (self.drm) |d| {
-            d.deinit();
-            self.drm = null;
+        for (self.outputs.items) |*o| {
+            if (o.hotplug_token) |t| self.lp.removeSource(t);
+            if (o.event_token) |t| self.lp.removeSource(t);
+            o.drm.deinit();
         }
+        self.outputs.deinit(self.alloc);
         if (self.fb) |*f| {
             f.deinit();
             self.fb = null;
@@ -465,32 +516,134 @@ const Console = struct {
         if (!self.cfg.drm) {
             self.fb = try fbdev.Fbdev.initReal(self.alloc, null);
             self.backend = self.fb.?.backend();
-        } else {
-            if (self.cfg.hwaccel) {
-                // Drm3d exists but its GBM/EGL/GL C bindings are not wired
-                // into build.zig (owned by the build integration); fall back.
-                log.warn("--hwaccel: Drm3d not available in this build, using Drm2d", .{});
-            }
-            self.drm = try drm2d.Drm2d.init(self.alloc, null, drm2d.libdrm.ops());
-            self.backend = self.drm.?.backend();
-            try self.drm.?.takeMaster();
-            self.drm_token = try self.lp.addSource(self.drm.?.eventFd(), loop.ev.in_, onDrmEvent, @intFromPtr(self));
+            const sel = try self.selectFbMode();
+            try self.backend.setMode(sel.ci, sel.mi);
+            self.mode = sel.mode;
+            self.rotation = sel.rotation;
+            return;
         }
-
-        const sel = try self.selectMode();
-        try self.backend.setMode(sel.ci, sel.mi);
-        self.mode = sel.mode;
+        if (self.cfg.hwaccel) {
+            // Drm3d exists but its GBM/EGL/GL C bindings are not wired
+            // into build.zig (owned by the build integration); fall back.
+            log.warn("--hwaccel: Drm3d not available in this build, using Drm2d", .{});
+        }
+        try self.setupDrm();
     }
 
-    /// First connected, enabled connector + preferred mode, honouring the
-    /// three-tier `--mode`/`--screen` lookup (config.getMode/getScreen).
-    fn selectMode(self: *Console) !struct { ci: usize, mi: usize, mode: video.Mode } {
+    /// Open one Drm2d per GPU selected by `--gpus` (DRM master is per device,
+    /// recipes §10.3), then modeset each to its first enabled connector.
+    /// Falls back to card0 when enumeration/selection yields nothing.
+    fn setupDrm(self: *Console) !void {
+        const candidates = drm2d.enumerateGpus(self.alloc, self.io) catch |err| blk: {
+            log.warn("gpu enumerate: {t}", .{err});
+            break :blk null;
+        };
+        if (candidates) |cands| {
+            defer drm2d.freeGpuCandidates(self.alloc, cands);
+            var buf: [8]drm2d.GpuCandidate = undefined;
+            const sel = drm2d.selectGpus(cands, gpuPolicy(self.cfg.gpus), &buf);
+            for (sel) |g| {
+                self.openCard(g.path) catch |err| log.warn("open {s}: {t}", .{ g.path, err });
+            }
+        }
+        if (self.outputs.items.len == 0) {
+            try self.openCard(null);
+        }
+        // Select + modeset each card; drop cards with no usable connector.
+        var i: usize = self.outputs.items.len;
+        while (i > 0) {
+            i -= 1;
+            const o = &self.outputs.items[i];
+            const sel = self.selectForCard(o.drm) catch |err| blk: {
+                log.warn("probe {s}: {t}", .{ o.drm.card_name, err });
+                break :blk null;
+            };
+            if (sel) |s| {
+                try o.drm.setMode(s.ci, s.mi);
+                o.ci = s.ci;
+                o.mode = s.mode;
+                o.rotation = s.rotation;
+                o.name = s.name;
+            } else {
+                self.removeOutput(i);
+            }
+        }
+        if (self.outputs.items.len == 0) return error.NoConnectedDisplay;
+        self.mode = self.outputs.items[0].mode;
+        self.rotation = self.outputs.items[0].rotation;
+        self.backend = self.outputs.items[0].drm.backend();
+    }
+
+    /// Open a card, force the software cursor per `--soft-cursor`, enable the
+    /// udev hotplug monitor, take master and register the event + hotplug fds.
+    /// All callbacks use the Console as userdata (never an Output pointer), so
+    /// the outputs list may grow freely.
+    fn openCard(self: *Console, path: ?[]const u8) !void {
+        const drm = try drm2d.Drm2d.init(self.alloc, path, drm2d.libdrm.ops());
+        errdefer drm.deinit();
+        drm.setSoftCursorForce(self.cfg.soft_cursor);
+        drm.enableHotplug(drm2d.libudev.hotplugOps()) catch |err|
+            log.warn("hotplug enable: {t}", .{err});
+        try drm.takeMaster();
+        const event_token = try self.lp.addSource(drm.eventFd(), loop.ev.in_, onDrmEvent, @intFromPtr(self));
+        errdefer self.lp.removeSource(event_token);
+        var hotplug_token: ?loop.Token = null;
+        if (drm.hotplugFd()) |hfd| {
+            hotplug_token = try self.lp.addSource(hfd, loop.ev.in_, onHotplugEvent, @intFromPtr(self));
+        }
+        try self.outputs.append(self.alloc, .{
+            .drm = drm,
+            .event_token = event_token,
+            .hotplug_token = hotplug_token,
+        });
+    }
+
+    fn removeOutput(self: *Console, index: usize) void {
+        const o = self.outputs.items[index];
+        if (o.hotplug_token) |t| self.lp.removeSource(t);
+        if (o.event_token) |t| self.lp.removeSource(t);
+        o.drm.deinit();
+        _ = self.outputs.swapRemove(index);
+    }
+
+    /// First connected, enabled connector on a card + its mode via
+    /// selectModeIndex (`mode=` / `use-original-mode` / preferred, M5.3). The
+    /// backend is single-active-connector, so further enabled connectors on
+    /// the same card are reported but not driven (M5.4 scanout gap).
+    fn selectForCard(self: *Console, drm: *drm2d.Drm2d) !?ModeSelection {
+        const conns = try drm.connectors();
+        var result: ?ModeSelection = null;
+        var enabled_count: usize = 0;
+        for (conns, 0..) |conn, ci| {
+            if (!conn.connected or conn.modes.len == 0) continue;
+            const screen = self.cfg.getScreen(conn.card_name, conn.name);
+            if (!screen.enabled) continue;
+            enabled_count += 1;
+            if (result != null) continue;
+            const spec = modeSpecFor(self.cfg, conn.card_name, conn.name);
+            const mi = (try drm.selectModeIndex(ci, spec, self.cfg.use_original_mode)) orelse continue;
+            result = .{
+                .ci = ci,
+                .mi = mi,
+                .mode = conn.modes[mi],
+                .rotation = orientationToRotation(screen.orientation),
+                .name = conn.name,
+            };
+        }
+        if (enabled_count > 1) {
+            log.warn("{s}: {d} enabled connectors; drm2d drives one per card (M5.4 scanout gap)", .{ drm.card_name, enabled_count });
+        }
+        return result;
+    }
+
+    /// fbdev path: first connected, enabled connector + preferred/mode= match
+    /// (fbdev has no selectModeIndex; the manual match is kept).
+    fn selectFbMode(self: *Console) !ModeSelection {
         const conns = try self.backend.connectors();
         for (conns, 0..) |conn, ci| {
             if (!conn.connected or conn.modes.len == 0) continue;
             const screen = self.cfg.getScreen(conn.card_name, conn.name);
             if (!screen.enabled) continue;
-            self.rotation = orientationToRotation(screen.orientation);
             var mi: usize = conn.preferred_mode orelse 0;
             if (self.cfg.getMode(conn.card_name, conn.name)) |want| {
                 for (conn.modes, 0..) |m, j| {
@@ -502,7 +655,13 @@ const Console = struct {
                     }
                 }
             }
-            return .{ .ci = ci, .mi = mi, .mode = conn.modes[mi] };
+            return .{
+                .ci = ci,
+                .mi = mi,
+                .mode = conn.modes[mi],
+                .rotation = orientationToRotation(screen.orientation),
+                .name = conn.name,
+            };
         }
         return error.NoConnectedDisplay;
     }
@@ -518,16 +677,64 @@ const Console = struct {
         self.cell = try discovery.cellMetrics(self.face);
         if (self.cell.cell_w == 0 or self.cell.cell_h == 0) return error.InvalidCellMetrics;
 
-        const eff = self.rotation.effectiveDimensions(self.mode.width_px, self.mode.height_px);
-        self.cols = @intCast(@max(1, @min(eff.w / self.cell.cell_w, std.math.maxInt(u16))));
-        self.rows = @intCast(@max(1, @min(eff.h / self.cell.cell_h, std.math.maxInt(u16))));
-
         self.renderer = try cpu.CpuRenderer.init(self.alloc, &self.disc.?, &self.face, .{
             .size_px = self.size_px,
         });
-        try self.renderer.?.resize(self.cols, self.rows, self.cell.cell_w, self.cell.cell_h);
+        try self.rebuildLayout();
+    }
 
-        self.shadow = try video.Framebuffer.create(self.alloc, eff.w, eff.h, .xrgb8888, null);
+    /// Recompute the shared canvas + per-output viewports from the current
+    /// cell size and rotations (computeLayout, M5.4), resize the renderer and
+    /// rebuild the shadow framebuffer. Does not touch the session manager;
+    /// callers that have one resize it separately.
+    fn rebuildLayout(self: *Console) !void {
+        var conns: [max_outputs]layout.Connector = undefined;
+        var plans: [max_outputs]layout.Plan = undefined;
+        var n: usize = 0;
+        if (self.fb != null) {
+            conns[0] = .{
+                .width_px = self.mode.width_px,
+                .height_px = self.mode.height_px,
+                .width_mm = self.mode.width_mm,
+                .height_mm = self.mode.height_mm,
+                .rotation = self.rotation,
+            };
+            n = 1;
+        } else {
+            for (self.outputs.items) |o| {
+                conns[n] = .{
+                    .gpu = o.drm.card_name,
+                    .connector = o.name,
+                    .width_px = o.mode.width_px,
+                    .height_px = o.mode.height_px,
+                    .width_mm = o.mode.width_mm,
+                    .height_mm = o.mode.height_mm,
+                    .rotation = o.rotation,
+                };
+                n += 1;
+            }
+        }
+        const cell = layout.Cell{ .w = self.cell.cell_w, .h = self.cell.cell_h };
+        const canvas = layout.computeLayout(conns[0..n], cell, mmMode(self.cfg.multi_monitor), plans[0..n]);
+        self.canvas = canvas;
+        self.cols = @intCast(@max(1, @min(canvas.cols, std.math.maxInt(u16))));
+        self.rows = @intCast(@max(1, @min(canvas.rows, std.math.maxInt(u16))));
+        if (self.fb != null) {
+            self.fb_plan = plans[0];
+        } else {
+            for (self.outputs.items, 0..) |*o, idx| o.plan = plans[idx];
+        }
+        // The shadow holds the complete canvas in logical (content) space.
+        if (self.shadow) |*s| {
+            if (s.width != canvas.width or s.height != canvas.height) {
+                s.destroy(self.alloc);
+                self.shadow = null;
+                self.shadow = try video.Framebuffer.create(self.alloc, canvas.width, canvas.height, .xrgb8888, null);
+            }
+        } else {
+            self.shadow = try video.Framebuffer.create(self.alloc, canvas.width, canvas.height, .xrgb8888, null);
+        }
+        try self.renderer.?.resize(self.cols, self.rows, self.cell.cell_w, self.cell.cell_h);
     }
 
     fn setupSessions(self: *Console) !void {
@@ -624,27 +831,35 @@ const Console = struct {
     }
 
     fn videoTakeMaster(self: *Console) void {
-        if (self.drm) |d| d.takeMaster() catch |err| log.err("takeMaster: {t}", .{err});
+        for (self.outputs.items) |o| o.drm.takeMaster() catch |err| log.err("takeMaster: {t}", .{err});
     }
 
     fn videoDropMaster(self: *Console) void {
-        if (self.drm) |d| d.dropMaster() catch |err| log.err("dropMaster: {t}", .{err});
+        for (self.outputs.items) |o| o.drm.dropMaster() catch |err| log.err("dropMaster: {t}", .{err});
+    }
+
+    /// True while any output has a submitted flip in flight. The slowest
+    /// output paces the frame loop; fbdev is synchronous (always false).
+    fn anyFlipPending(self: *Console) bool {
+        if (self.fb != null) return self.backend.flipPending();
+        for (self.outputs.items) |o| {
+            if (o.drm.flipPending()) return true;
+        }
+        return false;
     }
 
     /// Present the active session if there is damage and no flip is in
     /// flight. DRM completion re-triggers this through onDrmEvent; fbdev is
-    /// synchronous (flipPending always false).
+    /// synchronous (flipPending always false). The session renders once into
+    /// the shared shadow canvas, which is then presented into every output's
+    /// back buffer through its viewport plan (M5.4).
     fn renderIfDirty(self: *Console) void {
         if (!self.dirty or self.dpms_off or !self.seat_active) return;
-        if (self.backend.flipPending()) return;
+        if (self.anyFlipPending()) return;
         if (self.mgr == null or self.shadow == null) return;
         const m = &self.mgr.?;
         const shadow = &self.shadow.?;
 
-        const fb = self.backend.beginFrame() catch |err| {
-            log.warn("beginFrame: {t}", .{err});
-            return;
-        };
         self.damage.clearRetainingCapacity();
         const ctx = sess.RenderContext{
             .fb = shadow,
@@ -665,21 +880,63 @@ const Console = struct {
         // the next one (M4.4); the tick's new pixel generations reach the
         // renderer through the next frame's placement list.
         self.tickKittyAnimations();
-        // The shadow holds the complete image in logical (content) space;
-        // blit it into the physical back buffer, rotating if needed (M5.4).
-        if (self.rotation == .normal) {
-            fb.blitFrom(shadow.*, 0, 0, .{ .x = 0, .y = 0, .w = shadow.width, .h = shadow.height });
+        if (self.fb != null) {
+            self.present(self.backend, self.fb_plan);
         } else {
-            cpu.blitRotated(fb.*, shadow.*, self.rotation);
+            for (self.outputs.items) |*o| {
+                self.present(o.drm.backend(), o.plan);
+            }
         }
-        // Rotated frames are fully repainted, so present the whole frame.
-        const dmg: []const video.Damage = if (self.full_redraw or self.rotation != .normal) &.{} else self.damage.items;
-        self.backend.endFrame(dmg) catch |err| {
-            log.warn("endFrame: {t}", .{err});
-            return;
-        };
         self.dirty = false;
         self.full_redraw = false;
+    }
+
+    /// Present the shadow canvas into one output's back buffer through its
+    /// viewport plan, then flip. The 1:1 unrotated full-canvas case uses the
+    /// fast blitFrom + exact damage; other viewports clear the letterbox and
+    /// use blitViewport with row-band physical damage (Plan.damage), or a full
+    /// frame on full_redraw.
+    fn present(self: *Console, backend: video.Backend, plan: layout.Plan) void {
+        const shadow = &self.shadow.?;
+        const fb = backend.beginFrame() catch |err| {
+            log.warn("beginFrame: {t}", .{err});
+            return;
+        };
+        const trivial = plan.scale == 1 and plan.conn.rotation == .normal and
+            plan.src.x == 0 and plan.src.y == 0 and
+            plan.src.w == self.canvas.width and plan.src.h == self.canvas.height and
+            plan.dst.x == 0 and plan.dst.y == 0;
+        if (trivial) {
+            fb.blitFrom(shadow.*, 0, 0, .{ .x = 0, .y = 0, .w = shadow.width, .h = shadow.height });
+            const dmg: []const video.Damage = if (self.full_redraw) &.{} else self.damage.items;
+            backend.endFrame(dmg) catch |err| log.warn("endFrame: {t}", .{err});
+            return;
+        }
+        // Viewport path: clear the letterbox, paint the rotated/scaled window.
+        fb.fill(0);
+        render.blitViewport(fb.*, shadow.*, plan);
+        if (self.full_redraw) {
+            backend.endFrame(&.{}) catch |err| log.warn("endFrame: {t}", .{err});
+            return;
+        }
+        self.phys_damage.clearRetainingCapacity();
+        const cell = layout.Cell{ .w = self.cell.cell_w, .h = self.cell.cell_h };
+        for (self.damage.items) |r| {
+            const row0 = r.y / self.cell.cell_h;
+            const row1 = (r.y + r.h + self.cell.cell_h - 1) / self.cell.cell_h;
+            if (plan.damage(self.canvas, row0, row1, cell)) |pr| {
+                self.phys_damage.append(self.alloc, .{
+                    .x = @intCast(pr.x),
+                    .y = @intCast(pr.y),
+                    .w = pr.w,
+                    .h = pr.h,
+                }) catch |err| {
+                    log.warn("damage: {t}", .{err});
+                    break;
+                };
+            }
+        }
+        backend.endFrame(self.phys_damage.items) catch |err| log.warn("endFrame: {t}", .{err});
     }
 
     fn wakeDpms(self: *Console) void {
@@ -781,9 +1038,11 @@ const Console = struct {
         self.full_redraw = true;
     }
 
-    /// grab-rotate-cw/ccw: cycle the screen rotation and reconfigure (M5.4).
+    /// grab-rotate-cw/ccw: cycle the active (primary) output's rotation and
+    /// reconfigure the shared grid (M5.4).
     fn handleRotate(self: *Console, id: u16) void {
-        self.rotation = if (id == 11) self.rotation.rotateCw() else self.rotation.rotateCcw();
+        self.rotation = rotateStep(self.rotation, id);
+        if (self.outputs.items.len > 0) self.outputs.items[0].rotation = self.rotation;
         self.reconfigureGrid() catch |err| {
             log.warn("rotate regrid: {t}", .{err});
             return;
@@ -791,22 +1050,94 @@ const Console = struct {
         self.full_redraw = true;
     }
 
-    /// Recompute the grid from the current cell size and rotation, resize
-    /// the renderer and every session, and rebuild the shadow framebuffer
-    /// when the logical (post-rotation) size changed. Shared by zoom/rotate.
+    /// Recompute the shared canvas + viewports from the current cell size and
+    /// rotations, resize the renderer and every session, and rebuild the
+    /// shadow when the canvas size changed. Shared by zoom/rotate.
     fn reconfigureGrid(self: *Console) !void {
-        const eff = self.rotation.effectiveDimensions(self.mode.width_px, self.mode.height_px);
-        self.cols = @intCast(@max(1, @min(eff.w / self.cell.cell_w, std.math.maxInt(u16))));
-        self.rows = @intCast(@max(1, @min(eff.h / self.cell.cell_h, std.math.maxInt(u16))));
-        try self.renderer.?.resize(self.cols, self.rows, self.cell.cell_w, self.cell.cell_h);
+        try self.rebuildLayout();
         try self.mgr.?.resize(self.cols, self.rows);
-        if (self.shadow) |*s| {
-            if (s.width != eff.w or s.height != eff.h) {
-                s.destroy(self.alloc);
-                self.shadow = null;
-                self.shadow = try video.Framebuffer.create(self.alloc, eff.w, eff.h, .xrgb8888, null);
+    }
+
+    /// Re-probe connectors on every open card after a hotplug event, re-select
+    /// modes, drop cards that lost all connectors, pick up newly added cards,
+    /// then rebuild the layout and redraw (M5.5). Runs with master held.
+    fn reprobe(self: *Console) void {
+        var i: usize = self.outputs.items.len;
+        while (i > 0) {
+            i -= 1;
+            const o = &self.outputs.items[i];
+            const sel = self.selectForCard(o.drm) catch |err| blk: {
+                log.warn("reprobe {s}: {t}", .{ o.drm.card_name, err });
+                break :blk null;
+            };
+            if (sel) |s| {
+                const changed = o.ci != s.ci or o.mode.width_px != s.mode.width_px or
+                    o.mode.height_px != s.mode.height_px or o.mode.refresh_mhz != s.mode.refresh_mhz;
+                if (changed) {
+                    o.drm.setMode(s.ci, s.mi) catch |err|
+                        log.warn("re-modeset {s}: {t}", .{ o.drm.card_name, err });
+                }
+                o.ci = s.ci;
+                o.mode = s.mode;
+                o.rotation = s.rotation;
+                o.name = s.name;
+            } else {
+                self.removeOutput(i);
             }
         }
+        self.addNewCards();
+        if (self.outputs.items.len == 0) {
+            log.warn("hotplug: no connected displays remain", .{});
+            return;
+        }
+        self.mode = self.outputs.items[0].mode;
+        self.rotation = self.outputs.items[0].rotation;
+        self.backend = self.outputs.items[0].drm.backend();
+        self.rebuildLayout() catch |err| {
+            log.warn("hotplug regrid: {t}", .{err});
+            return;
+        };
+        if (self.mgr) |*m| m.resize(self.cols, self.rows) catch |err| log.warn("hotplug resize: {t}", .{err});
+        self.full_redraw = true;
+        self.markDirty();
+    }
+
+    /// Open any newly appeared GPU that the policy selects and that is not
+    /// already driven (GPU hotplug, M5.5). Best effort.
+    fn addNewCards(self: *Console) void {
+        const candidates = drm2d.enumerateGpus(self.alloc, self.io) catch return;
+        defer drm2d.freeGpuCandidates(self.alloc, candidates);
+        var buf: [8]drm2d.GpuCandidate = undefined;
+        const sel = drm2d.selectGpus(candidates, gpuPolicy(self.cfg.gpus), &buf);
+        for (sel) |g| {
+            if (self.hasCard(g.path)) continue;
+            self.openCard(g.path) catch |err| {
+                log.warn("hotplug open {s}: {t}", .{ g.path, err });
+                continue;
+            };
+            const o = &self.outputs.items[self.outputs.items.len - 1];
+            const s = self.selectForCard(o.drm) catch |err| blk: {
+                log.warn("hotplug probe {s}: {t}", .{ g.path, err });
+                break :blk null;
+            };
+            if (s) |ss| {
+                o.drm.setMode(ss.ci, ss.mi) catch |err|
+                    log.warn("hotplug modeset {s}: {t}", .{ g.path, err });
+                o.ci = ss.ci;
+                o.mode = ss.mode;
+                o.rotation = ss.rotation;
+                o.name = ss.name;
+            } else {
+                self.removeOutput(self.outputs.items.len - 1);
+            }
+        }
+    }
+
+    fn hasCard(self: *const Console, path: []const u8) bool {
+        for (self.outputs.items) |o| {
+            if (std.mem.eql(u8, o.drm.card_path, path)) return true;
+        }
+        return false;
     }
 
     fn respawn(self: *Console, ts: *terminal.TerminalSession) void {
@@ -856,6 +1187,10 @@ const Console = struct {
         const self: *Console = @ptrFromInt(ud);
         self.seat_active = true;
         self.videoTakeMaster();
+        if (self.reprobe_pending) {
+            self.reprobe_pending = false;
+            self.reprobe();
+        }
         self.full_redraw = true;
         self.markDirty();
     }
@@ -893,14 +1228,38 @@ const Console = struct {
             self.requestQuit();
             return;
         }
-        if (self.drm) |d| {
-            d.readEvents() catch |err| {
+        // Every output's event fd shares this handler (userdata = Console);
+        // drain them all — readEvents is non-blocking and returns when empty.
+        for (self.outputs.items) |o| {
+            o.drm.readEvents() catch |err| {
                 log.warn("drm readEvents: {t}", .{err});
-                return;
+                continue;
             };
-            if (d.needsFullRedraw()) self.full_redraw = true;
+            if (o.drm.needsFullRedraw()) self.full_redraw = true;
         }
         self.renderIfDirty();
+    }
+
+    fn onHotplugEvent(lp: *loop.Loop, token: loop.Token, ud: usize, events: loop.Events) void {
+        _ = lp;
+        _ = token;
+        _ = events;
+        const self: *Console = @ptrFromInt(ud);
+        var changed = false;
+        for (self.outputs.items) |o| {
+            const hit = o.drm.pollHotplug() catch |err| blk: {
+                log.warn("hotplug poll: {t}", .{err});
+                break :blk false;
+            };
+            if (hit) changed = true;
+        }
+        if (!changed) return;
+        if (!self.seat_active) {
+            // No master: defer the re-modeset until the seat activates.
+            self.reprobe_pending = true;
+            return;
+        }
+        self.reprobe();
     }
 
     fn onInputEvent(lp: *loop.Loop, token: loop.Token, ud: usize, events: loop.Events) void {
@@ -1218,6 +1577,45 @@ fn orientationToRotation(o: config.Orientation) layout.Rotation {
     };
 }
 
+/// Map `--gpus` to the backend GPU selection policy (M5.3).
+fn gpuPolicy(g: config.Gpus) drm2d.GpuSelection {
+    return switch (g) {
+        .all => .all,
+        .primary => .primary,
+        .aux => .aux,
+    };
+}
+
+/// Map `--multi-monitor` to the layout arrangement (M5.4).
+fn mmMode(m: config.MultiMonitor) layout.MultiMonitorMode {
+    return switch (m) {
+        .clone => .clone,
+        .largest => .largest,
+        .scaled => .scaled,
+    };
+}
+
+/// Build the layout.ModeSpec for a display from the three-tier `--mode`
+/// lookup (M5.3). gpu/connector patterns are null when empty; a refresh rate
+/// of 0 (absent) or one that does not fit u16 leaves the rate unspecified.
+fn modeSpecFor(cfg: *const config.Config, gpu: []const u8, connector: []const u8) ?video.ModeSpec {
+    const want = cfg.getMode(gpu, connector) orelse return null;
+    return .{
+        .pattern = .{
+            .gpu = if (want.gpu.len > 0) want.gpu else null,
+            .connector = if (want.connector.len > 0) want.connector else null,
+        },
+        .width = want.width,
+        .height = want.height,
+        .rate = if (want.refresh_rate > 0) std.math.cast(u16, want.refresh_rate) else null,
+    };
+}
+
+/// grab-rotate-cw (11) / grab-rotate-ccw (12) step the rotation (M5.4).
+fn rotateStep(r: layout.Rotation, grab_id: u16) layout.Rotation {
+    return if (grab_id == 11) r.rotateCw() else r.rotateCcw();
+}
+
 /// config.vt is a device path ("/dev/ttyN"); VtReal.openVt wants the number.
 fn vtNumber(vt_path: ?[]const u8) !?u8 {
     const p = vt_path orelse return null;
@@ -1357,4 +1755,111 @@ test "kittyRedrawDelayNs: future deadline, due and past floor at 1 ms" {
     try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), kittyRedrawDelayNs(100, 100));
     try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), kittyRedrawDelayNs(100, 90));
     try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), kittyRedrawDelayNs(std.math.maxInt(u64), 0));
+}
+
+// ---------------------------------------------------------------------------
+// M5.3-M5.7 video wiring tests (hermetic: no DRM device, no real GPU).
+// ---------------------------------------------------------------------------
+
+test "gpuPolicy: maps --gpus to the backend selection" {
+    try std.testing.expectEqual(drm2d.GpuSelection.all, gpuPolicy(.all));
+    try std.testing.expectEqual(drm2d.GpuSelection.primary, gpuPolicy(.primary));
+    try std.testing.expectEqual(drm2d.GpuSelection.aux, gpuPolicy(.aux));
+}
+
+test "gpu selection: policy filters candidates through selectGpus" {
+    const cands = [_]drm2d.GpuCandidate{
+        .{ .path = "/dev/dri/card0", .name = "card0", .primary = true },
+        .{ .path = "/dev/dri/card1", .name = "card1", .aux = true },
+        .{ .path = "/dev/dri/card2", .name = "card2" },
+    };
+    var buf: [8]drm2d.GpuCandidate = undefined;
+    try std.testing.expectEqual(@as(usize, 3), drm2d.selectGpus(&cands, gpuPolicy(.all), &buf).len);
+    const prim = drm2d.selectGpus(&cands, gpuPolicy(.primary), &buf);
+    try std.testing.expectEqual(@as(usize, 1), prim.len);
+    try std.testing.expectEqualStrings("card0", prim[0].name);
+    // aux keeps primary OR aux (the kmscon asymmetry).
+    const aux = drm2d.selectGpus(&cands, gpuPolicy(.aux), &buf);
+    try std.testing.expectEqual(@as(usize, 2), aux.len);
+    try std.testing.expectEqualStrings("card0", aux[0].name);
+    try std.testing.expectEqualStrings("card1", aux[1].name);
+}
+
+test "mmMode: maps --multi-monitor to the layout arrangement" {
+    try std.testing.expectEqual(layout.MultiMonitorMode.clone, mmMode(.clone));
+    try std.testing.expectEqual(layout.MultiMonitorMode.largest, mmMode(.largest));
+    try std.testing.expectEqual(layout.MultiMonitorMode.scaled, mmMode(.scaled));
+}
+
+test "modeSpecFor: builds a ModeSpec from the three-tier --mode lookup" {
+    var cfg = config.Config.init(std.testing.allocator);
+    defer cfg.deinit();
+    var d = config.Diag{};
+    try cfg.parseCli(&.{
+        "--mode=card0[HDMI-A-1]1920x1080@60",
+        "--mode=[DP-1]1280x720",
+        "--mode=800x600",
+    }, &d);
+
+    // Exact gpu+connector tier: rate present.
+    const exact = modeSpecFor(&cfg, "card0", "HDMI-A-1").?;
+    try std.testing.expectEqualStrings("card0", exact.pattern.gpu.?);
+    try std.testing.expectEqualStrings("HDMI-A-1", exact.pattern.connector.?);
+    try std.testing.expectEqual(@as(u32, 1920), exact.width);
+    try std.testing.expectEqual(@as(u32, 1080), exact.height);
+    try std.testing.expectEqual(@as(?u16, 60), exact.rate);
+
+    // Connector-only tier: gpu pattern null, rate absent -> null.
+    const conn = modeSpecFor(&cfg, "card9", "DP-1").?;
+    try std.testing.expect(conn.pattern.gpu == null);
+    try std.testing.expectEqualStrings("DP-1", conn.pattern.connector.?);
+    try std.testing.expectEqual(@as(?u16, null), conn.rate);
+
+    // Global tier: both patterns null.
+    const global = modeSpecFor(&cfg, "cardX", "VGA-1").?;
+    try std.testing.expect(global.pattern.gpu == null);
+    try std.testing.expect(global.pattern.connector == null);
+    try std.testing.expectEqual(@as(u32, 800), global.width);
+}
+
+test "modeSpecFor: no matching --mode yields null; oversized rate is unspecified" {
+    var cfg = config.Config.init(std.testing.allocator);
+    defer cfg.deinit();
+    var d = config.Diag{};
+    try cfg.parseCli(&.{"--mode=card0[HDMI-A-1]1920x1080@70000"}, &d);
+    // Unmatched display.
+    try std.testing.expect(modeSpecFor(&cfg, "card1", "DP-9") == null);
+    // 70000 Hz does not fit u16: rate left unspecified rather than panicking.
+    const spec = modeSpecFor(&cfg, "card0", "HDMI-A-1").?;
+    try std.testing.expectEqual(@as(?u16, null), spec.rate);
+}
+
+test "rotateStep: grab 11 rotates cw, grab 12 rotates ccw, four steps wrap" {
+    try std.testing.expectEqual(layout.Rotation.right, rotateStep(.normal, 11));
+    try std.testing.expectEqual(layout.Rotation.normal, rotateStep(.left, 11));
+    try std.testing.expectEqual(layout.Rotation.left, rotateStep(.normal, 12));
+    try std.testing.expectEqual(layout.Rotation.normal, rotateStep(.right, 12));
+    var r: layout.Rotation = .normal;
+    for (0..4) |_| r = rotateStep(r, 11);
+    try std.testing.expectEqual(layout.Rotation.normal, r);
+}
+
+test "multi-monitor wiring: mmMode + computeLayout shared grid for two outputs" {
+    const conns = [_]layout.Connector{
+        .{ .width_px = 1280, .height_px = 720 },
+        .{ .width_px = 1920, .height_px = 1080 },
+    };
+    const cell = layout.Cell{ .w = 8, .h = 16 };
+    var plans: [2]layout.Plan = undefined;
+    // clone and scaled size the canvas from the smallest output (1280x720).
+    const clone = layout.computeLayout(&conns, cell, mmMode(.clone), &plans);
+    try std.testing.expectEqual(@as(u32, 160), clone.cols);
+    try std.testing.expectEqual(@as(u32, 45), clone.rows);
+    const scaled = layout.computeLayout(&conns, cell, mmMode(.scaled), &plans);
+    try std.testing.expectEqual(@as(u32, 160), scaled.cols);
+    try std.testing.expect(std.math.approxEqAbs(f64, 1.5, plans[1].scale, 1e-9));
+    // largest sizes the canvas from the biggest output (1920x1080).
+    const largest = layout.computeLayout(&conns, cell, mmMode(.largest), &plans);
+    try std.testing.expectEqual(@as(u32, 240), largest.cols);
+    try std.testing.expectEqual(@as(u32, 67), largest.rows);
 }

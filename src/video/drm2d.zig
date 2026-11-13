@@ -430,7 +430,7 @@ pub fn selectGpus(candidates: []const GpuCandidate, policy: GpuSelection, out: [
 /// via sysfs (recipes §10.1). Best effort: a card whose sysfs attributes
 /// cannot be read is returned unflagged. The returned slice and its strings
 /// are allocator-owned; free with `freeGpuCandidates`.
-pub fn enumerateGpus(allocator: Allocator) ![]GpuCandidate {
+pub fn enumerateGpus(allocator: Allocator, io: std.Io) ![]GpuCandidate {
     var list: std.ArrayList(GpuCandidate) = .empty;
     errdefer {
         for (list.items) |c| {
@@ -439,17 +439,17 @@ pub fn enumerateGpus(allocator: Allocator) ![]GpuCandidate {
         }
         list.deinit(allocator);
     }
-    var dir = std.fs.cwd().openDir("/dev/dri", .{ .iterate = true }) catch
+    var dir = std.Io.Dir.cwd().openDir(io, "/dev/dri", .{ .iterate = true }) catch
         return list.toOwnedSlice(allocator);
-    defer dir.close();
+    defer dir.close(io);
     var it = dir.iterate();
-    while (try it.next()) |ent| {
+    while (try it.next(io)) |ent| {
         if (!isCardName(ent.name)) continue;
         const path = try std.fmt.allocPrint(allocator, "/dev/dri/{s}", .{ent.name});
         errdefer allocator.free(path);
         const name = try allocator.dupe(u8, ent.name);
         errdefer allocator.free(name);
-        const flags = classifyCard(allocator, ent.name);
+        const flags = classifyCard(allocator, io, ent.name);
         try list.append(allocator, .{
             .path = path,
             .name = name,
@@ -488,26 +488,27 @@ fn isCardName(name: []const u8) bool {
 /// Classify a card from sysfs (recipes §10.1): PCI `boot_vga == 1` or a
 /// platform (SoC) display controller is primary; the `udl` driver is aux;
 /// USB-attached displays are never primary.
-fn classifyCard(allocator: Allocator, name: []const u8) struct { primary: bool, aux: bool } {
+fn classifyCard(allocator: Allocator, io: std.Io, name: []const u8) struct { primary: bool, aux: bool } {
     var primary = false;
     var aux = false;
     const dev = std.fmt.allocPrint(allocator, "/sys/class/drm/{s}/device", .{name}) catch
         return .{ .primary = primary, .aux = aux };
     defer allocator.free(dev);
 
-    if (readSysfsAttr(allocator, dev, "boot_vga")) |v| {
+    if (readSysfsAttr(allocator, io, dev, "boot_vga")) |v| {
         defer allocator.free(v);
         if (std.mem.eql(u8, std.mem.trim(u8, v, " \t\r\n"), "1")) primary = true;
     } else |_| {}
 
     // Bus classification from the device symlink target.
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const real = std.fs.cwd().readLink(dev, &link_buf) catch "";
+    const real_len = std.Io.Dir.cwd().readLink(io, dev, &link_buf) catch 0;
+    const real = link_buf[0..real_len];
     const is_usb = std.mem.indexOf(u8, real, "usb") != null;
     const is_platform = std.mem.indexOf(u8, real, "platform") != null;
     if (!is_usb and is_platform) primary = true;
 
-    if (readSysfsAttr(allocator, dev, "uevent")) |v| {
+    if (readSysfsAttr(allocator, io, dev, "uevent")) |v| {
         defer allocator.free(v);
         var lines = std.mem.splitScalar(u8, v, '\n');
         while (lines.next()) |line| {
@@ -522,10 +523,10 @@ fn classifyCard(allocator: Allocator, name: []const u8) struct { primary: bool, 
 }
 
 /// Read `<dir>/<attr>` into an allocator-owned slice; error when absent.
-fn readSysfsAttr(allocator: Allocator, dir_path: []const u8, attr: []const u8) ![]u8 {
+fn readSysfsAttr(allocator: Allocator, io: std.Io, dir_path: []const u8, attr: []const u8) ![]u8 {
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, attr });
     defer allocator.free(path);
-    return std.fs.cwd().readFileAlloc(allocator, path, 4096);
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096));
 }
 
 fn dpmsValue(state: DpmsState) u64 {

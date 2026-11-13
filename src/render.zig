@@ -13,12 +13,13 @@
 //! dependency and compiles/tests standalone today. The concrete type will be
 //! documented and cast at the call site once it exists.
 //!
-//! Imports: std + framebuffer.zig only (both contract-owned). session.zig
-//! declares the identical `DamageList` alias (the same type) without
-//! importing this file.
+//! Imports: std + framebuffer.zig + video/layout.zig (all contract-owned;
+//! layout.zig itself imports only std). session.zig declares the identical
+//! `DamageList` alias (the same type) without importing this file.
 
 const std = @import("std");
 const fb = @import("framebuffer.zig");
+const layout = @import("video/layout.zig");
 
 pub const Framebuffer = fb.Framebuffer;
 pub const PixelFormat = fb.PixelFormat;
@@ -162,6 +163,51 @@ pub const Renderer = struct {
         return self.vtable.renderFrame(self.ptr, state, fb_buf, damage, opts);
     }
 };
+
+/// Present the shared terminal canvas (`src`, in canvas/logical pixel space)
+/// into one connector's physical back buffer (`dst`) through a layout.Plan
+/// viewport (ROADMAP M5.4): crop `plan.src`, scale uniformly by `plan.scale`
+/// into `plan.dst` (content space, centered), then rotate onto the native
+/// framebuffer with `plan.conn.rotation`. Nearest-neighbour sampling keeps
+/// glyph edges crisp at integer scales. Formats must match; words are copied
+/// verbatim. Pixels outside the viewport are left untouched (the caller
+/// clears the letterbox). The 1:1 unrotated full-canvas case is faster via
+/// Framebuffer.blitFrom and is handled at the call site.
+pub fn blitViewport(dst: Framebuffer, src: Framebuffer, plan: layout.Plan) void {
+    std.debug.assert(dst.format == src.format);
+    if (!plan.active or plan.scale <= 0) return;
+    const inv = 1.0 / plan.scale;
+    const rot = plan.conn.rotation;
+    const pw = plan.conn.width_px;
+    const ph = plan.conn.height_px;
+    const dx0: i32 = @intFromFloat(@floor(plan.dst.x));
+    const dy0: i32 = @intFromFloat(@floor(plan.dst.y));
+    const dw: u32 = @intFromFloat(@round(plan.dst.w));
+    const dh: u32 = @intFromFloat(@round(plan.dst.h));
+    if (dw == 0 or dh == 0 or plan.src.w == 0 or plan.src.h == 0) return;
+
+    var cy: u32 = 0;
+    var fy: f64 = @floatFromInt(plan.src.y);
+    while (cy < dh) : (cy += 1) {
+        const sy: u32 = @intFromFloat(@floor(fy));
+        const content_y = dy0 + @as(i32, @intCast(cy));
+        var cx: u32 = 0;
+        var fx: f64 = @floatFromInt(plan.src.x);
+        while (cx < dw) : (cx += 1) {
+            const sx: u32 = @intFromFloat(@floor(fx));
+            if (sx < src.width and sy < src.height) {
+                const word = src.get(sx, sy);
+                const content_x = dx0 + @as(i32, @intCast(cx));
+                const p = rot.logicalToPhysical(content_x, content_y, pw, ph);
+                if (p.x >= 0 and p.y >= 0 and p.x < dst.width and p.y < dst.height) {
+                    dst.set(@intCast(p.x), @intCast(p.y), word);
+                }
+            }
+            fx += inv;
+        }
+        fy += inv;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests: computeMetrics centering math and a mock renderer through the
@@ -334,4 +380,120 @@ test "render: RenderOpts carries all cursor styles and blink phases" {
         try std.testing.expectEqual(@as(u8, 128), opts.bg_opacity);
         try std.testing.expectEqual(@as(usize, 18), opts.palette.len);
     }
+}
+
+// ---------------------------------------------------------------------------
+// blitViewport: multi-monitor present (crop / scale / rotate / center).
+// ---------------------------------------------------------------------------
+
+fn fillPattern(f: Framebuffer) void {
+    var y: u32 = 0;
+    while (y < f.height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < f.width) : (x += 1) {
+            f.set(x, y, 0x10000 * (x + 1) + 0x100 * (y + 1));
+        }
+    }
+}
+
+test "blitViewport: 1:1 normal full canvas is an exact copy" {
+    const a = std.testing.allocator;
+    var src = try Framebuffer.create(a, 4, 2, .xrgb8888, null);
+    defer src.destroy(a);
+    var dst = try Framebuffer.create(a, 4, 2, .xrgb8888, null);
+    defer dst.destroy(a);
+    fillPattern(src);
+    const plan = layout.Plan{
+        .active = true,
+        .conn = .{ .width_px = 4, .height_px = 2, .rotation = .normal },
+        .src = .{ .x = 0, .y = 0, .w = 4, .h = 2 },
+        .scale = 1,
+        .dst = .{ .x = 0, .y = 0, .w = 4, .h = 2 },
+    };
+    blitViewport(dst, src, plan);
+    var y: u32 = 0;
+    while (y < 2) : (y += 1) {
+        var x: u32 = 0;
+        while (x < 4) : (x += 1) try std.testing.expectEqual(src.get(x, y), dst.get(x, y));
+    }
+}
+
+test "blitViewport: 1:1 normal centered leaves the letterbox untouched" {
+    const a = std.testing.allocator;
+    var src = try Framebuffer.create(a, 2, 2, .xrgb8888, null);
+    defer src.destroy(a);
+    var dst = try Framebuffer.create(a, 4, 4, .xrgb8888, null);
+    defer dst.destroy(a);
+    fillPattern(src);
+    dst.fill(0xABABAB);
+    const plan = layout.Plan{
+        .active = true,
+        .conn = .{ .width_px = 4, .height_px = 4, .rotation = .normal },
+        .src = .{ .x = 0, .y = 0, .w = 2, .h = 2 },
+        .scale = 1,
+        .dst = .{ .x = 1, .y = 1, .w = 2, .h = 2 },
+    };
+    blitViewport(dst, src, plan);
+    try std.testing.expectEqual(src.get(0, 0), dst.get(1, 1));
+    try std.testing.expectEqual(src.get(1, 1), dst.get(2, 2));
+    // Border keeps the sentinel.
+    try std.testing.expectEqual(@as(u32, 0xABABAB), dst.get(0, 0));
+    try std.testing.expectEqual(@as(u32, 0xABABAB), dst.get(3, 3));
+}
+
+test "blitViewport: nearest-neighbour 2x upscale blocks" {
+    const a = std.testing.allocator;
+    var src = try Framebuffer.create(a, 2, 2, .xrgb8888, null);
+    defer src.destroy(a);
+    var dst = try Framebuffer.create(a, 4, 4, .xrgb8888, null);
+    defer dst.destroy(a);
+    fillPattern(src);
+    const plan = layout.Plan{
+        .active = true,
+        .conn = .{ .width_px = 4, .height_px = 4, .rotation = .normal },
+        .src = .{ .x = 0, .y = 0, .w = 2, .h = 2 },
+        .scale = 2,
+        .dst = .{ .x = 0, .y = 0, .w = 4, .h = 4 },
+    };
+    blitViewport(dst, src, plan);
+    try std.testing.expectEqual(src.get(0, 0), dst.get(0, 0));
+    try std.testing.expectEqual(src.get(0, 0), dst.get(1, 1));
+    try std.testing.expectEqual(src.get(1, 0), dst.get(2, 0));
+    try std.testing.expectEqual(src.get(1, 0), dst.get(3, 1));
+    try std.testing.expectEqual(src.get(0, 1), dst.get(0, 2));
+    try std.testing.expectEqual(src.get(1, 1), dst.get(3, 3));
+}
+
+test "blitViewport: right rotation maps content corners to the native frame" {
+    const a = std.testing.allocator;
+    var src = try Framebuffer.create(a, 4, 2, .xrgb8888, null);
+    defer src.destroy(a);
+    var dst = try Framebuffer.create(a, 2, 4, .xrgb8888, null);
+    defer dst.destroy(a);
+    fillPattern(src);
+    const plan = layout.Plan{
+        .active = true,
+        .conn = .{ .width_px = 2, .height_px = 4, .rotation = .right },
+        .src = .{ .x = 0, .y = 0, .w = 4, .h = 2 },
+        .scale = 1,
+        .dst = .{ .x = 0, .y = 0, .w = 4, .h = 2 },
+    };
+    blitViewport(dst, src, plan);
+    // .right: physical = (pw-1-y, x) with pw=2.
+    try std.testing.expectEqual(src.get(0, 0), dst.get(1, 0));
+    try std.testing.expectEqual(src.get(3, 0), dst.get(1, 3));
+    try std.testing.expectEqual(src.get(0, 1), dst.get(0, 0));
+    try std.testing.expectEqual(src.get(3, 1), dst.get(0, 3));
+}
+
+test "blitViewport: inactive plan is a no-op" {
+    const a = std.testing.allocator;
+    var src = try Framebuffer.create(a, 2, 2, .xrgb8888, null);
+    defer src.destroy(a);
+    var dst = try Framebuffer.create(a, 2, 2, .xrgb8888, null);
+    defer dst.destroy(a);
+    fillPattern(src);
+    dst.fill(0);
+    blitViewport(dst, src, .{ .active = false });
+    try std.testing.expectEqual(@as(u32, 0), dst.get(0, 0));
 }
