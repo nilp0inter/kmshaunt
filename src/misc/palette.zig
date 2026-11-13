@@ -420,6 +420,30 @@ pub fn applyCustom(
     return out;
 }
 
+/// Standard xterm 256-color extension for slots 16..255: the 6x6x6 color
+/// cube (16..231, channels 0, 95, 135, 175, 215, 255) and the 24-step
+/// grayscale ramp (232..255, 8 + 10*(idx-232)). This is the libghostty
+/// built-in default for those slots and the CPU renderer's paletteColor
+/// lookup; kmscon presets only define the first 16 slots, so the
+/// extension stays fixed when a preset is applied. `idx` must be >= 16.
+pub fn xterm256(idx: u8) Color {
+    std.debug.assert(idx >= 16);
+    if (idx < 232) {
+        const v: u16 = idx - 16;
+        return .{
+            .r = cubeChannel(@intCast(v / 36)),
+            .g = cubeChannel(@intCast((v / 6) % 6)),
+            .b = cubeChannel(@intCast(v % 6)),
+        };
+    }
+    const gray: u8 = @intCast(8 + (@as(u16, idx) - 232) * 10);
+    return .{ .r = gray, .g = gray, .b = gray };
+}
+
+fn cubeChannel(c: u8) u8 {
+    return if (c == 0) 0 else @intCast(55 + @as(u16, c) * 40);
+}
+
 // ---------------------------------------------------------------------------
 // Tests. Palette expectations are the doc's §5.10 table values, transcribed
 // inline so every slot of every preset is checked against the doc.
@@ -745,4 +769,16 @@ test "palette tables are comptime-known" {
     try std.testing.expectEqual(Color{ .r = 129, .g = 161, .b = 193 }, nord_blue);
     const vga_fg: Color = comptime Preset.vga.get()[ColorName.foreground.slot()];
     try std.testing.expectEqual(Color{ .r = 170, .g = 170, .b = 170 }, vga_fg);
+}
+
+test "xterm256 extends the palette with the standard cube and gray ramp" {
+    // Cube corners and a primary: 16=(0,0,0), 196=(5,0,0), 231=(5,5,5).
+    try std.testing.expectEqual(Color{ .r = 0, .g = 0, .b = 0 }, xterm256(16));
+    try std.testing.expectEqual(Color{ .r = 255, .g = 0, .b = 0 }, xterm256(196));
+    try std.testing.expectEqual(Color{ .r = 255, .g = 255, .b = 255 }, xterm256(231));
+    // Channel steps 95/135/175 at cube (1,2,3).
+    try std.testing.expectEqual(Color{ .r = 95, .g = 135, .b = 175 }, xterm256(16 + 1 * 36 + 2 * 6 + 3));
+    // Grayscale ramp endpoints: 8 and 8 + 23*10 = 238.
+    try std.testing.expectEqual(Color{ .r = 8, .g = 8, .b = 8 }, xterm256(232));
+    try std.testing.expectEqual(Color{ .r = 238, .g = 238, .b = 238 }, xterm256(255));
 }

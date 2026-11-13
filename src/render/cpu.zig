@@ -21,6 +21,11 @@
 //!   grid). The framebuffer is cleared/presented by the caller; the
 //!   renderer paints dirty rows only and appends one full-width damage
 //!   rectangle per drawn row.
+//! * Blinking (M2.4): `RenderOpts.cursor_blink_on` is the session-wide
+//!   blink phase (null = blinking disabled). The renderer tracks it across
+//!   frames: a phase flip repaints the cursor row and every row holding
+//!   SGR-blink cells even when the render state is clean. SGR-blink glyphs
+//!   hide on the off-phase; only a cursor that requests blinking hides.
 //! * The grid is anchored at the framebuffer's top-left corner; centering
 //!   padding is the session/video-layout's job, not the renderer's.
 //!
@@ -94,6 +99,7 @@ const color = @import("../font/color.zig");
 const deco = @import("decorations.zig");
 const layout = @import("../video/layout.zig");
 const image = @import("image.zig");
+const presets = @import("../misc/palette.zig");
 
 const log = std.log.scoped(.cpu);
 
@@ -193,6 +199,18 @@ pub const CpuRenderer = struct {
     prev_placements: std.ArrayListUnmanaged(image.Placement) = .empty,
     /// Per-row redraw flags for the current frame, sized to `rows`.
     redraw_rows: []bool = &.{},
+    /// Per-row flags: the row holds SGR-blink cells. collectRow refreshes
+    /// the flag of every drawn row; a blink-phase flip repaints the marked
+    /// rows even when the render state is clean (M2.4).
+    blink_rows: []bool = &.{},
+    /// Blink phase of the last successfully rendered frame (null =
+    /// blinking disabled). Compared against RenderOpts.cursor_blink_on to
+    /// detect phase flips, which change no terminal data and so leave the
+    /// render state clean.
+    prev_blink_phase: ?bool = null,
+    /// Viewport row of the cursor drawn in the last successful frame;
+    /// repainted on a blink-phase flip together with the blink rows.
+    prev_cursor_row: ?u16 = null,
 
     const FaceSlot = struct {
         face: discovery.Face,
@@ -261,6 +279,7 @@ pub const CpuRenderer = struct {
         self.placements.deinit(self.allocator);
         self.prev_placements.deinit(self.allocator);
         if (self.redraw_rows.len > 0) self.allocator.free(self.redraw_rows);
+        if (self.blink_rows.len > 0) self.allocator.free(self.blink_rows);
     }
 
     pub fn renderer(self: *CpuRenderer) render.Renderer {
@@ -283,6 +302,10 @@ pub const CpuRenderer = struct {
         }
         if (rows != self.redraw_rows.len) {
             self.redraw_rows = try self.allocator.realloc(self.redraw_rows, rows);
+            self.blink_rows = try self.allocator.realloc(self.blink_rows, rows);
+            // Row indices shift with the grid; the next redraw rebuilds
+            // the flags from the cells.
+            @memset(self.blink_rows, false);
         }
         self.cols = cols;
         self.rows = rows;
@@ -328,7 +351,10 @@ pub const CpuRenderer = struct {
 
         const dirty = try state.dirty();
         const images_changed = !placementsEqual(self.placements.items, self.prev_placements.items);
-        if (dirty == .clean and !images_changed) return;
+        // The blink timer flips the phase without touching terminal data,
+        // so a phase change must repaint even a clean state (M2.4).
+        const blink_changed = opts.cursor_blink_on != self.prev_blink_phase;
+        if (dirty == .clean and !images_changed and !blink_changed) return;
 
         self.atlas.beginFrame();
         const colors = try state.colors();
@@ -351,6 +377,17 @@ pub const CpuRenderer = struct {
         }
         for (self.placements.items) |p| self.markImageRows(p.dst);
         for (self.prev_placements.items) |p| self.markImageRows(p.dst);
+        if (blink_changed) {
+            // Blink rows and the cursor row come from the previous frame:
+            // their contents cannot have changed without a dirty row.
+            for (self.blink_rows, 0..) |has_blink, y| {
+                if (has_blink) self.redraw_rows[y] = true;
+            }
+            if (self.prev_cursor_row) |y| {
+                if (y < self.rows) self.redraw_rows[y] = true;
+            }
+            if (cursor.active) self.redraw_rows[cursor.y] = true;
+        }
 
         // Layer interleaving (ghostty-vt-api.md §9.6): below_background
         // -> cell backgrounds -> below_text -> text -> above_text. All
@@ -382,6 +419,8 @@ pub const CpuRenderer = struct {
             &self.prev_placements,
         );
         try state.clean();
+        self.prev_blink_phase = opts.cursor_blink_on;
+        self.prev_cursor_row = if (cursor.active) cursor.y else null;
     }
 
     // ------------------------------------------------------------------
@@ -459,7 +498,7 @@ pub const CpuRenderer = struct {
         try self.drawRowText(f, y_px, n);
         for (self.row_cells[0..n], 0..) |*rc, x| {
             const x_px: i32 = @as(i32, @intCast(x)) * cw;
-            if (deco.shouldDraw(rc.style.flags.invisible))
+            if (!rc.invisible)
                 self.drawDecorations(f, x_px, y_px, rc.style, rc.fg, opts);
             if (rc.is_cursor and cursor.style != .block)
                 deco.drawCursor(f.*, x_px, y_px, cw, ch, cursorStyle(cursor.style), cursor.color, true);
@@ -679,6 +718,8 @@ pub const CpuRenderer = struct {
         cursor: CursorDraw,
     ) !usize {
         self.row_cps.clearRetainingCapacity();
+        const blink_off = if (opts.cursor_blink_on) |on| !on else false;
+        var row_blink = false;
         var cells = try row.cells();
         var x: u16 = 0;
         while (try cells.next()) |cell| {
@@ -706,7 +747,11 @@ pub const CpuRenderer = struct {
                 .wide => 2,
                 .spacer_tail, .spacer_head => 0,
             };
-            const invisible = !deco.shouldDraw(cell.style.flags.invisible);
+            // SGR blink hides the glyph on the off-phase, like invisible
+            // (the background still paints; M2.4).
+            if (cell.style.flags.blink) row_blink = true;
+            const invisible = !deco.shouldDraw(cell.style.flags.invisible) or
+                (blink_off and cell.style.flags.blink);
             const is_sprite = n_cps > 0 and sprite.isSprite(base_cp);
             const bold = cell.style.flags.bold;
             const italic = cell.style.flags.italic;
@@ -734,6 +779,7 @@ pub const CpuRenderer = struct {
             };
             x += 1;
         }
+        self.blink_rows[y] = row_blink;
         return x;
     }
 
@@ -811,7 +857,7 @@ pub const CpuRenderer = struct {
             const end = run.start + run.len;
             while (i < end) : (i += 1) {
                 const rc = &self.row_cells[i];
-                if (rc.sprite) {
+                if (rc.sprite and !rc.invisible) {
                     if (span_start) |s| {
                         try self.drawSpan(f, y_px, s, i, run.face_id);
                         span_start = null;
@@ -1094,10 +1140,10 @@ pub const CpuRenderer = struct {
     };
 
     /// Resolve this frame's cursor presentation. The cursor is drawn
-    /// inside the row walk, so the caller must keep the cursor row dirty
-    /// whenever the cursor moves or the blink phase flips (libghostty
-    /// marks cursor rows dirty on movement; the session's blink tick
-    /// forces an update).
+    /// inside the row walk; renderFrame repaints the cursor row when the
+    /// blink phase flips, so a clean render state still blinks (M2.4).
+    /// Only a cursor that requests blinking hides on the off-phase; a
+    /// steady cursor stays visible in both phases.
     fn cursorDraw(
         self: *const CpuRenderer,
         state: *vt.RenderState,
@@ -1110,7 +1156,7 @@ pub const CpuRenderer = struct {
         const vp = cur.viewport orelse return .{};
         if (vp.x >= self.cols or vp.y >= self.rows) return .{};
         const blink_on = opts.cursor_blink_on orelse true;
-        if (!blink_on) return .{};
+        if (cur.blinking and !blink_on) return .{};
         return .{
             .active = true,
             .x = vp.x,
@@ -1340,22 +1386,11 @@ fn packRgb(c: vt.Rgb) u32 {
 
 /// Palette lookup. Slots 0..15 come from the session table (slots 16/17
 /// are the default fg/bg, reached through RenderOpts, not indices).
-/// Indices 16..255 use the standard xterm 256-color cube and grayscale.
+/// Indices 16..255 use the standard xterm 256-color cube and grayscale
+/// (palette.xterm256, shared with the terminal's color_palette option).
 fn paletteColor(palette: *const [18]u32, idx: u8) u32 {
     if (idx < 16) return palette[idx];
-    if (idx < 232) {
-        const v: u32 = idx - 16;
-        const r = cubeChannel(v / 36);
-        const g = cubeChannel((v / 6) % 6);
-        const b = cubeChannel(v % 6);
-        return (r << 16) | (g << 8) | b;
-    }
-    const gray: u32 = 8 + @as(u32, idx - 232) * 10;
-    return (gray << 16) | (gray << 8) | gray;
-}
-
-fn cubeChannel(c: u32) u32 {
-    return if (c == 0) 0 else 55 + c * 40;
+    return presets.xterm256(idx).xrgb();
 }
 
 /// Blend `color` toward `base` with `opacity` (0 = base, 255 = color).
@@ -1538,7 +1573,6 @@ pub fn blitRotated(dst: Framebuffer, src: Framebuffer, rotation: layout.Rotation
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const presets = @import("../misc/palette.zig");
 
 /// One test seat: discovery + face + renderer + terminal + render state +
 /// framebuffer, all real. The legacy preset supplies the palette. The
@@ -1852,6 +1886,100 @@ test "cpu: bg_opacity, invisible and inverse" {
     // blended toward the default background by bg_opacity like any bg.
     try testing.expectEqual(blendOpacity(env.palette[16], env.palette[17], 128), env.f.get(2 * cw, 0));
     try testing.expect(env.cellHasInk(2, 0));
+}
+
+test "cpu: SGR blink hides text on the off-phase, repaints clean rows (M2.4)" {
+    const a = testing.allocator;
+    var env = try Env.init(a, 40, 8);
+    defer env.deinit(a);
+    const bg = env.palette[17];
+    env.f.fill(bg);
+
+    // "BLINK" carries SGR 5, "plain" does not. Cursor hidden: isolate text.
+    env.t.write("\x1b[?25l\x1b[5mBLINK\x1b[0m plain");
+    var damage: DamageList = .empty;
+    defer damage.deinit(a);
+    var o = env.opts();
+    o.cursor_blink_on = true;
+    try env.renderOpts(&damage, o);
+    try testing.expect(env.cellHasInk(0, 0));
+    try testing.expect(env.cellHasInk(4, 0));
+    try testing.expect(env.cellHasInk(6, 0));
+
+    // Off-phase on a CLEAN render state: the blink row must repaint, the
+    // blink glyphs vanish (background stays), the plain text survives.
+    try env.state.update(&env.t);
+    try testing.expectEqual(vt.Dirty.clean, try env.state.dirty());
+    damage.clearRetainingCapacity();
+    o.cursor_blink_on = false;
+    try env.cpu.renderer().renderFrame(&env.state, &env.f, &damage, o);
+    try testing.expect(damage.items.len > 0);
+    for (0..5) |x| try testing.expect(!env.cellHasInk(@intCast(x), 0));
+    try testing.expect(env.cellHasInk(6, 0));
+    try testing.expectEqual(bg, env.f.get(0, 0));
+
+    // Same phase again: clean state, no repaint.
+    const snapshot = try a.dupe(u8, env.f.mem);
+    defer a.free(snapshot);
+    damage.clearRetainingCapacity();
+    try env.renderOpts(&damage, o);
+    try testing.expectEqual(@as(usize, 0), damage.items.len);
+    try testing.expectEqualSlices(u8, snapshot, env.f.mem);
+
+    // Back on: the glyphs return.
+    damage.clearRetainingCapacity();
+    o.cursor_blink_on = true;
+    try env.renderOpts(&damage, o);
+    try testing.expect(damage.items.len > 0);
+    try testing.expect(env.cellHasInk(0, 0));
+    try testing.expect(env.cellHasInk(4, 0));
+}
+
+test "cpu: cursor blink phase repaints the cursor row on a clean state (M2.4)" {
+    const a = testing.allocator;
+    var env = try Env.init(a, 40, 8);
+    defer env.deinit(a);
+    const cw = env.cpu.metrics.cell_w;
+    const ch = env.cpu.metrics.cell_h;
+    const bg = env.palette[17];
+    const cursor_color = env.palette[16]; // no explicit cursor color: default fg
+    env.f.fill(bg);
+
+    const blink_default = true;
+    try env.t.setOption(.default_cursor_blink, &blink_default);
+    env.t.write("\x1b[?25hhi"); // block cursor at (2, 0)
+    var damage: DamageList = .empty;
+    defer damage.deinit(a);
+    var o = env.opts();
+    o.cursor_blink_on = true;
+    try env.renderOpts(&damage, o);
+    try testing.expectEqual(cursor_color, env.f.get(2 * cw + cw / 2, ch / 2));
+
+    // Off-phase: the render state is clean (no terminal change), yet the
+    // cursor row must repaint and the block cursor disappear.
+    try env.state.update(&env.t);
+    try testing.expectEqual(vt.Dirty.clean, try env.state.dirty());
+    damage.clearRetainingCapacity();
+    o.cursor_blink_on = false;
+    try env.cpu.renderer().renderFrame(&env.state, &env.f, &damage, o);
+    try testing.expect(damage.items.len > 0);
+    try testing.expectEqual(bg, env.f.get(2 * cw + cw / 2, ch / 2));
+    try testing.expect(env.cellHasInk(0, 0)); // the text stays
+
+    // On-phase again: the cursor returns.
+    damage.clearRetainingCapacity();
+    o.cursor_blink_on = true;
+    try env.renderOpts(&damage, o);
+    try testing.expect(damage.items.len > 0);
+    try testing.expectEqual(cursor_color, env.f.get(2 * cw + cw / 2, ch / 2));
+
+    // A steady cursor (blinking off) stays visible in the off-phase.
+    const steady_default = false;
+    try env.t.setOption(.default_cursor_blink, &steady_default);
+    damage.clearRetainingCapacity();
+    o.cursor_blink_on = false;
+    try env.renderOpts(&damage, o);
+    try testing.expectEqual(cursor_color, env.f.get(2 * cw + cw / 2, ch / 2));
 }
 
 test "cpu: palette indices beyond 16 use the xterm cube" {

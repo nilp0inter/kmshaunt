@@ -9,6 +9,9 @@
 //!   moved after init: the Effects table is registered lazily at the final
 //!   address (see `ensureBound`), because init returns by value and the C
 //!   userdata pointer must stay stable.
+//!   init applies cfg.effectivePalette() to the terminal (16 ANSI colors +
+//!   default fg/bg via the color_palette/color_foreground/color_background
+//!   options; M2.4).
 //! * `ts.setRenderer(r)` -- inject the render.Renderer (CpuRenderer). render()
 //!   errors with NoRenderer until one is injected.
 //! * `s.start()` opens the pty, builds the environment (below) and spawns
@@ -39,8 +42,9 @@
 //!       manager (kmscon grab resolution is not a session concern).
 //!     - child_exit: terminal child status after reap, fired before the
 //!       oneshot stop.
-//! * `ts.blink_phase` -- main.zig's blink timer toggles this; render() uses
-//!   it only while the cursor requests blinking and cfg.blink is on.
+//! * `ts.blink_phase` -- main.zig's blink timer toggles this; render()
+//!   passes it as the frame blink phase while cfg.blink is on (cursor and
+//!   SGR text blink, M2.4).
 //! * `ts.seat_name` / `ts.vt_nr` / `ts.drm` -- set before start; they feed
 //!   XDG_SEAT / XDG_VTNR / TERM_SESSION_TYPE / KMS_START_SCRIPT below.
 //!
@@ -128,6 +132,7 @@ const vt = @import("../vt.zig");
 const render = @import("../render.zig");
 const config = @import("../config/config.zig");
 const pty_mod = @import("../misc/pty.zig");
+const palette = @import("../misc/palette.zig");
 
 pub const Pty = pty_mod.Pty;
 
@@ -262,7 +267,27 @@ pub const TerminalSession = struct {
         };
         try self.vt.setScrollbackMaxLines(cfg.sb_size);
         try self.vt.setOption(.default_cursor_blink, &cfg.blink);
+        try self.applyPalette();
         return self;
+    }
+
+    /// Apply cfg.effectivePalette() (preset + palette-* overrides +
+    /// custom) to the terminal: the 16 ANSI slots plus the default
+    /// foreground/background. Slots 16..255 keep the standard xterm cube
+    /// and grayscale (palette.xterm256), matching the library default and
+    /// the CPU renderer's paletteColor. These set the terminal DEFAULTS:
+    /// OSC 4/10/11 overrides still apply on top, and RIS restores this
+    /// palette (libghostty keeps it as the palette "original").
+    fn applyPalette(self: *TerminalSession) !void {
+        const eff = self.cfg.effectivePalette();
+        var pal: [256]vt.Rgb = undefined;
+        for (0..16) |i| pal[i] = rgbFromPalette(eff[i]);
+        for (16..256) |i| pal[i] = rgbFromPalette(palette.xterm256(@intCast(i)));
+        try self.vt.setOption(.color_palette, &pal);
+        const fg = rgbFromPalette(eff[16]);
+        const bg = rgbFromPalette(eff[17]);
+        try self.vt.setOption(.color_foreground, &fg);
+        try self.vt.setOption(.color_background, &bg);
     }
 
     /// Stop the child and release everything. Safe after a failed start.
@@ -464,7 +489,9 @@ pub const TerminalSession = struct {
                 // block_hollow has no renderer counterpart; draw block.
                 .block, .block_hollow => .block,
             },
-            .cursor_blink_on = if (cursor.blinking and self.cfg.blink) self.blink_phase else null,
+            // The session-wide blink phase: drives the cursor (when it
+            // requests blinking) and SGR text blink alike (M2.4).
+            .cursor_blink_on = if (self.cfg.blink) self.blink_phase else null,
             .palette = &self.palette18,
             .default_fg = self.palette18[16],
             .default_bg = self.palette18[17],
@@ -987,6 +1014,10 @@ pub const TerminalSession = struct {
 
 fn packRgb(c: vt.Rgb) u32 {
     return (@as(u32, c.r) << 16) | (@as(u32, c.g) << 8) | c.b;
+}
+
+fn rgbFromPalette(c: palette.Color) vt.Rgb {
+    return .{ .r = c.r, .g = c.g, .b = c.b };
 }
 
 fn mapButton(code: u32) ?vt.MouseButton {
@@ -1817,4 +1848,128 @@ test "terminal: side buttons report as extended buttons, not the wheel" {
 
     try sendButton(s, 0x113, true, 4, 8, 1); // BTN_SIDE
     _ = try pumpUntilText(&ts, "SIDE_OK", 5000);
+}
+
+test "terminal: init applies the configured preset palette (M2.4)" {
+    var cfg = testCfg(&.{"/bin/sh"});
+    defer cfg.deinit();
+    cfg.palette = .solarized;
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+
+    try ts.render_state.update(&ts.vt);
+    const colors = try ts.render_state.colors();
+    const want = palette.Preset.solarized.get();
+    for (0..16) |i| {
+        try testing.expectEqual(want[i].r, colors.palette[i].r);
+        try testing.expectEqual(want[i].g, colors.palette[i].g);
+        try testing.expectEqual(want[i].b, colors.palette[i].b);
+    }
+    try testing.expectEqual(want[16].r, colors.foreground.r);
+    try testing.expectEqual(want[16].g, colors.foreground.g);
+    try testing.expectEqual(want[16].b, colors.foreground.b);
+    try testing.expectEqual(want[17].r, colors.background.r);
+    try testing.expectEqual(want[17].g, colors.background.g);
+    try testing.expectEqual(want[17].b, colors.background.b);
+    // Slots 16..255 keep the standard xterm extension.
+    try testing.expectEqual(@as(u8, 255), colors.palette[196].r);
+    try testing.expectEqual(@as(u8, 0), colors.palette[196].g);
+    try testing.expectEqual(@as(u8, 0), colors.palette[196].b);
+    try testing.expectEqual(@as(u8, 8), colors.palette[232].r);
+
+    // An OSC 4 override applies on top; RIS restores the configured
+    // palette (it is the terminal default, not an override).
+    ts.vt.write("\x1b]4;1;rgb:ff/ff/ff\x07");
+    try ts.render_state.update(&ts.vt);
+    const overridden = try ts.render_state.colors();
+    try testing.expectEqual(@as(u8, 255), overridden.palette[1].r);
+    ts.vt.reset();
+    try ts.render_state.update(&ts.vt);
+    const after = try ts.render_state.colors();
+    try testing.expectEqual(want[1].r, after.palette[1].r);
+    try testing.expectEqual(want[1].g, after.palette[1].g);
+    try testing.expectEqual(want[1].b, after.palette[1].b);
+}
+
+test "terminal: custom palette overrides reach the terminal (M2.4)" {
+    var cfg = testCfg(&.{"/bin/sh"});
+    defer cfg.deinit();
+    cfg.palette = .custom;
+    cfg.custom_palette[1] = .{ .r = 10, .g = 20, .b = 30 };
+    cfg.custom_palette[16] = .{ .r = 200, .g = 201, .b = 202 };
+    cfg.custom_palette[17] = .{ .r = 40, .g = 50, .b = 60 };
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+
+    try ts.render_state.update(&ts.vt);
+    const colors = try ts.render_state.colors();
+    try testing.expectEqual(@as(u8, 10), colors.palette[1].r);
+    try testing.expectEqual(@as(u8, 20), colors.palette[1].g);
+    try testing.expectEqual(@as(u8, 30), colors.palette[1].b);
+    try testing.expectEqual(@as(u8, 200), colors.foreground.r);
+    try testing.expectEqual(@as(u8, 201), colors.foreground.g);
+    try testing.expectEqual(@as(u8, 202), colors.foreground.b);
+    try testing.expectEqual(@as(u8, 40), colors.background.r);
+    try testing.expectEqual(@as(u8, 50), colors.background.g);
+    try testing.expectEqual(@as(u8, 60), colors.background.b);
+    // Untouched slots keep the custom base (== legacy).
+    try testing.expectEqual(@as(u8, 205), colors.palette[3].r);
+}
+
+test "terminal: unset palette falls back to legacy (M2.4)" {
+    var cfg = testCfg(&.{"/bin/sh"});
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+
+    try ts.render_state.update(&ts.vt);
+    const colors = try ts.render_state.colors();
+    const want = palette.Preset.legacy.get();
+    for (0..16) |i| {
+        try testing.expectEqual(want[i].r, colors.palette[i].r);
+        try testing.expectEqual(want[i].g, colors.palette[i].g);
+        try testing.expectEqual(want[i].b, colors.palette[i].b);
+    }
+    try testing.expectEqual(want[16].r, colors.foreground.r);
+    try testing.expectEqual(want[17].r, colors.background.r);
+}
+
+test "terminal: render passes the blink phase for cursor and text blink (M2.4)" {
+    var cfg = testCfg(&.{"/bin/sh"});
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    ts.setRenderer(mock.renderer());
+
+    var fb = try render.Framebuffer.create(testing.allocator, 64, 48, .xrgb8888, null);
+    defer fb.destroy(testing.allocator);
+    var damage: render.DamageList = .empty;
+    defer damage.deinit(testing.allocator);
+    // Zero cell metrics match the pre-first-render session geometry, so
+    // no resize round-trip interferes.
+    const ctx = sess.RenderContext{
+        .fb = &fb,
+        .damage = &damage,
+        .cell_w = 0,
+        .cell_h = 0,
+        .cols = 80,
+        .rows = 24,
+    };
+    const s = ts.session();
+
+    // A steady cursor (DECSCUSR 2) must not gate the phase: SGR text
+    // blink needs it even when the cursor does not blink.
+    ts.vt.write("\x1b[2 q");
+    ts.blink_phase = false;
+    try s.render(&ctx);
+    try testing.expectEqual(@as(?bool, false), mock.last_opts.?.cursor_blink_on);
+    ts.blink_phase = true;
+    try s.render(&ctx);
+    try testing.expectEqual(@as(?bool, true), mock.last_opts.?.cursor_blink_on);
+
+    // cfg.blink off: no phase (everything steady).
+    cfg.blink = false;
+    try s.render(&ctx);
+    try testing.expectEqual(@as(?bool, null), mock.last_opts.?.cursor_blink_on);
 }
