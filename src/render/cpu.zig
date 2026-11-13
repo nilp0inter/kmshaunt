@@ -970,7 +970,9 @@ const CellColors = struct { fg: u32, bg: u32 };
 /// wins over the library-resolved RGB), then the cell-level resolved
 /// override, then the frame default. Inverse swaps the pair, opacity
 /// blends the background toward the default background, faint blends the
-/// foreground toward the painted background.
+/// foreground toward the painted background. Selected cells (M2.3 mouse
+/// selection) invert last, like libtsm's selection rendering -- so SGR
+/// inverse cells invert back.
 fn resolveColors(cell: *const vt.Cell, opts: RenderOpts) CellColors {
     var fg = resolveStyleColor(cell.style.fg(), cell.fg, opts.palette, opts.default_fg);
     var bg = resolveStyleColor(cell.style.bg(), cell.bg, opts.palette, opts.default_bg);
@@ -981,6 +983,11 @@ fn resolveColors(cell: *const vt.Cell, opts: RenderOpts) CellColors {
     }
     bg = blendOpacity(bg, opts.default_bg, opts.bg_opacity);
     if (cell.style.flags.faint) fg = deco.applyFaint(fg, bg);
+    if (cell.selected) {
+        const c = deco.applyInverse(fg, bg);
+        fg = c.fg;
+        bg = c.bg;
+    }
     return .{ .fg = fg, .bg = bg };
 }
 
@@ -1362,6 +1369,44 @@ test "cpu: text, SGR color, block cursor, dirty-row tracking" {
     try env.render(&damage2);
     try testing.expectEqual(@as(usize, 0), damage2.items.len);
     try testing.expectEqualSlices(u8, snapshot, env.f.mem);
+}
+
+test "cpu: selection highlight inverts cells and dirties the row" {
+    const a = testing.allocator;
+    var env = try Env.init(a, 80, 24);
+    defer env.deinit(a);
+    const cw = env.cpu.metrics.cell_w;
+    const ch = env.cpu.metrics.cell_h;
+    const bg = env.palette[17];
+    const fg = env.palette[16];
+
+    env.f.fill(bg);
+    env.t.write("\x1b[?25hhello");
+    var damage: DamageList = .empty;
+    defer damage.deinit(a);
+    try env.renderNoCursor(&damage);
+    // The bottom-right corner of a cell is background (no descender ink).
+    try testing.expectEqual(bg, env.f.get(cw - 1, ch - 1));
+
+    // Install a selection over cells 0..4: the row must repaint (damage)
+    // and selected cells get the inverted background.
+    const start = try env.t.gridRef(.viewport, .{ .x = 0, .y = 0 });
+    const end = try env.t.gridRef(.viewport, .{ .x = 4, .y = 0 });
+    const sel: vt.Selection = .{ .start = start, .end = end };
+    try env.t.setSelection(&sel);
+    damage.clearRetainingCapacity();
+    try env.renderNoCursor(&damage);
+    try testing.expect(damage.items.len > 0);
+    try testing.expectEqual(fg, env.f.get(cw - 1, ch - 1));
+    // Cell 5 is outside the selection: default background.
+    try testing.expectEqual(bg, env.f.get(5 * cw + cw - 1, ch - 1));
+
+    // Clearing the selection restores the background and repaints.
+    try env.t.setSelection(null);
+    damage.clearRetainingCapacity();
+    try env.renderNoCursor(&damage);
+    try testing.expect(damage.items.len > 0);
+    try testing.expectEqual(bg, env.f.get(cw - 1, ch - 1));
 }
 
 test "cpu: wide cell draws base, skips continuation, no panic" {

@@ -85,6 +85,35 @@
 //!   enquiry/xtversion/desktop_notification/progress_report/program_status/
 //!   semantic_prompt  -> not installed (ignored), matching kmscon.
 //!
+//! Mouse routing (M2.3)
+//! --------------------
+//! Pointer events take one of two paths, decided per event by
+//! vt.mouseTracking() (there is no mode-change callback):
+//! * Tracking ON (X10/normal/button/any): motion/button/axis events are
+//!   encoded by vt.MouseEncoder (mode + format refreshed from the
+//!   terminal before every encode, so SGR/urxvt switches apply at once)
+//!   and written to the pty. Wheel = button 4/5 (vertical) and 6/7
+//!   (horizontal) press+release pairs at the last pointer position.
+//! * Tracking OFF: the left button drives vt.SelectionGesture
+//!   (press/drag/release). The gesture counts clicks itself (monotonic
+//!   now_ns, 400 ms window matching libinput.double_click_window_ms):
+//!   single = cell (the selection starts at the first drag), double =
+//!   word, triple = line. Results are installed with vt.setSelection;
+//!   the CPU renderer highlights selected cells (inverse video).
+//!   Copy: on release -- and immediately on a double/triple press --
+//!   vt.selectedText (Ghostty's PLAIN+UNWRAP+TRIM) lands in the
+//!   in-process clipboard, primary AND standard (kmscon keeps a single
+//!   copy buffer). Middle press pastes it through vt.paste (bracketed
+//!   per mode 2004, allow_unsafe: kmscon has no confirmation prompt)
+//!   and clears the selection; right press and any key event clear the
+//!   selection too (kmscon terminal.c parity). Wheel events scroll the
+//!   viewport 3 lines per detent (libinput reports +/-15 per wheel
+//!   click), accumulated across fractional finger scrolls;
+//!   natural-scrolling is applied by the input layer before us.
+//! Enabling mouse tracking drops an in-progress selection (checked
+//! after every pty pump). There is no autoscroll timer: kmscon's
+//! selection does not autoscroll either.
+//!
 //! backspace-delete: the ghostty key encoder's BACKARROW_KEY_MODE option is
 //! not exposed by vt.zig; its default (backspace emits 0x7f) already matches
 //! cfg.backspace_delete = on. For off, handleKey intercepts unmodified
@@ -106,6 +135,14 @@ pub const Pty = pty_mod.Pty;
 pub const default_path = "/usr/local/bin:/usr/bin:/bin";
 
 const reap_flags: u32 = std.posix.W.NOHANG | std.posix.W.UNTRACED;
+
+/// Gesture click window: matches libinput.double_click_window_ms so the
+/// input layer's click_count and the gesture's own counting agree.
+const double_click_window_ns: u64 = 400 * std.time.ns_per_ms;
+/// libinput reports one wheel detent as +/-15 axis units.
+const wheel_detent: f64 = 15.0;
+/// kmscon scrolls 3 lines per wheel event (terminal.c POINTER_WHEEL).
+const scroll_lines_per_detent: f64 = 3.0;
 
 /// Host hooks, all optional. `userdata` is passed to every callback.
 /// Set before start(); see the module header for the wiring contract.
@@ -135,6 +172,7 @@ pub const TerminalSession = struct {
     render_state: vt.RenderState,
     key_encoder: vt.KeyEncoder,
     mouse_encoder: vt.MouseEncoder,
+    gesture: vt.SelectionGesture,
     pty: Pty = .{},
     active: bool = false,
 
@@ -166,6 +204,13 @@ pub const TerminalSession = struct {
     render_held: bool = false,
     palette18: [18]u32 = @splat(0),
     last_pointer: struct { x: f32 = 0, y: f32 = 0 } = .{},
+    /// M2.3: a left-button selection drag is in progress (tracking off).
+    selecting: bool = false,
+    /// Fractional wheel lines carried between axis events (handleAxis).
+    scroll_accum: f64 = 0,
+    /// Monotonic clock for the gesture's click counting; injectable for
+    /// hermetic double-click tests (libinput.Input.now_ms convention).
+    now_ns: *const fn () u64 = monotonicNs,
 
     /// Create the terminal, encoders, render state and the Effects table.
     /// The table is registered with the terminal lazily (ensureBound) at
@@ -186,6 +231,8 @@ pub const TerminalSession = struct {
         errdefer ke.free();
         var me = try vt.MouseEncoder.new();
         errdefer me.free();
+        var ge = try vt.SelectionGesture.new();
+        errdefer ge.free(null);
 
         var self: TerminalSession = .{
             .allocator = allocator,
@@ -209,6 +256,7 @@ pub const TerminalSession = struct {
             .render_state = rs,
             .key_encoder = ke,
             .mouse_encoder = me,
+            .gesture = ge,
             .cols = cols,
             .rows = rows,
         };
@@ -223,6 +271,7 @@ pub const TerminalSession = struct {
         self.render_state.deinit();
         self.key_encoder.free();
         self.mouse_encoder.free();
+        self.gesture.free(&self.vt);
         self.vt.deinit();
         self.title_buf.deinit(self.allocator);
         self.pwd_buf.deinit(self.allocator);
@@ -281,6 +330,12 @@ pub const TerminalSession = struct {
                 break;
             }
             self.vt.write(buf[0..n]);
+        }
+        // A program that enables mouse tracking takes over the pointer:
+        // drop any in-progress selection (no mode-change callback exists,
+        // so poll after every drain; module header).
+        if (try self.vt.mouseTracking()) {
+            if (self.selecting or (try self.vt.selection()) != null) try self.clearSelection();
         }
     }
 
@@ -425,11 +480,19 @@ pub const TerminalSession = struct {
             .key => |k| try self.handleKey(k),
             .pointer_motion => |m| {
                 self.last_pointer = .{ .x = @floatCast(m.x), .y = @floatCast(m.y) };
-                try self.handleMouse(.motion, null, m.x, m.y);
+                if (try self.vt.mouseTracking()) {
+                    try self.handleMouse(.motion, null, m.x, m.y);
+                } else if (self.selecting) {
+                    try self.selectionDrag(m.x, m.y);
+                }
             },
             .pointer_button => |b| {
                 self.last_pointer = .{ .x = @floatCast(b.x), .y = @floatCast(b.y) };
-                try self.handleMouse(if (b.pressed) .press else .release, mapButton(b.button), b.x, b.y);
+                if (try self.vt.mouseTracking()) {
+                    try self.handleMouse(if (b.pressed) .press else .release, mapButton(b.button), b.x, b.y);
+                } else {
+                    try self.handleSelectionButton(b);
+                }
             },
             .pointer_axis => |a| try self.handleAxis(a),
             .grab => |g| {
@@ -440,6 +503,9 @@ pub const TerminalSession = struct {
 
     fn handleKey(self: *TerminalSession, k: sess.InputEvent.Key) !void {
         if (!self.active) return;
+        // kmscon resets the mouse selection on any key event
+        // (terminal.c input_event).
+        if (self.selecting or (try self.vt.selection()) != null) try self.clearSelection();
         const key = std.enums.fromInt(vt.Key, k.ghostty_key) orelse return;
         const action = std.enums.fromInt(vt.KeyAction, k.action) orelse return;
 
@@ -474,9 +540,14 @@ pub const TerminalSession = struct {
 
     fn handleMouse(self: *TerminalSession, action: vt.MouseAction, button: ?vt.MouseButton, x: f64, y: f64) !void {
         if (!self.active) return;
-        // M2.3: route to the encoder while the program tracks the mouse.
-        // Selection gestures when tracking is off are a follow-up.
+        // Reporting path: the caller gates on vt.mouseTracking(); the
+        // check here keeps handleAxis safe. Mode + format are refreshed
+        // from the terminal so X10/normal/button/any and SGR switches
+        // apply without a mode-change callback.
         if (!(try self.vt.mouseTracking())) return;
+        // Unmapped buttons (BTN_TASK, ...) must not encode as a phantom
+        // button-3 press; motion without a button stays valid (any mode).
+        if (action != .motion and button == null) return;
         try self.mouse_encoder.setFromTerminal(&self.vt);
         try self.updateMouseSize();
         var buf: [64]u8 = undefined;
@@ -490,18 +561,160 @@ pub const TerminalSession = struct {
     }
 
     fn handleAxis(self: *TerminalSession, axis: sess.InputEvent.PointerAxis) !void {
-        // Wheel events are button 4/5 (vertical) and 6/7 (horizontal)
-        // press+release pairs at the last pointer position.
-        if (axis.dy != 0) {
-            const btn: vt.MouseButton = if (axis.dy > 0) .five else .four;
-            try self.handleMouse(.press, btn, self.last_pointer.x, self.last_pointer.y);
-            try self.handleMouse(.release, btn, self.last_pointer.x, self.last_pointer.y);
+        if (!self.active) return;
+        if (try self.vt.mouseTracking()) {
+            // Wheel events are button 4/5 (vertical) and 6/7 (horizontal)
+            // press+release pairs at the last pointer position.
+            if (axis.dy != 0) {
+                const btn: vt.MouseButton = if (axis.dy > 0) .five else .four;
+                try self.handleMouse(.press, btn, self.last_pointer.x, self.last_pointer.y);
+                try self.handleMouse(.release, btn, self.last_pointer.x, self.last_pointer.y);
+            }
+            if (axis.dx != 0) {
+                const btn: vt.MouseButton = if (axis.dx > 0) .seven else .six;
+                try self.handleMouse(.press, btn, self.last_pointer.x, self.last_pointer.y);
+                try self.handleMouse(.release, btn, self.last_pointer.x, self.last_pointer.y);
+            }
+            return;
         }
-        if (axis.dx != 0) {
-            const btn: vt.MouseButton = if (axis.dx > 0) .seven else .six;
-            try self.handleMouse(.press, btn, self.last_pointer.x, self.last_pointer.y);
-            try self.handleMouse(.release, btn, self.last_pointer.x, self.last_pointer.y);
+        // Local viewport scroll (natural-scrolling is already applied by
+        // the input layer). libinput reports wheel detents as +/-15;
+        // kmscon scrolls 3 lines per wheel event (terminal.c
+        // POINTER_WHEEL). Accumulate so fractional finger/continuous
+        // scrolls only move whole lines. Horizontal scroll has no
+        // viewport counterpart (kmscon ignores it too).
+        if (axis.dy == 0) return;
+        self.scroll_accum += axis.dy / wheel_detent * scroll_lines_per_detent;
+        const lines: isize = @intFromFloat(@trunc(self.scroll_accum));
+        if (lines == 0) return;
+        self.scroll_accum -= @floatFromInt(lines);
+        try self.vt.scrollViewport(.{ .delta = lines });
+    }
+
+    // -- selection gestures (M2.3, tracking off) ---------------------------
+
+    /// Left button: press starts the gesture (the gesture counts clicks:
+    /// double = word, triple = line, installed and copied at once),
+    /// release finishes a drag and copies. Middle press pastes the
+    /// clipboard, right press cancels the selection (kmscon
+    /// handle_pointer_button parity).
+    fn handleSelectionButton(self: *TerminalSession, b: sess.InputEvent.PointerButton) !void {
+        if (!self.active) return;
+        if (self.cell_w == 0 or self.cell_h == 0) return; // no geometry yet
+        switch (b.button) {
+            0x110 => { // BTN_LEFT
+                if (b.pressed) {
+                    const ref = try self.cellRef(b.x, b.y);
+                    const sel = try self.gesture.press(&self.vt, ref, .{
+                        .position = .{ .x = b.x, .y = b.y },
+                        .time_ns = self.now_ns(),
+                        .repeat_interval_ns = double_click_window_ns,
+                    });
+                    if (sel) |s| {
+                        // Double/triple click: word/line selected and copied
+                        // at once; no drag follows (kmscon sets select=false).
+                        self.selecting = false;
+                        try self.vt.setSelection(&s);
+                        try self.copySelection();
+                    } else {
+                        // Single click: the selection starts at the first
+                        // drag; drop any previous selection.
+                        self.selecting = true;
+                        try self.vt.setSelection(null);
+                    }
+                } else {
+                    const ref = try self.cellRef(b.x, b.y);
+                    try self.gesture.release(&self.vt, ref);
+                    if (self.selecting) {
+                        self.selecting = false;
+                        try self.copySelection();
+                    }
+                }
+            },
+            0x112 => { // BTN_MIDDLE: paste, then clear (kmscon)
+                if (b.pressed) {
+                    try self.pasteClipboard();
+                    try self.clearSelection();
+                }
+            },
+            0x111 => { // BTN_RIGHT: cancel the selection (kmscon)
+                if (b.pressed) try self.clearSelection();
+            },
+            else => {},
         }
+    }
+
+    /// Extend the in-progress selection to the cell under the pointer.
+    /// The real pixel position goes to the gesture: a cell is included
+    /// only once the pointer crosses ~60% of its width.
+    fn selectionDrag(self: *TerminalSession, x: f64, y: f64) !void {
+        if (!self.active) return;
+        if (self.cell_w == 0 or self.cell_h == 0) return;
+        const ref = try self.cellRef(x, y);
+        const geom: vt.GestureGeometry = .{
+            .columns = self.cols,
+            .cell_width = self.cell_w,
+            .screen_height = @as(u32, self.rows) * self.cell_h,
+        };
+        if (try self.gesture.drag(&self.vt, ref, .{ .x = x, .y = y }, geom, false)) |sel| {
+            try self.vt.setSelection(&sel);
+        }
+    }
+
+    /// The viewport cell under a surface position, clamped to the grid
+    /// (kmscon coord_to_cell). Untracked ref: install or pass it to the
+    /// gesture before the next terminal mutation.
+    fn cellRef(self: *TerminalSession, x: f64, y: f64) !vt.GridRef {
+        const cw: f64 = @floatFromInt(self.cell_w);
+        const ch: f64 = @floatFromInt(self.cell_h);
+        const cx = std.math.clamp(@floor(x / cw), 0, @as(f64, @floatFromInt(self.cols - 1)));
+        const cy = std.math.clamp(@floor(y / ch), 0, @as(f64, @floatFromInt(self.rows - 1)));
+        return self.vt.gridRef(.viewport, .{ .x = @intFromFloat(cx), .y = @intFromFloat(cy) });
+    }
+
+    fn clearSelection(self: *TerminalSession) !void {
+        self.selecting = false;
+        self.gesture.reset(&self.vt);
+        try self.vt.setSelection(null);
+    }
+
+    /// Copy the installed selection into the in-process clipboard:
+    /// primary (X11 selection owner) and standard (kmscon keeps a single
+    /// copy buffer, so OSC 52 reads and paste see it too). Formats into
+    /// the primary buffer directly, growing it on OutOfSpace.
+    fn copySelection(self: *TerminalSession) !void {
+        const sel = (try self.vt.selection()) orelse return;
+        const buf = &self.clipboard[@intFromEnum(vt.ClipboardLocation.primary)];
+        var cap: usize = @max(buf.capacity, 4096);
+        while (true) {
+            try buf.ensureTotalCapacity(self.allocator, cap);
+            const text = vt.selectedText(&self.vt, &sel, buf.allocatedSlice()) catch |err| switch (err) {
+                error.OutOfSpace => {
+                    cap *= 2;
+                    continue;
+                },
+                else => return err,
+            };
+            buf.items.len = text.len;
+            break;
+        }
+        const std_buf = &self.clipboard[@intFromEnum(vt.ClipboardLocation.standard)];
+        std_buf.clearRetainingCapacity();
+        try std_buf.appendSlice(self.allocator, buf.items);
+    }
+
+    /// Middle-click paste: primary first, standard as the fallback.
+    /// vt.paste frames per mode 2004 (bracketed) or streams plain text
+    /// through write_pty. allow_unsafe: kmscon pastes without a
+    /// confirmation prompt; programs that enable bracketed paste stay
+    /// protected.
+    fn pasteClipboard(self: *TerminalSession) !void {
+        const text = if (self.clipboardText(.primary).len > 0)
+            self.clipboardText(.primary)
+        else
+            self.clipboardText(.standard);
+        if (text.len == 0) return;
+        _ = try self.vt.paste(text, .{ .location = .primary, .allow_unsafe = true });
     }
 
     /// Write to the pty master, retrying a full non-blocking master with
@@ -781,8 +994,11 @@ fn mapButton(code: u32) ?vt.MouseButton {
         0x110 => .left, // BTN_LEFT
         0x111 => .right, // BTN_RIGHT
         0x112 => .middle, // BTN_MIDDLE
-        0x113 => .four, // BTN_SIDE
-        0x114 => .five, // BTN_EXTRA
+        // Side buttons: X11 buttons 8/9 (4/5 are the wheel). The ghostty
+        // encoder emits them as codes 128/129; ten/eleven are unsupported
+        // by the encoder, so BTN_FORWARD/BTN_BACK stay unmapped.
+        0x113 => .eight, // BTN_SIDE
+        0x114 => .nine, // BTN_EXTRA
         else => null,
     };
 }
@@ -793,6 +1009,12 @@ fn sleepMs(ms: u64) void {
         .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
     };
     _ = std.os.linux.nanosleep(&req, null);
+}
+
+fn monotonicNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,4 +1557,264 @@ test "terminal: mouse reporting routes button events to the encoder" {
     } });
     try sendChar(s, .enter, null);
     _ = try pumpUntilText(&ts, "MOUSE_OK", 5000);
+}
+
+// -- M2.3: selection, copy/paste, wheel scroll -----------------------------
+
+var fake_clock_ns: u64 = 0;
+fn fakeNowNs() u64 {
+    return fake_clock_ns;
+}
+
+/// Establish 8x16 cell geometry through a render, the way main.zig's
+/// first frame does. The mock stays borrowed by the session, so the
+/// caller owns it.
+fn renderGeometry(ts: *TerminalSession, s: sess.Session, mock: *MockRenderer) !void {
+    ts.setRenderer(mock.renderer());
+    var fb = try render.Framebuffer.create(testing.allocator, 640, 384, .xrgb8888, null);
+    defer fb.destroy(testing.allocator);
+    var damage: render.DamageList = .empty;
+    defer damage.deinit(testing.allocator);
+    const ctx = sess.RenderContext{
+        .fb = &fb,
+        .damage = &damage,
+        .cell_w = 8,
+        .cell_h = 16,
+        .cols = 80,
+        .rows = 24,
+    };
+    try s.render(&ctx);
+}
+
+fn sendButton(s: sess.Session, button: u32, pressed: bool, x: f64, y: f64, count: u8) !void {
+    try s.onInput(.{ .pointer_button = .{
+        .button = button,
+        .pressed = pressed,
+        .x = x,
+        .y = y,
+        .click_count = count,
+    } });
+}
+
+fn sendMotion(s: sess.Session, x: f64, y: f64) !void {
+    try s.onInput(.{ .pointer_motion = .{ .dx = 0, .dy = 0, .absolute = false, .x = x, .y = y } });
+}
+
+fn sendAxis(s: sess.Session, dy: f64) !void {
+    try s.onInput(.{ .pointer_axis = .{ .dx = 0, .dy = dy } });
+}
+
+test "terminal: drag selection installs, copies on release, right-click clears" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'hello world'" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    const s = ts.session();
+    try s.start();
+    try renderGeometry(&ts, s, &mock);
+    _ = try pumpUntilText(&ts, "hello world", 5000);
+
+    // Motion without a press never selects.
+    try sendMotion(s, 20, 8);
+    try testing.expectEqual(@as(?vt.Selection, null), try ts.vt.selection());
+
+    // Press in cell 0: single click, no selection until the first drag.
+    try sendButton(s, 0x110, true, 4, 8, 1);
+    try testing.expectEqual(@as(?vt.Selection, null), try ts.vt.selection());
+    // Drag to cell 4 (x=39 crosses the ~60% inclusion threshold).
+    try sendMotion(s, 39, 8);
+    try testing.expect((try ts.vt.selection()) != null);
+    try testing.expect(ts.selecting);
+    // Release copies "hello" into both clipboard locations.
+    try sendButton(s, 0x110, false, 39, 8, 1);
+    try testing.expect(!ts.selecting);
+    try testing.expectEqualStrings("hello", ts.clipboardText(.primary));
+    try testing.expectEqualStrings("hello", ts.clipboardText(.standard));
+
+    // Right press clears the selection (kmscon parity).
+    try sendButton(s, 0x111, true, 39, 8, 1);
+    try testing.expectEqual(@as(?vt.Selection, null), try ts.vt.selection());
+}
+
+test "terminal: double-click selects word, triple-click selects line" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'hello world'" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    const s = ts.session();
+    try s.start();
+    try renderGeometry(&ts, s, &mock);
+    _ = try pumpUntilText(&ts, "hello world", 5000);
+    fake_clock_ns = 0;
+    ts.now_ns = fakeNowNs;
+
+    // Single click on cell 1: no selection.
+    try sendButton(s, 0x110, true, 12, 8, 1);
+    try sendButton(s, 0x110, false, 12, 8, 1);
+    try testing.expectEqual(@as(?vt.Selection, null), try ts.vt.selection());
+
+    // Second press within the 400 ms window: word, copied at once.
+    fake_clock_ns = 100 * std.time.ns_per_ms;
+    try sendButton(s, 0x110, true, 12, 8, 2);
+    try testing.expect((try ts.vt.selection()) != null);
+    try testing.expectEqualStrings("hello", ts.clipboardText(.primary));
+    try sendButton(s, 0x110, false, 12, 8, 2);
+
+    // Third press: the whole line.
+    fake_clock_ns = 200 * std.time.ns_per_ms;
+    try sendButton(s, 0x110, true, 12, 8, 3);
+    try testing.expectEqualStrings("hello world", ts.clipboardText(.primary));
+    try sendButton(s, 0x110, false, 12, 8, 3);
+
+    // After the window expires a press is single again: selection cleared.
+    fake_clock_ns = 700 * std.time.ns_per_ms;
+    try sendButton(s, 0x110, true, 12, 8, 1);
+    try testing.expectEqual(@as(?vt.Selection, null), try ts.vt.selection());
+    try sendButton(s, 0x110, false, 12, 8, 1);
+}
+
+test "terminal: middle-click pastes clipboard, bracketed under mode 2004" {
+    // First paste is plain (5 bytes "hello"); the child then enables
+    // bracketed paste and the second paste arrives framed (6+5+6 bytes).
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'hello world'; read -r -N 5 a; printf 'P1'; printf '\\033[?2004h'; read -r -N 17 b; printf 'P2'" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    const s = ts.session();
+    try s.start();
+    try renderGeometry(&ts, s, &mock);
+    _ = try pumpUntilText(&ts, "hello world", 5000);
+
+    // Select "hello" and release -> clipboard.
+    try sendButton(s, 0x110, true, 4, 8, 1);
+    try sendMotion(s, 39, 8);
+    try sendButton(s, 0x110, false, 39, 8, 1);
+    try testing.expectEqualStrings("hello", ts.clipboardText(.primary));
+
+    // Middle press pastes plain "hello" and clears the selection.
+    try sendButton(s, 0x112, true, 4, 8, 1);
+    _ = try pumpUntilText(&ts, "P1", 5000);
+    try testing.expectEqual(@as(?vt.Selection, null), try ts.vt.selection());
+
+    // Wait for mode 2004 to arrive, then paste again: bracketed.
+    try pumpUntil(&ts, {}, struct {
+        fn p(_: void, t: *TerminalSession) bool {
+            return t.vt.getMode(vt.mode(2004, false)) catch false;
+        }
+    }.p, 5000);
+    try sendButton(s, 0x112, true, 4, 8, 1);
+    _ = try pumpUntilText(&ts, "P2", 5000);
+}
+
+test "terminal: wheel scrolls the viewport when not tracking" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "i=0; while [ $i -lt 60 ]; do printf 'line %s\\n' \"$i\"; i=$((i+1)); done" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    const s = ts.session();
+    try s.start();
+    try renderGeometry(&ts, s, &mock);
+    _ = try pumpUntilText(&ts, "line 59", 5000);
+
+    const bottom = try ts.vt.scrollbar();
+    try testing.expectEqual(bottom.total, bottom.offset + bottom.len);
+    // One detent up = 3 lines (kmscon), one detent down returns.
+    try sendAxis(s, -15);
+    try testing.expectEqual(bottom.offset - 3, (try ts.vt.scrollbar()).offset);
+    try sendAxis(s, 15);
+    try testing.expectEqual(bottom.offset, (try ts.vt.scrollbar()).offset);
+    // Fractional finger scrolls accumulate: 5 x -2 units = -2 lines.
+    for (0..5) |_| try sendAxis(s, -2);
+    try testing.expectEqual(bottom.offset - 2, (try ts.vt.scrollbar()).offset);
+}
+
+test "terminal: enabling mouse tracking drops the selection" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'hello world'" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    const s = ts.session();
+    try s.start();
+    try renderGeometry(&ts, s, &mock);
+    _ = try pumpUntilText(&ts, "hello world", 5000);
+
+    try sendButton(s, 0x110, true, 4, 8, 1);
+    try sendMotion(s, 39, 8);
+    try testing.expect((try ts.vt.selection()) != null);
+
+    // The program enables tracking; the next pump drops the selection.
+    ts.vt.write("\x1b[?1000h");
+    try ts.onPtyReadable();
+    try testing.expectEqual(@as(?vt.Selection, null), try ts.vt.selection());
+    try testing.expect(!ts.selecting);
+}
+
+test "terminal: key events clear the selection" {
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'hello world'; read x" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    const s = ts.session();
+    try s.start();
+    try renderGeometry(&ts, s, &mock);
+    _ = try pumpUntilText(&ts, "hello world", 5000);
+
+    try sendButton(s, 0x110, true, 4, 8, 1);
+    try sendMotion(s, 39, 8);
+    try sendButton(s, 0x110, false, 39, 8, 1);
+    try testing.expect((try ts.vt.selection()) != null);
+
+    try sendChar(s, .a, 'a');
+    try testing.expectEqual(@as(?vt.Selection, null), try ts.vt.selection());
+}
+
+test "terminal: mouse reporting SGR format, motion filtered in normal mode" {
+    // Mode 1000 (normal) + 1006 (SGR): motion is not reported, so the
+    // first 9 bytes the child reads are the press report ESC[<0;1;1M.
+    // The case statement matches the raw bytes (the vt would swallow the
+    // CSI if it were printed back).
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033[?1000h\\033[?1006h'; read -r -N 9 x; case \"$x\" in *'0;1;1M') printf SGR_OK;; *) printf SGR_BAD;; esac" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    const s = ts.session();
+    try s.start();
+    try renderGeometry(&ts, s, &mock);
+    try pumpUntil(&ts, {}, struct {
+        fn p(_: void, t: *TerminalSession) bool {
+            return t.vt.mouseTracking() catch false;
+        }
+    }.p, 5000);
+
+    try sendMotion(s, 20, 20);
+    try sendButton(s, 0x110, true, 4, 8, 1);
+    _ = try pumpUntilText(&ts, "SGR_OK", 5000);
+}
+
+test "terminal: side buttons report as extended buttons, not the wheel" {
+    // BTN_SIDE -> ghostty .eight -> xterm extended code 128 (NOT wheel
+    // 64/65). SGR press report is ESC[<128;1;1M = 11 bytes.
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033[?1000h\\033[?1006h'; read -r -N 11 x; case \"$x\" in *'128;1;1M') printf SIDE_OK;; *) printf SIDE_BAD;; esac" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    const s = ts.session();
+    try s.start();
+    try renderGeometry(&ts, s, &mock);
+    try pumpUntil(&ts, {}, struct {
+        fn p(_: void, t: *TerminalSession) bool {
+            return t.vt.mouseTracking() catch false;
+        }
+    }.p, 5000);
+
+    try sendButton(s, 0x113, true, 4, 8, 1); // BTN_SIDE
+    _ = try pumpUntilText(&ts, "SIDE_OK", 5000);
 }
