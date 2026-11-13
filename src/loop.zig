@@ -378,9 +378,9 @@ pub fn nsToTimespec(ns: u64) linux.timespec {
     };
 }
 
-/// Blocks a caller-selectable set of signals with sigprocmask and exposes
-/// them through a nonblocking signalfd registered in a Loop. The original
-/// process mask is restored on deinit.
+/// Blocks a caller-selectable set of signals with rt_sigprocmask(2) and
+/// exposes them through a nonblocking signalfd registered in a Loop. The
+/// original thread signal mask is restored on deinit.
 ///
 /// Blocked signals stay blocked (the process cannot die from them while this
 /// source exists); the callback consumes them via signalfd reads.
@@ -422,6 +422,27 @@ pub const SignalSource = struct {
     pub const InitError = error{ OutOfMemory, ProcessFdQuotaExceeded, SystemFdQuotaExceeded } ||
         Loop.AddError;
 
+    /// Apply `how` to the calling thread's signal mask with the raw
+    /// rt_sigprocmask(2) syscall.
+    ///
+    /// The set is the kernel-ABI `linux.sigset_t` (one word, 8 bytes on
+    /// x86_64), which is exactly what signalfd(2) consumes.
+    /// `posix.sigprocmask` cannot be used here: under `-lc` it resolves to
+    /// libc's `sigprocmask`, whose `posix.sigset_t` is the 128-byte library
+    /// ABI, so handing it a kernel set is a type error (and the wrong size in
+    /// principle). Going straight to the syscall is valid in both freestanding
+    /// and libc builds -- libc's wrapper is a thin shim over this same call
+    /// and keeps no userspace copy of the mask.
+    fn setSignalMask(how: u32, set: ?*const linux.sigset_t, old_set: ?*linux.sigset_t) void {
+        switch (linux.errno(linux.sigprocmask(how, set, old_set))) {
+            .SUCCESS => return,
+            // `how` is a compile-time constant and every pointer comes from a
+            // live local, so the documented failure modes cannot occur.
+            .FAULT, .INVAL => unreachable,
+            else => unreachable,
+        }
+    }
+
     /// Block `options.signals`, create a nonblocking CLOEXEC signalfd, and
     /// register it in `loop` with EPOLLIN interest. The Loop must outlive
     /// this source.
@@ -433,8 +454,8 @@ pub const SignalSource = struct {
         // Block first: signals sent between here and the signalfd creation
         // are queued and become visible through the fd instead of escaping.
         var old_mask: linux.sigset_t = undefined;
-        posix.sigprocmask(linux.SIG.BLOCK, &mask, &old_mask);
-        errdefer posix.sigprocmask(linux.SIG.SETMASK, &old_mask, null);
+        setSignalMask(linux.SIG.BLOCK, &mask, &old_mask);
+        errdefer setSignalMask(linux.SIG.SETMASK, &old_mask, null);
 
         const fd_rc = linux.signalfd(-1, &mask, linux.SFD.CLOEXEC | linux.SFD.NONBLOCK);
         const fd: posix.fd_t = switch (linux.errno(fd_rc)) {
@@ -453,9 +474,9 @@ pub const SignalSource = struct {
         self.* = .{ .fd = fd, .loop_ = loop_, .token = token, .old_mask = old_mask, .options = options };
     }
 
-    /// Restore the process signal mask. Pending signals are drained through
-    /// the fd first so that restoring the mask cannot deliver (and fatally
-    /// act on) a signal nobody consumed.
+    /// Restore the thread signal mask saved by `init`. Pending signals are
+    /// drained through the fd first so that restoring the mask cannot deliver
+    /// (and fatally act on) a signal nobody consumed.
     pub fn deinit(self: *SignalSource) void {
         var info: linux.signalfd_siginfo = undefined;
         while (true) {
@@ -468,7 +489,7 @@ pub const SignalSource = struct {
             closeFd(self.fd);
             self.fd = -1;
         }
-        posix.sigprocmask(linux.SIG.SETMASK, &self.old_mask, null);
+        setSignalMask(linux.SIG.SETMASK, &self.old_mask, null);
     }
 
     pub fn getFd(self: *const SignalSource) posix.fd_t {

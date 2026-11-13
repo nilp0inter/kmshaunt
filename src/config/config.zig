@@ -15,8 +15,8 @@
 //!     `<configdir>/<seat>.seat.conf`) with kmscon precedence:
 //!     defaults < CLI (CONF_LOCKED) < main file < seat file.
 //!   * Grabs, modes/screens, login shell-splitting and the keysym table
-//!     live in the sibling modules; palette presets live in `palette.zig`
-//!     (self-contained copy of `src/misc/palette.zig`, same verified tables).
+//!     live in the sibling modules; palette presets live in the canonical
+//!     `src/misc/palette.zig`.
 //!
 //! Deliberate deviations from kmscon (assignment requirements, see the
 //! module report): unknown/invalid CLI options are typed errors instead
@@ -37,7 +37,7 @@ pub const grab = @import("grab.zig");
 pub const display = @import("display.zig");
 pub const shell = @import("shell.zig");
 pub const keysyms = @import("keysyms.zig");
-pub const palette = @import("palette.zig");
+pub const palette = @import("../misc/palette.zig");
 
 pub const Grab = grab.Grab;
 pub const Mode = display.Mode;
@@ -1255,7 +1255,7 @@ test {
     _ = @import("shell.zig");
     _ = @import("keysyms.zig");
     _ = @import("diag.zig");
-    _ = @import("palette.zig");
+    _ = @import("../misc/palette.zig");
 }
 
 fn cliOk(cfg: *Config, args: []const []const u8) !void {

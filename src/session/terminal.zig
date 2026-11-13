@@ -989,9 +989,9 @@ test "terminal: echo round-trip via onInput key encoding" {
     try sendChar(s, .i, 'i');
     try sendChar(s, .t, 't');
     try sendChar(s, .enter, null);
-    try pumpUntil(&ts, {}, struct {
-        fn p(_: void, t: *TerminalSession) bool {
-            return t.hooks.exits > 0;
+    try pumpUntil(&ts, &log, struct {
+        fn p(l: *HookLog, _: *TerminalSession) bool {
+            return l.exits > 0;
         }
     }.p, 5000);
     try testing.expectEqual(@as(u32, 1), log.exits);
@@ -1030,8 +1030,10 @@ test "terminal: DA and size reports reply through write_pty" {
 }
 
 test "terminal: OSC52 clipboard set/get/clear in-process" {
-    // set "hello" (base64 aGVsbG8=), read it back (reply echoed), clear.
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033]52;c;aGVsbG8=\\007\\033]52;c;?\\007\\033]52;c;\\007'" });
+    // Set "hello" (base64 aGVsbG8=) and read it back (reply echoed); the
+    // clear is delayed with the bash builtin read -t so the set state is
+    // observable before it arrives (no external sleep in the minimal PATH).
+    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033]52;c;aGVsbG8=\\007\\033]52;c;?\\007'; read -t 0.3 x; printf '\\033]52;c;\\007'" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
