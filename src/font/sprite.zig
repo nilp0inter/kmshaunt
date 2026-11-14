@@ -352,24 +352,26 @@ const CornerArc = struct {
     fn inside(self: CornerArc, px: f64, py: f64) bool {
         const left = self.corner == 0 or self.corner == 2;
         const top = self.corner == 0 or self.corner == 1;
-        // Straight stems: vertical from the top/bottom edge to the arc,
-        // horizontal from the left/right edge to the arc.
-        if (top) {
-            if (@abs(px - self.cx) <= self.half and py <= self.cy - self.r) return true;
-        } else {
-            if (@abs(px - self.cx) <= self.half and py >= self.cy + self.r) return true;
-        }
+        // Inset the arc center toward the cell interior so the quarter arc
+        // joins a horizontal stem (to the left/right edge) and a vertical stem
+        // (to the top/bottom edge) that connect to neighbouring line cells.
+        const ax = self.cx + (if (left) self.r else -self.r);
+        const ay = self.cy + (if (top) self.r else -self.r);
         if (left) {
-            if (@abs(py - self.cy) <= self.half and px <= self.cx - self.r) return true;
+            if (@abs(py - self.cy) <= self.half and px >= ax) return true;
         } else {
-            if (@abs(py - self.cy) <= self.half and px >= self.cx + self.r) return true;
+            if (@abs(py - self.cy) <= self.half and px <= ax) return true;
         }
-        // Quarter arc.
-        const in_quadrant = (if (left) px <= self.cx else px >= self.cx) and
-            (if (top) py <= self.cy else py >= self.cy);
+        if (top) {
+            if (@abs(px - self.cx) <= self.half and py >= ay) return true;
+        } else {
+            if (@abs(px - self.cx) <= self.half and py <= ay) return true;
+        }
+        const in_quadrant = (if (left) px <= ax else px >= ax) and
+            (if (top) py <= ay else py >= ay);
         if (!in_quadrant) return false;
-        const dx = px - self.cx;
-        const dy = py - self.cy;
+        const dx = px - ax;
+        const dy = py - ay;
         return @abs(@sqrt(dx * dx + dy * dy) - self.r) <= self.half;
     }
 };
