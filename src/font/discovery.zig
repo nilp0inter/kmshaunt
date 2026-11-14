@@ -499,6 +499,49 @@ pub fn cellMetrics(face: Face) !CellMetrics {
     };
 }
 
+/// ghostty-compatible cell geometry (port of ghostty src/font/Metrics.zig
+/// `calc` + `apply`, with the FreeType vertical metrics). Uses rounding (not
+/// truncation), includes the line gap, and derives the baseline from the cell
+/// bottom with half-gap centering, so the same user adjust-* percentages yield
+/// the same grid as ghostty. `aw/ah/ab` are the adjust-cell-width/height and
+/// adjust-font-baseline percentages.
+pub fn cellMetricsGhostty(face: Face, aw: i32, ah: i32, ab: i32) !CellMetrics {
+    const idx = face.glyphIndex('0') orelse face.glyphIndex(' ') orelse
+        return error.NoReferenceGlyph;
+    try ftCheck(ft.FT_Load_Glyph(face.ft_face, idx, ft.FT_LOAD_DEFAULT));
+    const face_width = @as(f64, @floatFromInt(face.ft_face.*.glyph.*.advance.x)) / 64.0;
+    const sm = face.ft_face.*.size.*.metrics;
+    const ascent = @as(f64, @floatFromInt(sm.ascender)) / 64.0;
+    const descent = @as(f64, @floatFromInt(sm.descender)) / 64.0;
+    const face_height = @as(f64, @floatFromInt(sm.height)) / 64.0;
+    const line_gap = face_height - (ascent - descent);
+
+    var cw = @round(face_width);
+    var ch = @round(face_height);
+    const face_baseline = line_gap / 2.0 - descent;
+    var cb = @round(face_baseline - (ch - face_height) / 2.0); // from cell bottom
+
+    // adjust-cell-width (percent).
+    cw = @max(1, @round(cw * (100.0 + @as(f64, @floatFromInt(aw))) / 100.0));
+    // adjust-cell-height (percent) with baseline recentering, as ghostty does.
+    const orig_ch = ch;
+    ch = @max(1, @round(ch * (100.0 + @as(f64, @floatFromInt(ah))) / 100.0));
+    const half = (ch - orig_ch) / 2.0;
+    const face_y = cb - face_baseline;
+    const pos = face_y - (orig_ch - face_height) / 2.0;
+    const diff_bottom = if (pos > 0) @floor(half) else @ceil(half);
+    cb += diff_bottom;
+    // adjust-font-baseline (percent, relative to cell bottom).
+    cb = @round(cb * (100.0 + @as(f64, @floatFromInt(ab))) / 100.0);
+
+    const baseline_top = ch - cb;
+    return .{
+        .cell_w = @intCast(@as(i32, @intFromFloat(cw))),
+        .cell_h = @intCast(@as(i32, @intFromFloat(ch))),
+        .baseline = @intCast(@max(0, @as(i32, @intFromFloat(baseline_top)))),
+    };
+}
+
 /// Map a FreeType error code to a Zig error.
 fn ftCheck(err: ft.FT_Error) !void {
     if (err == ft.FT_Err_Ok) return;
