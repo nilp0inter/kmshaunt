@@ -2327,6 +2327,18 @@ fn createTerminal(
         .child_exit = hookChildExit,
     };
 
+    // Seed the console's known cell metrics before start(): the spawn-time
+    // TIOCSWINSZ must carry real pixel dimensions. A child that starts with
+    // ws_xpixel/ws_ypixel = 0 (metrics only landed on the first render,
+    // ~400 ms later) makes notcurses derive cellpx = 0 and permanently
+    // disable pixel graphics (pixel_draw = NULL), which aborts demos that
+    // require NCBLIT_PIXEL (keller) and silently degrades the others.
+    if (c.cell.cell_w != 0 and c.cell.cell_h != 0) {
+        ts.cell_w = c.cell.cell_w;
+        ts.cell_h = c.cell.cell_h;
+        try ts.session().resize(cols, rows);
+    }
+
     try ts.session().start();
     try c.terminals.append(alloc, ts);
 
