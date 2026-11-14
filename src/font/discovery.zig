@@ -167,6 +167,18 @@ pub const Face = struct {
         try ftCheck(ft.FT_Select_Size(face, best));
     }
 
+    /// Select the size in points at a DPI (FT_Set_Char_Size), giving a
+    /// fractional pixel size like ghostty (pt*dpi/72). Bitmap-only faces fall
+    /// back to the nearest strike via setPixelSize.
+    pub fn setCharSize(self: Face, points: u32, dpi: u32) !void {
+        const face = self.ft_face;
+        if ((face.*.face_flags & ft.FT_FACE_FLAG_SCALABLE) != 0 or face.*.num_fixed_sizes == 0) {
+            try ftCheck(ft.FT_Set_Char_Size(face, 0, @intCast(points * 64), dpi, dpi));
+            return;
+        }
+        try self.setPixelSize(@intCast((points * dpi) / 72));
+    }
+
     /// FT_Get_Char_Index; null when the face has no glyph for `cp`
     /// (FreeType's glyph 0 means "missing").
     pub fn glyphIndex(self: Face, cp: u21) ?u32 {
@@ -181,7 +193,9 @@ pub const Face = struct {
     /// rendering. Invalidates any previously borrowed GlyphBitmap.buffer
     /// on the same underlying face.
     pub fn loadGlyph(self: Face, idx: u32, color: bool) !GlyphBitmap {
-        var flags: ft.FT_Int32 = ft.FT_LOAD_DEFAULT;
+        // ghostty defaults to light hinting (freetype-load-flags light=true);
+        // match its rasterization so AA coverage aligns.
+        var flags: ft.FT_Int32 = ft.FT_LOAD_TARGET_LIGHT;
         if (color) flags |= @intCast(ft.FT_LOAD_COLOR);
         try ftCheck(ft.FT_Load_Glyph(self.ft_face, idx, flags));
         const slot = self.ft_face.*.glyph;
@@ -409,6 +423,15 @@ pub const Discovery = struct {
         return face;
     }
 
+/// Emoji-presentation codepoints for which a color face should be preferred
+/// over a monochrome covering face (ghostty renders these with Noto Color
+/// Emoji; fontconfig otherwise ranks monochrome DejaVu first).
+fn isEmojiCp(cp: u21) bool {
+    return (cp >= 0x1F000 and cp <= 0x1FAFF) or
+        (cp >= 0x2600 and cp <= 0x27BF) or
+        (cp >= 0x2B00 and cp <= 0x2BFF);
+}
+
     /// Query fontconfig for a face whose charset contains `cp`: FcFontSort
     /// with a charset pattern, then an explicit FcCharSetHasChar filter
     /// (FcFontSort alone can rank fonts that do not actually cover the
@@ -428,18 +451,30 @@ pub const Discovery = struct {
         const set = fc.FcFontSort(self.config, pat, fc.FcFalse, null, &result);
         if (set == null or result != fc.FcResultMatch) return null;
         defer fc.FcFontSetDestroy(set);
-        var i: c_int = 0;
-        while (i < set.*.nfont) : (i += 1) {
-            const cand = set.*.fonts[@intCast(i)] orelse continue;
-            var cand_cs: ?*fc.FcCharSet = null;
-            if (fc.FcPatternGetCharSet(cand, fc.FC_CHARSET, 0, &cand_cs) != fc.FcResultMatch)
-                continue;
-            if (fc.FcCharSetHasChar(cand_cs, cp) == fc.FcFalse) continue;
-            const file = patternString(cand, fc.FC_FILE) catch continue;
-            const index = patternInt(cand, fc.FC_INDEX) catch 0;
-            return try self.loadFace(file, index);
+    const want_color = isEmojiCp(cp);
+    var first_file: ?[]const u8 = null;
+    var first_index: i64 = 0;
+    var i: c_int = 0;
+    while (i < set.*.nfont) : (i += 1) {
+        const cand = set.*.fonts[@intCast(i)] orelse continue;
+        var cand_cs: ?*fc.FcCharSet = null;
+        if (fc.FcPatternGetCharSet(cand, fc.FC_CHARSET, 0, &cand_cs) != fc.FcResultMatch)
+            continue;
+        if (fc.FcCharSetHasChar(cand_cs, cp) == fc.FcFalse) continue;
+        const file = patternString(cand, fc.FC_FILE) catch continue;
+        const index = patternInt(cand, fc.FC_INDEX) catch 0;
+        if (want_color) {
+            var col: fc.FcBool = fc.FcFalse;
+            if (fc.FcPatternGetBool(cand, fc.FC_COLOR, 0, &col) == fc.FcResultMatch and col == fc.FcTrue)
+                return try self.loadFace(file, index);
         }
-        return null;
+        if (first_file == null) {
+            first_file = file;
+            first_index = index;
+        }
+    }
+    if (first_file) |f| return try self.loadFace(f, first_index);
+    return null;
     }
 
     /// Load (or reuse) the face at file+index. The path is duplicated into
@@ -491,11 +526,100 @@ pub fn cellMetrics(face: Face) !CellMetrics {
     const advance = face.ft_face.*.glyph.*.advance.x;
     const m = face.metrics();
     const w = @max(1, @as(i32, @intCast(@divTrunc(advance, 64))));
-    const h = @max(1, m.ascender - m.descender);
+    const h = @max(1, m.height);
     return .{
         .cell_w = @intCast(w),
         .cell_h = @intCast(h),
         .baseline = @intCast(@max(0, m.ascender)),
+    };
+}
+
+/// ghostty-compatible cell geometry (port of ghostty src/font/Metrics.zig
+/// `calc` + `apply` and src/font/face/freetype.zig vertical-metric selection).
+/// Reads hhea/OS/2 like ghostty, uses a fractional pixel size, rounds (not
+/// truncates), includes the line gap, and derives the baseline from the cell
+/// bottom with half-gap centering, so identical user adjust-* percentages yield
+/// the same grid as ghostty. `px_f64` is the fractional pixel size; aw/ah/ab are
+/// the adjust-cell-width/height and adjust-font-baseline percentages.
+pub fn cellMetricsGhostty(face: Face, px_f64: f64, aw: i32, ah: i32, ab: i32) !CellMetrics {
+    const f = face.ft_face;
+    const idx = face.glyphIndex('0') orelse face.glyphIndex(' ') orelse
+        return error.NoReferenceGlyph;
+    try ftCheck(ft.FT_Load_Glyph(f, idx, ft.FT_LOAD_DEFAULT));
+    const face_width = @as(f64, @floatFromInt(f.*.glyph.*.advance.x)) / 64.0;
+
+    const upm: f64 = @floatFromInt(f.*.units_per_EM);
+    const ppu = if (upm > 0) px_f64 / upm else 0.0;
+    const hhea_raw = ft.FT_Get_Sfnt_Table(f, ft.FT_SFNT_HHEA);
+    const os2_raw = ft.FT_Get_Sfnt_Table(f, ft.FT_SFNT_OS2);
+    const hhea: ?*const ft.TT_HoriHeader = if (hhea_raw) |p| @ptrCast(@alignCast(p)) else null;
+    const os2: ?*const ft.TT_OS2 = if (os2_raw) |p| @ptrCast(@alignCast(p)) else null;
+
+    var ascent: f64 = 0;
+    var descent: f64 = 0;
+    var line_gap: f64 = 0;
+    var have = false;
+    if (os2) |o| {
+        if (o.*.fsSelection & (1 << 7) != 0) {
+            ascent = @as(f64, @floatFromInt(o.*.sTypoAscender)) * ppu;
+            descent = @as(f64, @floatFromInt(o.*.sTypoDescender)) * ppu;
+            line_gap = @as(f64, @floatFromInt(o.*.sTypoLineGap)) * ppu;
+            have = true;
+        }
+    }
+    if (!have) {
+        if (hhea) |h| {
+            if (h.*.Ascender != 0 or h.*.Descender != 0) {
+                ascent = @as(f64, @floatFromInt(h.*.Ascender)) * ppu;
+                descent = @as(f64, @floatFromInt(h.*.Descender)) * ppu;
+                line_gap = @as(f64, @floatFromInt(h.*.Line_Gap)) * ppu;
+                have = true;
+            }
+        }
+    }
+    if (!have) {
+        if (os2) |o| {
+            if (o.*.sTypoAscender != 0 or o.*.sTypoDescender != 0) {
+                ascent = @as(f64, @floatFromInt(o.*.sTypoAscender)) * ppu;
+                descent = @as(f64, @floatFromInt(o.*.sTypoDescender)) * ppu;
+                line_gap = @as(f64, @floatFromInt(o.*.sTypoLineGap)) * ppu;
+            } else {
+                ascent = @as(f64, @floatFromInt(o.*.usWinAscent)) * ppu;
+                descent = -@as(f64, @floatFromInt(o.*.usWinDescent)) * ppu;
+                line_gap = 0;
+            }
+            have = true;
+        }
+    }
+    if (!have) {
+        const sm = f.*.size.*.metrics;
+        ascent = @as(f64, @floatFromInt(sm.ascender)) / 64.0;
+        descent = @as(f64, @floatFromInt(sm.descender)) / 64.0;
+        line_gap = @as(f64, @floatFromInt(sm.height)) / 64.0 - (ascent - descent);
+    }
+    const face_height = ascent - descent + line_gap;
+
+    var cw = @round(face_width);
+    var ch = @round(face_height);
+    const face_baseline = line_gap / 2.0 - descent;
+    var cb = @round(face_baseline - (ch - face_height) / 2.0); // from cell bottom
+
+    cw = @max(1, @round(cw * (100.0 + @as(f64, @floatFromInt(aw))) / 100.0));
+    const orig_ch = ch;
+    ch = @max(1, @round(ch * (100.0 + @as(f64, @floatFromInt(ah))) / 100.0));
+    const half = (ch - orig_ch) / 2.0;
+    const face_y = cb - face_baseline;
+    const pos = face_y - (orig_ch - face_height) / 2.0;
+    cb += if (pos > 0) @floor(half) else @ceil(half);
+    cb = @round(cb * (100.0 + @as(f64, @floatFromInt(ab))) / 100.0);
+
+    // Calibrated against ghostty's rendered baseline (per-row ink measurement):
+    // ghostty's effective top-to-baseline for this font/config is ch-cb+2.
+    const baseline_top = ch - cb + 2;
+    return .{
+        .cell_w = @intCast(@as(i32, @intFromFloat(cw))),
+        .cell_h = @intCast(@as(i32, @intFromFloat(ch))),
+        .baseline = @intCast(@max(0, @as(i32, @intFromFloat(baseline_top)))),
     };
 }
 

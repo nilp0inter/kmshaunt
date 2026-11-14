@@ -338,8 +338,8 @@ const RoundCapOutline = struct {
 /// Rounded box-drawing corner (U+256D..U+2570): a quarter-arc of radius
 /// r centered on the cell center, joined to the two edge midpoints.
 /// `corner` selects which quadrant the arc bulges into: 0 = top-left
-/// (U+256F), 1 = top-right (U+2570), 2 = bottom-left (U+256E),
-/// 3 = bottom-right (U+256D).
+/// (U+256D), 1 = top-right (U+256E), 2 = bottom-left (U+2570),
+/// 3 = bottom-right (U+256F).
 const CornerArc = struct {
     cx: f64,
     cy: f64,
@@ -352,24 +352,26 @@ const CornerArc = struct {
     fn inside(self: CornerArc, px: f64, py: f64) bool {
         const left = self.corner == 0 or self.corner == 2;
         const top = self.corner == 0 or self.corner == 1;
-        // Straight stems: vertical from the top/bottom edge to the arc,
-        // horizontal from the left/right edge to the arc.
-        if (top) {
-            if (@abs(px - self.cx) <= self.half and py <= self.cy - self.r) return true;
-        } else {
-            if (@abs(px - self.cx) <= self.half and py >= self.cy + self.r) return true;
-        }
+        // Inset the arc center toward the cell interior so the quarter arc
+        // joins a horizontal stem (to the left/right edge) and a vertical stem
+        // (to the top/bottom edge) that connect to neighbouring line cells.
+        const ax = self.cx + (if (left) self.r else -self.r);
+        const ay = self.cy + (if (top) self.r else -self.r);
         if (left) {
-            if (@abs(py - self.cy) <= self.half and px <= self.cx - self.r) return true;
+            if (@abs(py - self.cy) <= self.half and px >= ax) return true;
         } else {
-            if (@abs(py - self.cy) <= self.half and px >= self.cx + self.r) return true;
+            if (@abs(py - self.cy) <= self.half and px <= ax) return true;
         }
-        // Quarter arc.
-        const in_quadrant = (if (left) px <= self.cx else px >= self.cx) and
-            (if (top) py <= self.cy else py >= self.cy);
+        if (top) {
+            if (@abs(px - self.cx) <= self.half and py >= ay) return true;
+        } else {
+            if (@abs(px - self.cx) <= self.half and py <= ay) return true;
+        }
+        const in_quadrant = (if (left) px <= ax else px >= ax) and
+            (if (top) py <= ay else py >= ay);
         if (!in_quadrant) return false;
-        const dx = px - self.cx;
-        const dy = py - self.cy;
+        const dx = px - ax;
+        const dy = py - ay;
         return @abs(@sqrt(dx * dx + dy * dy) - self.r) <= self.half;
     }
 };
@@ -586,10 +588,10 @@ fn drawBox(out: []u8, c: Cell, cp: u21) void {
         0x254D => drawDash(out, c, true, 2, c.heavy, c.heavy),
         0x254E => drawDash(out, c, false, 2, c.light, c.heavy),
         0x254F => drawDash(out, c, false, 2, c.heavy, c.heavy),
-        0x256D => drawCornerArc(out, c, 3),
-        0x256E => drawCornerArc(out, c, 2),
-        0x256F => drawCornerArc(out, c, 0),
-        0x2570 => drawCornerArc(out, c, 1),
+        0x256D => drawCornerArc(out, c, 0),
+        0x256E => drawCornerArc(out, c, 1),
+        0x256F => drawCornerArc(out, c, 3),
+        0x2570 => drawCornerArc(out, c, 2),
         0x2571 => drawDiagonal(out, c, false, c.light),
         0x2572 => drawDiagonal(out, c, true, c.light),
         0x2573 => {

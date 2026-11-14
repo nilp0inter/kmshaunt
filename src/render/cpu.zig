@@ -1868,11 +1868,59 @@ fn blendChannel(fg: u32, bg: u32, a: u8) u32 {
     return (fg * aa + bg * (255 - aa) + 127) / 255;
 }
 
+/// sRGB<->linear LUTs + transfer fns for ghostty linear-corrected blending.
+const s2l: [256]f32 = blk: {
+    @setEvalBranchQuota(100000);
+    var t: [256]f32 = undefined;
+    for (&t, 0..) |*v, i| {
+        const x = @as(f32, @floatFromInt(i)) / 255.0;
+        v.* = if (x <= 0.04045) x / 12.92 else std.math.pow(f32, (x + 0.055) / 1.055, 2.4);
+    }
+    break :blk t;
+};
+const l2s: [1024]u8 = blk: {
+    @setEvalBranchQuota(100000);
+    var t: [1024]u8 = undefined;
+    for (&t, 0..) |*v, i| {
+        const x = @as(f32, @floatFromInt(i)) / 1023.0;
+        const vf = if (x <= 0.0031308) x * 12.92 else 1.055 * std.math.pow(f32, x, 1.0 / 2.4) - 0.055;
+        v.* = @intFromFloat(@max(0.0, @min(255.0, @round(vf * 255.0))));
+    }
+    break :blk t;
+};
+fn linF(x: f32) f32 {
+    return if (x <= 0.04045) x / 12.92 else std.math.pow(f32, (x + 0.055) / 1.055, 2.4);
+}
+fn unlinF(x: f32) f32 {
+    return if (x <= 0.0031308) x * 12.92 else 1.055 * std.math.pow(f32, x, 1.0 / 2.4) - 0.055;
+}
+fn linIdx(l: f32) usize {
+    return @intCast(std.math.clamp(@as(i32, @intFromFloat(@round(l * 1023.0))), 0, 1023));
+}
+
+/// ghostty linear-corrected source-over: derive a corrected coverage so the
+/// linear blend reproduces the sRGB-blend luminance, then blend in linear.
+/// Matches ghostty alpha-blending=linear-corrected (Linux default).
 fn blendPixel(fg: u32, bg: u32, a: u8) u32 {
-    const r = blendChannel((fg >> 16) & 0xff, (bg >> 16) & 0xff, a);
-    const g = blendChannel((fg >> 8) & 0xff, (bg >> 8) & 0xff, a);
-    const b = blendChannel(fg & 0xff, bg & 0xff, a);
-    return (r << 16) | (g << 8) | b;
+    if (a == 0) return bg;
+    if (a == 255) return fg;
+    const fr = s2l[(fg >> 16) & 0xff];
+    const fg2 = s2l[(fg >> 8) & 0xff];
+    const fbl = s2l[fg & 0xff];
+    const br = s2l[(bg >> 16) & 0xff];
+    const bg2 = s2l[(bg >> 8) & 0xff];
+    const bb = s2l[bg & 0xff];
+    const fg_l = 0.2126 * fr + 0.7152 * fg2 + 0.0722 * fbl;
+    const bg_l = 0.2126 * br + 0.7152 * bg2 + 0.0722 * bb;
+    var af = @as(f32, @floatFromInt(a)) / 255.0;
+    if (@abs(fg_l - bg_l) > 0.001) {
+        const blend_l = linF(unlinF(fg_l) * af + unlinF(bg_l) * (1.0 - af));
+        af = std.math.clamp((blend_l - bg_l) / (fg_l - bg_l), 0.0, 1.0);
+    }
+    const r = l2s[linIdx(fr * af + br * (1.0 - af))];
+    const g = l2s[linIdx(fg2 * af + bg2 * (1.0 - af))];
+    const b = l2s[linIdx(fbl * af + bb * (1.0 - af))];
+    return (@as(u32, r) << 16) | (@as(u32, g) << 8) | b;
 }
 
 /// Vectorized a8 coverage blend for one glyph row: `src` holds one coverage
@@ -1882,28 +1930,7 @@ fn blendPixel(fg: u32, bg: u32, a: u8) u32 {
 /// M8.1: the unicode benchmark blits the same .notdef raster into thousands
 /// of CJK cells per frame, so the per-pixel blend is the frame bottleneck.
 fn blendA8Row(dst: []u8, src: []const u8, fg: u32) void {
-    const V = @Vector(4, u32);
-    const n = src.len;
-    const fgr: V = @splat((fg >> 16) & 0xff);
-    const fgg: V = @splat((fg >> 8) & 0xff);
-    const fgb: V = @splat(fg & 0xff);
-    const mask: V = @splat(0xff);
-    const round: V = @splat(127);
-    const k255: V = @splat(255);
-    const s16: V = @splat(16);
-    const s8: V = @splat(8);
-    var i: usize = 0;
-    while (i + 4 <= n) : (i += 4) {
-        const av: V = .{ src[i], src[i + 1], src[i + 2], src[i + 3] };
-        const dv = @as(*align(1) const V, @ptrCast(dst[i * 4 ..].ptr)).*;
-        const inv = k255 - av;
-        const rr = (fgr * av + ((dv >> s16) & mask) * inv + round) / k255;
-        const gg = (fgg * av + ((dv >> s8) & mask) * inv + round) / k255;
-        const bb = (fgb * av + (dv & mask) * inv + round) / k255;
-        @as(*align(1) V, @ptrCast(dst[i * 4 ..].ptr)).* = (rr << s16) | (gg << s8) | bb;
-    }
-    while (i < n) : (i += 1) {
-        const a = src[i];
+    for (src, 0..) |a, i| {
         if (a == 0) continue;
         const off = i * 4;
         const d = std.mem.readInt(u32, dst[off..][0..4], .little);

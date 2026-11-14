@@ -4,3 +4,4 @@ zig-out/
 zig-pkg/
 result*
 fixtures/t2/fonts/
+parity-inspect/

@@ -1029,21 +1029,32 @@ const Console = struct {
     }
 
     fn setupFont(self: *Console) !void {
+        // ghostty interprets font-size in points at 96 DPI (pt*96/72 = pt*4/3);
+        // match it so the same user value yields the same pixel size.
         self.size_px = if (self.cfg.font_size != 0)
-            @intCast(@min(self.cfg.font_size, std.math.maxInt(u16)))
+            @intCast(@min((self.cfg.font_size * 4) / 3, std.math.maxInt(u16)))
         else
             autoFontSize(self.mode);
 
         self.disc = try discovery.Discovery.init(self.alloc);
         self.face = try self.disc.?.primaryFace(self.cfg.font_name, self.size_px);
-        self.cell = try discovery.cellMetrics(self.face);
+        if (self.cfg.font_size != 0) try self.face.setCharSize(self.cfg.font_size, 96);
+        const px_f64 = if (self.cfg.font_size != 0)
+            @as(f64, @floatFromInt(self.cfg.font_size)) * 96.0 / 72.0
+        else
+            @as(f64, @floatFromInt(self.size_px));
+        self.cell = try discovery.cellMetricsGhostty(self.face, px_f64, self.cfg.adjust_cell_width, self.cfg.adjust_cell_height, self.cfg.adjust_font_baseline);
         if (self.cell.cell_w == 0 or self.cell.cell_h == 0) return error.InvalidCellMetrics;
 
         self.renderer = try cpu.CpuRenderer.init(self.alloc, &self.disc.?, &self.face, .{
             .size_px = self.size_px,
         });
+        // The renderer defaults its baseline to the face ascender; use the
+        // ghostty-compatible baseline so text/underlines sit at ghostty's height.
+        self.renderer.?.metrics.baseline = self.cell.baseline;
         try self.rebuildLayout();
     }
+
 
     /// Recompute the shared canvas + per-output viewports from the current
     /// cell size and rotations (computeLayout, M5.4), resize the renderer and
