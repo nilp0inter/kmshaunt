@@ -193,7 +193,9 @@ pub const Face = struct {
     /// rendering. Invalidates any previously borrowed GlyphBitmap.buffer
     /// on the same underlying face.
     pub fn loadGlyph(self: Face, idx: u32, color: bool) !GlyphBitmap {
-        var flags: ft.FT_Int32 = ft.FT_LOAD_DEFAULT;
+        // ghostty defaults to light hinting (freetype-load-flags light=true);
+        // match its rasterization so AA coverage aligns.
+        var flags: ft.FT_Int32 = ft.FT_LOAD_TARGET_LIGHT;
         if (color) flags |= @intCast(ft.FT_LOAD_COLOR);
         try ftCheck(ft.FT_Load_Glyph(self.ft_face, idx, flags));
         const slot = self.ft_face.*.glyph;
