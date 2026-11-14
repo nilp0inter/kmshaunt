@@ -423,6 +423,15 @@ pub const Discovery = struct {
         return face;
     }
 
+/// Emoji-presentation codepoints for which a color face should be preferred
+/// over a monochrome covering face (ghostty renders these with Noto Color
+/// Emoji; fontconfig otherwise ranks monochrome DejaVu first).
+fn isEmojiCp(cp: u21) bool {
+    return (cp >= 0x1F000 and cp <= 0x1FAFF) or
+        (cp >= 0x2600 and cp <= 0x27BF) or
+        (cp >= 0x2B00 and cp <= 0x2BFF);
+}
+
     /// Query fontconfig for a face whose charset contains `cp`: FcFontSort
     /// with a charset pattern, then an explicit FcCharSetHasChar filter
     /// (FcFontSort alone can rank fonts that do not actually cover the
@@ -442,18 +451,30 @@ pub const Discovery = struct {
         const set = fc.FcFontSort(self.config, pat, fc.FcFalse, null, &result);
         if (set == null or result != fc.FcResultMatch) return null;
         defer fc.FcFontSetDestroy(set);
-        var i: c_int = 0;
-        while (i < set.*.nfont) : (i += 1) {
-            const cand = set.*.fonts[@intCast(i)] orelse continue;
-            var cand_cs: ?*fc.FcCharSet = null;
-            if (fc.FcPatternGetCharSet(cand, fc.FC_CHARSET, 0, &cand_cs) != fc.FcResultMatch)
-                continue;
-            if (fc.FcCharSetHasChar(cand_cs, cp) == fc.FcFalse) continue;
-            const file = patternString(cand, fc.FC_FILE) catch continue;
-            const index = patternInt(cand, fc.FC_INDEX) catch 0;
-            return try self.loadFace(file, index);
+    const want_color = isEmojiCp(cp);
+    var first_file: ?[]const u8 = null;
+    var first_index: i64 = 0;
+    var i: c_int = 0;
+    while (i < set.*.nfont) : (i += 1) {
+        const cand = set.*.fonts[@intCast(i)] orelse continue;
+        var cand_cs: ?*fc.FcCharSet = null;
+        if (fc.FcPatternGetCharSet(cand, fc.FC_CHARSET, 0, &cand_cs) != fc.FcResultMatch)
+            continue;
+        if (fc.FcCharSetHasChar(cand_cs, cp) == fc.FcFalse) continue;
+        const file = patternString(cand, fc.FC_FILE) catch continue;
+        const index = patternInt(cand, fc.FC_INDEX) catch 0;
+        if (want_color) {
+            var col: fc.FcBool = fc.FcFalse;
+            if (fc.FcPatternGetBool(cand, fc.FC_COLOR, 0, &col) == fc.FcResultMatch and col == fc.FcTrue)
+                return try self.loadFace(file, index);
         }
-        return null;
+        if (first_file == null) {
+            first_file = file;
+            first_index = index;
+        }
+    }
+    if (first_file) |f| return try self.loadFace(f, first_index);
+    return null;
     }
 
     /// Load (or reuse) the face at file+index. The path is duplicated into
