@@ -53,12 +53,16 @@
 //!   goes into one HarfBuzz buffer and the glyphs are laid out with a pen
 //!   walk (LTR or RTL) inside the cell.
 //! * Cell width ALWAYS comes from libghostty (`Cell.wide`), never from the
-//!   font (R1): a wide base owns 2 cells, its continuation owns none. A
-//!   glyph raster wider than its cell span is box-filtered down to fit.
+//!   font (R1): a wide base owns 2 cells, its continuation owns none. Like
+//!   ghostty, glyph rasters may overflow their cell span; sizing constraints
+//!   happen at raster time (emoji), never at blit.
 //! * Color glyphs (CBDT/sbix via FT_LOAD_COLOR, COLRv0/v1 via hb-raster,
 //!   both through font/color.zig) land on the atlas bgra8 page as
-//!   premultiplied BGRA and composite source-over onto the cell
-//!   background. Sprites (font/sprite.zig) take precedence over shaping.
+//!   premultiplied BGRA. Emoji rasters are constrained to the primary face
+//!   box (.cover, ghostty SharedGrid) and resized with the vendored stb
+//!   Mitchell filter, then composite source-over in LINEAR light (ghostty
+//!   GL_FRAMEBUFFER_SRGB). Sprites (font/sprite.zig) take precedence over
+//!   shaping.
 //! * Repeated (glyph, fg, bg) tuples over an untouched uniform background
 //!   (the unicode benchmark's .notdef tofu across CJK cells) blend ONCE
 //!   into a cached bitmap and memcpy-blit thereafter (M8.1 composited
@@ -124,8 +128,15 @@ const image_cache_limit_bytes: usize = @intCast(2 * vt.default_kitty_storage_lim
 
 /// Init-time configuration.
 pub const Options = struct {
-    /// Pixel size set on the face; part of every atlas key.
+    /// Legacy integer pixel size, used when size_points == 0; part of
+    /// every atlas key.
     size_px: u16,
+    /// Point size + DPI for ghostty-faithful fractional sizing. When
+    /// size_points != 0 the face is sized with FT_Set_Char_Size (ghostty
+    /// setSize_) instead of FT_Set_Pixel_Sizes, so outlines rasterize at
+    /// the fractional ppem (14pt@96dpi = 18.671875px, not 18).
+    size_points: u32 = 0,
+    size_dpi: u32 = 96,
     /// Atlas page dimensions (shared by the a8 and bgra8 pages).
     atlas_width: u16 = 1024,
     atlas_height: u16 = 1024,
@@ -146,6 +157,10 @@ pub const CpuRenderer = struct {
     /// Discovery. Cell geometry and decorations use its metrics.
     face: discovery.Face,
     size_px: u16,
+    /// Fractional text sizing (Options.size_points/size_dpi); 0 points
+    /// selects the legacy integer pixel path.
+    size_points: u32 = 0,
+    size_dpi: u32 = 96,
     /// The init configuration, kept so setFontSize can re-initialize at a
     /// new pixel size. `font_features` borrows the caller's strings (they
     /// must outlive the renderer, like `discovery`).
@@ -270,13 +285,18 @@ pub const CpuRenderer = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, d: *discovery.Discovery, face: *discovery.Face, opts: Options) !CpuRenderer {
-        try face.setPixelSize(opts.size_px);
+        if (opts.size_points != 0)
+            try face.setCharSize(opts.size_points, opts.size_dpi)
+        else
+            try face.setPixelSize(opts.size_px);
         const metrics = try discovery.cellMetrics(face.*);
         var self = CpuRenderer{
             .allocator = allocator,
             .discovery = d,
             .face = face.*,
             .size_px = opts.size_px,
+            .size_points = opts.size_points,
+            .size_dpi = opts.size_dpi,
             .opts = opts,
             .metrics = metrics,
             .atlas = try atlas.GlyphAtlas.init(allocator, opts.atlas_width, opts.atlas_height),
@@ -378,6 +398,13 @@ pub const CpuRenderer = struct {
         if (new_size_px == self.size_px) return self.metrics;
         var opts = self.opts;
         opts.size_px = new_size_px;
+        if (opts.size_points != 0 and opts.size_dpi != 0) {
+            // Zoom steps pixels; convert back to points at the configured
+            // DPI so the face keeps ghostty's fractional char sizing.
+            const px: f32 = @floatFromInt(new_size_px);
+            const dpi: f32 = @floatFromInt(opts.size_dpi);
+            opts.size_points = @intFromFloat(@round(px * 72.0 / dpi));
+        }
         var fresh = try init(self.allocator, self.discovery, &self.face, opts);
         errdefer fresh.deinit();
         try fresh.resize(self.cols, self.rows, fresh.metrics.cell_w, fresh.metrics.cell_h);
@@ -963,7 +990,7 @@ pub const CpuRenderer = struct {
         const fallback = blk: {
             if (self.fallback_faces.get(cp)) |entry| break :blk entry;
             const face = try self.discovery.fallbackFace(cp);
-            if (face) |f| try f.setPixelSize(self.size_px);
+            if (face) |f| try self.applyTextSize(f);
             try self.fallback_faces.put(self.allocator, cp, face);
             break :blk face;
         };
@@ -974,6 +1001,18 @@ pub const CpuRenderer = struct {
             return self.faceSlot(styled);
         }
         return self.faceSlot(style_face);
+    }
+
+    /// Size a face handle for text: ghostty's fractional char size when
+    /// configured (Options.size_points), the legacy integer pixel size
+    /// otherwise. Used for fallback faces and to restore the text size
+    /// after a color strike selection.
+    fn applyTextSize(self: *const CpuRenderer, f: discovery.Face) !void {
+        var face = f;
+        if (self.size_points != 0)
+            try face.setCharSize(self.size_points, self.size_dpi)
+        else
+            try face.setPixelSize(self.size_px);
     }
 
     /// Bold/italic variant of the primary face, matched once per style
@@ -1079,7 +1118,7 @@ pub const CpuRenderer = struct {
             for (span[lo..hi]) |cd| cells_w += @as(u32, cd.width);
             const max_w = @max(cells_w, 1) * cw;
             const x_px: i32 = @as(i32, @intCast(cell_idx)) * cw;
-            try self.drawGlyph(f, x_px, y_px, face_id, g, max_w, self.row_cells[cell_idx].fg);
+            try self.drawGlyph(f, x_px, y_px, face_id, g, max_w, cell_idx, self.row_cells[cell_idx].fg);
         }
     }
 
@@ -1133,11 +1172,17 @@ pub const CpuRenderer = struct {
         direction: shaper.Direction,
         max_w: u32,
     ) !void {
+        // The constraint width belongs to the cluster's BASE cell, not
+        // the pen position of each individual glyph.
+        const cell_x: usize = if (self.metrics.cell_w > 0)
+            @intCast(@divTrunc(x_px, @as(i32, self.metrics.cell_w)))
+        else
+            0;
         var pen: f32 = if (direction == .rtl) @floatFromInt(max_w) else 0;
         for (glyphs) |g| {
             if (direction == .rtl) pen -= g.x_advance;
             const gx = x_px + roundI32(pen);
-            try self.drawGlyph(f, gx, y_px, rc.face_id, g, max_w, rc.fg);
+            try self.drawGlyph(f, gx, y_px, rc.face_id, g, max_w, cell_x, rc.fg);
             if (direction != .rtl) pen += g.x_advance;
         }
     }
@@ -1145,9 +1190,11 @@ pub const CpuRenderer = struct {
     /// Rasterize (or fetch from the atlas) one shaped glyph and blit it at
     /// the pen position `x_px`/`y_px` plus bearings and shaped offsets.
     /// Color faces route through color.renderColor (premultiplied BGRA on
-    /// the bgra8 page); a glyph without a color representation falls back
-    /// to the gray/FT_LOAD_COLOR raster. `max_w` is the glyph's cell span
-    /// in pixels; wider rasters are scaled down to fit (R1).
+    /// the bgra8 page) with ghostty's emoji constraint + stb resize; a
+    /// glyph without a color representation falls back to the gray raster.
+    /// `max_w` is the glyph's cell span in pixels; like ghostty, rasters
+    /// may overflow it (no blit-time scaling). `cell_x` is the glyph's
+    /// base cell, used for the emoji constraint width.
     fn drawGlyph(
         self: *CpuRenderer,
         f: *Framebuffer,
@@ -1156,6 +1203,7 @@ pub const CpuRenderer = struct {
         face_id: u16,
         g: shaper.ShapedGlyph,
         max_w: u32,
+        cell_x: usize,
         fg: u32,
     ) !void {
         const slot = &self.faces.items[face_id];
@@ -1167,30 +1215,59 @@ pub const CpuRenderer = struct {
         };
         const entry = self.atlas.get(key) orelse blk: {
             if (slot.has_color) {
-                var cg: ?color.ColorGlyph = color.renderColor(
-                    self.allocator,
-                    @ptrCast(&slot.face.ft_face),
-                    g.glyph_index,
-                    self.size_px,
-                ) catch |err| switch (err) {
+                var cg: ?color.ColorGlyph = (if (self.size_points != 0)
+                    color.renderColorCharSize(
+                        self.allocator,
+                        @ptrCast(&slot.face.ft_face),
+                        g.glyph_index,
+                        self.size_points,
+                        self.size_dpi,
+                    )
+                else
+                    color.renderColor(
+                        self.allocator,
+                        @ptrCast(&slot.face.ft_face),
+                        g.glyph_index,
+                        self.size_px,
+                    )) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => null, // color paint failed: try the gray path
                 };
                 // renderColor may have selected a bitmap strike; restore
                 // the text size for later shaping/loads on this face.
-                try slot.face.setPixelSize(self.size_px);
+                try self.applyTextSize(slot.face);
                 if (cg) |*c| {
                     defer c.deinit(self.allocator);
+                    // ghostty emoji presentation: .cover constraint against
+                    // the primary face box + stb resize. Only when the grid
+                    // carries ghostty face metrics (the legacy cellMetrics
+                    // path leaves them zero: native raster and bearings).
+                    var constrained: ?color.ColorGlyph = null;
+                    defer if (constrained) |*cc| cc.deinit(self.allocator);
+                    if (self.metrics.face_width > 0 and self.metrics.face_height > 0) {
+                        constrained = color.constrainEmoji(self.allocator, c, .{
+                            .cell_width = @floatFromInt(self.metrics.cell_w),
+                            .cell_height = @floatFromInt(self.metrics.cell_h),
+                            .cell_baseline = @floatFromInt(@as(i32, self.metrics.cell_h) - @as(i32, self.metrics.baseline)),
+                            .face_width = self.metrics.face_width,
+                            .face_height = self.metrics.face_height,
+                            .face_y = self.metrics.face_y,
+                        }, self.emojiConstraintWidth(cell_x, y_px, max_w)) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => null, // degenerate constraint: native raster
+                        };
+                    }
+                    const src = if (constrained) |*cc| cc else c;
                     break :blk try self.atlas.insert(key, .{
-                        .bearing_x = clampI16(c.bearing_x),
-                        .bearing_y = clampI16(c.bearing_y),
+                        .bearing_x = clampI16(src.bearing_x),
+                        .bearing_y = clampI16(src.bearing_y),
                         .advance_x = clampI16(roundI32(g.x_advance)),
                     }, .{
                         .format = .bgra8,
-                        .width = @intCast(c.width),
-                        .height = @intCast(c.height),
-                        .data = c.pixels,
-                        .stride = c.pitch,
+                        .width = @intCast(src.width),
+                        .height = @intCast(src.height),
+                        .data = src.pixels,
+                        .stride = src.pitch,
                     });
                 }
             }
@@ -1206,7 +1283,7 @@ pub const CpuRenderer = struct {
         const dst_y = y_px + @as(i32, self.metrics.baseline) - @as(i32, entry.bearing_y) - roundI32(g.y_offset);
         // M8.1 composited cache: a repeated (glyph, fg, bg) tuple over an
         // untouched uniform background blends once, memcpy-blits after.
-        // Native-size a8 only; downscaled/color rasters blend normally.
+        // Native-size a8 only; color rasters blend normally.
         if (entry.format == .a8 and entry.width > 0 and entry.height > 0 and
             entry.width <= max_w and
             @as(usize, entry.width) * entry.height <= @as(usize, self.metrics.cell_w) * self.metrics.cell_h * 4)
@@ -1218,8 +1295,40 @@ pub const CpuRenderer = struct {
                 }
             }
         }
-        self.blitFit(f, dst_x, dst_y, entry, fg, max_w);
-        self.markInkedFit(dst_x, dst_y, entry, max_w);
+        self.blitEntry(f, dst_x, dst_y, entry, fg);
+        self.markInked(dst_x, dst_y, entry.width, entry.height);
+    }
+
+    /// ghostty cell.zig constraintWidth: wide cells always get 2; narrow
+    /// symbol-like glyphs may extend into a second cell when the next
+    /// cell is empty/space and the previous cell is not a non-graphics
+    /// symbol. `cell_x` is the glyph's base cell, `max_w` its pixel span.
+    fn emojiConstraintWidth(self: *const CpuRenderer, cell_x: usize, y_px: i32, max_w: u32) u2 {
+        const cw: u32 = self.metrics.cell_w;
+        const cells_w = if (cw > 0) @max(1, max_w / cw) else 1;
+        if (cells_w > 1) return 2;
+        const ch: i32 = self.metrics.cell_h;
+        if (ch <= 0) return 1;
+        const row = @divTrunc(y_px, ch);
+        if (row < 0 or row >= self.rows) return 1;
+        const n: usize = self.row_lens[@intCast(row)];
+        if (cell_x >= n) return 1;
+        if (!isSymbol(self.cellBaseCp(cell_x))) return 1;
+        if (cell_x + 1 >= self.cols) return 1;
+        if (cell_x > 0) {
+            const prev_cp = self.cellBaseCp(cell_x - 1);
+            if (isSymbol(prev_cp) and !isGraphicsElement(prev_cp)) return 1;
+        }
+        // Cells past the collected row length are empty.
+        const next_cp: u21 = if (cell_x + 1 < n) self.cellBaseCp(cell_x + 1) else 0;
+        if (next_cp == 0 or next_cp == 0x20 or next_cp == 0x2002) return 2;
+        return 1;
+    }
+
+    /// Base codepoint of a collected cell (0 when empty).
+    fn cellBaseCp(self: *const CpuRenderer, x: usize) u21 {
+        const rc = &self.row_cells[x];
+        return if (rc.n_cps > 0) self.row_cps.items[rc.cps_start] else 0;
     }
 
     /// Rasterize a code-drawn sprite into the atlas and blit it. Sprites
@@ -1315,20 +1424,6 @@ pub const CpuRenderer = struct {
             @memcpy(fbRow(f, c.x, c.y + r, c.w), src);
         }
         return true;
-    }
-
-    /// Mark the cells a glyph blit covers as drawn-on (see cell_inked).
-    /// Mirrors blitFit's geometry: native size, or box-filtered down to
-    /// max_w when the raster is wider than its cell span.
-    fn markInkedFit(self: *CpuRenderer, dst_x: i32, dst_y: i32, entry: atlas.AtlasEntry, max_w: u32) void {
-        var w: u32 = entry.width;
-        var h: u32 = entry.height;
-        if (max_w > 0 and entry.width > max_w) {
-            w = max_w;
-            const scale = @as(f32, @floatFromInt(max_w)) / @as(f32, @floatFromInt(entry.width));
-            h = @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(entry.height)) * scale))));
-        }
-        self.markInked(dst_x, dst_y, w, h);
     }
 
     /// Mark every grid cell a pixel rect touches as drawn-on. Conservative
@@ -1482,7 +1577,10 @@ pub const CpuRenderer = struct {
     /// Blit a cached glyph at (dst_x, dst_y), clipped to the framebuffer.
     /// a8 entries blend `color` by coverage; bgra8 entries carry their own
     /// PREMULTIPLIED BGRA pixels (color.zig and FT_LOAD_COLOR both emit
-    /// premultiplied alpha), composited source-over: out = src + dst*(1-a).
+    /// premultiplied alpha), composited source-over in LINEAR light:
+    /// out = src + dst*(1-a) with sRGB decode/encode (ghostty
+    /// GL_FRAMEBUFFER_SRGB). No blit-time scaling: rasters may overflow
+    /// their cell span like ghostty.
     fn blitEntry(
         self: *const CpuRenderer,
         f: *Framebuffer,
@@ -1518,88 +1616,13 @@ pub const CpuRenderer = struct {
                         const out = if (a == 255)
                             (@as(u32, src[off + 2]) << 16) | (@as(u32, src[off + 1]) << 8) | src[off]
                         else
-                            blendPremul(src[off + 2], (d >> 16) & 0xff, a) << 16 |
-                                blendPremul(src[off + 1], (d >> 8) & 0xff, a) << 8 |
-                                blendPremul(src[off], d & 0xff, a);
+                            blendPremulLinear(src[off + 2], (d >> 16) & 0xff, a) << 16 |
+                                blendPremulLinear(src[off + 1], (d >> 8) & 0xff, a) << 8 |
+                                blendPremulLinear(src[off], d & 0xff, a);
                         std.mem.writeInt(u32, dst[off..][0..4], out, .little);
                     }
                 }
             },
-        }
-    }
-
-    /// Blit with downscale-to-fit: a glyph wider than its cell span (1 or 2
-    /// cells -- the width always comes from libghostty, R1) is box-filtered
-    /// down, aspect preserved. Native-size glyphs take the fast path.
-    fn blitFit(
-        self: *const CpuRenderer,
-        f: *Framebuffer,
-        dst_x: i32,
-        dst_y: i32,
-        entry: atlas.AtlasEntry,
-        fg: u32,
-        max_w: u32,
-    ) void {
-        if (entry.width == 0 or entry.height == 0) return;
-        if (max_w == 0 or entry.width <= max_w) return self.blitEntry(f, dst_x, dst_y, entry, fg);
-        const dw = max_w;
-        const scale = @as(f32, @floatFromInt(dw)) / @as(f32, @floatFromInt(entry.width));
-        const dh = @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(entry.height)) * scale))));
-        const c = clipToFb(f, dst_x, dst_y, dw, dh) orelse return;
-        const sw: u64 = entry.width;
-        const sh: u64 = entry.height;
-        const region = switch (entry.format) {
-            .a8 => self.atlas.a8Region(entry),
-            .bgra8 => self.atlas.bgra8Region(entry),
-        };
-        const bpp: usize = if (entry.format == .a8) 1 else 4;
-        var r: u32 = 0;
-        while (r < c.h) : (r += 1) {
-            const dy: u64 = c.src_y + r;
-            const sy0 = dy * sh / dh;
-            const sy1 = @max((dy + 1) * sh / dh, sy0 + 1);
-            const dst = fbRow(f, c.x, c.y + r, c.w);
-            var i: u32 = 0;
-            while (i < c.w) : (i += 1) {
-                const dx: u64 = c.src_x + i;
-                const sx0 = dx * sw / dw;
-                const sx1 = @max((dx + 1) * sw / dw, sx0 + 1);
-                var sum = [4]u64{ 0, 0, 0, 0 };
-                var count: u64 = 0;
-                var sy = sy0;
-                while (sy < sy1) : (sy += 1) {
-                    const src_row = region.data[@as(usize, sy) * region.stride ..];
-                    var sx = sx0;
-                    while (sx < sx1) : (sx += 1) {
-                        const off = @as(usize, sx) * bpp;
-                        if (bpp == 1) {
-                            sum[0] += src_row[off];
-                        } else {
-                            sum[0] += src_row[off];
-                            sum[1] += src_row[off + 1];
-                            sum[2] += src_row[off + 2];
-                            sum[3] += src_row[off + 3];
-                        }
-                        count += 1;
-                    }
-                }
-                const off = @as(usize, i) * 4;
-                const d = std.mem.readInt(u32, dst[off..][0..4], .little);
-                const out: u32 = switch (entry.format) {
-                    .a8 => blendPixel(fg, d, @intCast((sum[0] + count / 2) / count)),
-                    .bgra8 => blk: {
-                        const a: u8 = @intCast((sum[3] + count / 2) / count);
-                        if (a == 0) break :blk d;
-                        const b: u32 = @intCast((sum[0] + count / 2) / count);
-                        const g: u32 = @intCast((sum[1] + count / 2) / count);
-                        const rr: u32 = @intCast((sum[2] + count / 2) / count);
-                        break :blk blendPremul(rr, (d >> 16) & 0xff, a) << 16 |
-                            blendPremul(g, (d >> 8) & 0xff, a) << 8 |
-                            blendPremul(b, d & 0xff, a);
-                    },
-                };
-                std.mem.writeInt(u32, dst[off..][0..4], out, .little);
-            }
         }
     }
 
@@ -1868,7 +1891,8 @@ fn blendChannel(fg: u32, bg: u32, a: u8) u32 {
     return (fg * aa + bg * (255 - aa) + 127) / 255;
 }
 
-/// sRGB<->linear LUTs + transfer fns for ghostty linear-corrected blending.
+/// sRGB->linear LUT + transfer fns for ghostty linear-corrected blending.
+/// The linear->sRGB direction is encoded directly from f32 (encodeSrgb).
 const s2l: [256]f32 = blk: {
     @setEvalBranchQuota(100000);
     var t: [256]f32 = undefined;
@@ -1878,24 +1902,19 @@ const s2l: [256]f32 = blk: {
     }
     break :blk t;
 };
-const l2s: [1024]u8 = blk: {
-    @setEvalBranchQuota(100000);
-    var t: [1024]u8 = undefined;
-    for (&t, 0..) |*v, i| {
-        const x = @as(f32, @floatFromInt(i)) / 1023.0;
-        const vf = if (x <= 0.0031308) x * 12.92 else 1.055 * std.math.pow(f32, x, 1.0 / 2.4) - 0.055;
-        v.* = @intFromFloat(@max(0.0, @min(255.0, @round(vf * 255.0))));
-    }
-    break :blk t;
-};
 fn linF(x: f32) f32 {
     return if (x <= 0.04045) x / 12.92 else std.math.pow(f32, (x + 0.055) / 1.055, 2.4);
 }
 fn unlinF(x: f32) f32 {
     return if (x <= 0.0031308) x * 12.92 else 1.055 * std.math.pow(f32, x, 1.0 / 2.4) - 0.055;
 }
-fn linIdx(l: f32) usize {
-    return @intCast(std.math.clamp(@as(i32, @intFromFloat(@round(l * 1023.0))), 0, 1023));
+/// Direct f32 linear -> sRGB encode, no intermediate quantization:
+/// ghostty blends in linear light and the sRGB framebuffer encodes the
+/// result. The 10-bit LUT this replaces quantized linear light before
+/// encoding and cost ±1-2 sRGB levels, worst in dark regions.
+fn encodeSrgb(l: f32) u32 {
+    const v = unlinF(std.math.clamp(l, 0.0, 1.0)) * 255.0;
+    return @intFromFloat(@round(v));
 }
 
 /// ghostty linear-corrected source-over: derive a corrected coverage so the
@@ -1917,9 +1936,9 @@ fn blendPixel(fg: u32, bg: u32, a: u8) u32 {
         const blend_l = linF(unlinF(fg_l) * af + unlinF(bg_l) * (1.0 - af));
         af = std.math.clamp((blend_l - bg_l) / (fg_l - bg_l), 0.0, 1.0);
     }
-    const r = l2s[linIdx(fr * af + br * (1.0 - af))];
-    const g = l2s[linIdx(fg2 * af + bg2 * (1.0 - af))];
-    const b = l2s[linIdx(fbl * af + bb * (1.0 - af))];
+    const r = encodeSrgb(fr * af + br * (1.0 - af));
+    const g = encodeSrgb(fg2 * af + bg2 * (1.0 - af));
+    const b = encodeSrgb(fbl * af + bb * (1.0 - af));
     return (@as(u32, r) << 16) | (@as(u32, g) << 8) | b;
 }
 
@@ -1939,10 +1958,13 @@ fn blendA8Row(dst: []u8, src: []const u8, fg: u32) void {
 }
 
 /// Source-over of one PREMULTIPLIED source channel over an opaque dst
-/// channel: out = src + dst * (1 - a).
-fn blendPremul(sc: u32, dc: u32, a: u8) u32 {
-    const inv: u32 = 255 - @as(u32, a);
-    return @min(255, sc + (dc * inv + 127) / 255);
+/// channel in LINEAR light: out = src + dst * (1 - a), sRGB-decoding both
+/// inputs and sRGB-encoding the result. Exactly emulates ghostty's
+/// sRGB-texture sampling + GL_ONE/GL_ONE_MINUS_SRC_ALPHA + sRGB
+/// framebuffer write for color glyphs (opaque pixels are unchanged).
+fn blendPremulLinear(sc: u32, dc: u32, a: u8) u32 {
+    const out = s2l[sc] + s2l[dc] * (1.0 - @as(f32, @floatFromInt(a)) / 255.0);
+    return encodeSrgb(out);
 }
 
 fn clampI16(v: i32) i16 {
@@ -1951,6 +1973,36 @@ fn clampI16(v: i32) i16 {
 
 fn roundI32(v: f32) i32 {
     return @intFromFloat(@round(v));
+}
+
+/// ghostty's "symbol-like" predicate (cell.zig isSymbol, generated from
+/// uucode is_symbol): private use areas plus the Arrows, Dingbats,
+/// Emoticons, Miscellaneous Symbols, Enclosed Alphanumerics, Enclosed
+/// Alphanumeric Supplement, Miscellaneous Symbols and Pictographs, and
+/// Transport and Map Symbols blocks.
+fn isSymbol(cp: u21) bool {
+    return (cp >= 0xE000 and cp <= 0xF8FF) or // BMP private use
+        (cp >= 0xF0000 and cp <= 0xFFFFD) or // plane 15 private use
+        (cp >= 0x100000 and cp <= 0x10FFFD) or // plane 16 private use
+        (cp >= 0x2190 and cp <= 0x21FF) or // arrows
+        (cp >= 0x2700 and cp <= 0x27BF) or // dingbats
+        (cp >= 0x1F600 and cp <= 0x1F64F) or // emoticons
+        (cp >= 0x2600 and cp <= 0x26FF) or // miscellaneous symbols
+        (cp >= 0x2460 and cp <= 0x24FF) or // enclosed alphanumerics
+        (cp >= 0x1F100 and cp <= 0x1F1FF) or // enclosed alphanumeric supplement
+        (cp >= 0x1F300 and cp <= 0x1F5FF) or // misc symbols and pictographs
+        (cp >= 0x1F680 and cp <= 0x1F6FF); // transport and map symbols
+}
+
+/// ghostty cell.zig isGraphicsElement: box drawing, block elements,
+/// legacy computing, and Powerline glyphs. A previous symbol cell only
+/// constrains the next one when it is NOT a graphics element.
+fn isGraphicsElement(cp: u21) bool {
+    return (cp >= 0x2500 and cp <= 0x257F) or // box drawing
+        (cp >= 0x2580 and cp <= 0x259F) or // block elements
+        (cp >= 0x1FB00 and cp <= 0x1FBFF) or // legacy computing
+        (cp >= 0x1CC00 and cp <= 0x1CEBF) or // legacy computing supplement
+        (cp >= 0xE0B0 and cp <= 0xE0D7); // powerline
 }
 
 fn cursorStyle(s: render.CursorStyle) deco.CursorStyle {

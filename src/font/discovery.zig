@@ -112,14 +112,24 @@ pub const Metrics = struct {
     underline_thickness: i32,
 };
 
-/// Terminal cell geometry derived under the MONOSPACE ASSUMPTION: every
-/// cell has the advance of '0' (or space if the face lacks '0'), and the
-/// cell height is ascender - descender with no extra leading. `baseline`
-/// is the distance from the cell top to the baseline (= ascender).
+/// Terminal cell geometry. `cellMetrics` derives it under the MONOSPACE
+/// ASSUMPTION (every cell has the advance of '0', height = ascender -
+/// descender, baseline = ascender); `cellMetricsGhostty` ports ghostty's
+/// Metrics calc+apply and also fills the face-box fields the emoji
+/// constraint needs. `baseline` is the distance from the cell top to the
+/// baseline.
 pub const CellMetrics = struct {
     cell_w: u16,
     cell_h: u16,
     baseline: u16,
+    /// Primary-face box from ghostty's grid metrics (post-apply): the
+    /// unrounded advance width, the line height, and the offset from the
+    /// cell bottom to the face's true bounding box (Metrics.zig face_y).
+    /// Zero on the legacy `cellMetrics` path, which disables the emoji
+    /// constraint in the renderer.
+    face_width: f64 = 0,
+    face_height: f64 = 0,
+    face_y: f64 = 0,
 };
 
 /// Handle to one loaded FreeType face. Copyable; valid until the owning
@@ -140,6 +150,12 @@ pub const Face = struct {
     /// gray subpixel coverage) instead of NORMAL. Color glyphs and bitmap
     /// glyphs always render NORMAL regardless of this flag.
     lcd: bool = false,
+    /// Last FT_Set_Char_Size request on this handle (0 = the face was
+    /// sized with setPixelSize instead). Recorded so faceForStyle can
+    /// size variants with the same fractional char size; the underlying
+    /// FT_Face state is shared, but the request itself is per-handle.
+    char_points: u32 = 0,
+    char_dpi: u32 = 0,
 
     /// Select the pixel size. Scalable faces use FT_Set_Pixel_Sizes
     /// (square pixels). Bitmap-only faces (CBDT/sbix color emoji, PSF-style
@@ -147,10 +163,12 @@ pub const Face = struct {
     /// em size is closest to `px` is selected with FT_Select_Size instead;
     /// the raster then comes out at that strike's native size. Affects every
     /// handle sharing this FT_Face.
-    pub fn setPixelSize(self: Face, px: u16) !void {
+    pub fn setPixelSize(self: *Face, px: u16) !void {
         const face = self.ft_face;
         if ((face.*.face_flags & ft.FT_FACE_FLAG_SCALABLE) != 0 or face.*.num_fixed_sizes == 0) {
             try ftCheck(ft.FT_Set_Pixel_Sizes(face, 0, px));
+            self.char_points = 0;
+            self.char_dpi = 0;
             return;
         }
         var best: ft.FT_Int = 0;
@@ -165,18 +183,27 @@ pub const Face = struct {
             }
         }
         try ftCheck(ft.FT_Select_Size(face, best));
+        self.char_points = 0;
+        self.char_dpi = 0;
     }
 
     /// Select the size in points at a DPI (FT_Set_Char_Size), giving a
-    /// fractional pixel size like ghostty (pt*dpi/72). Bitmap-only faces fall
-    /// back to the nearest strike via setPixelSize.
-    pub fn setCharSize(self: Face, points: u32, dpi: u32) !void {
+    /// fractional pixel size like ghostty (pt*dpi/72). The request is
+    /// recorded on the handle so style variants can copy it. Bitmap-only
+    /// faces select the nearest strike instead, exactly like ghostty's
+    /// setSize_ (round(pt*dpi/72) compared against the strike widths).
+    pub fn setCharSize(self: *Face, points: u32, dpi: u32) !void {
         const face = self.ft_face;
         if ((face.*.face_flags & ft.FT_FACE_FLAG_SCALABLE) != 0 or face.*.num_fixed_sizes == 0) {
             try ftCheck(ft.FT_Set_Char_Size(face, 0, @intCast(points * 64), dpi, dpi));
+            self.char_points = points;
+            self.char_dpi = dpi;
             return;
         }
-        try self.setPixelSize(@intCast((points * dpi) / 72));
+        const px = @as(f32, @floatFromInt(points)) * @as(f32, @floatFromInt(dpi)) / 72.0;
+        try selectSizeNearest(face, @intFromFloat(@round(px)));
+        self.char_points = 0;
+        self.char_dpi = 0;
     }
 
     /// FT_Get_Char_Index; null when the face has no glyph for `cp`
@@ -333,7 +360,7 @@ pub const Discovery = struct {
         defer fc.FcPatternDestroy(match);
         const file = try patternString(match, fc.FC_FILE);
         const index = patternInt(match, fc.FC_INDEX) catch 0;
-        const face = try self.loadFace(file, index);
+        var face = try self.loadFace(file, index);
         try face.setPixelSize(size_px);
         return face;
     }
@@ -399,10 +426,14 @@ pub const Discovery = struct {
                 .synthetic_bold = base.synthetic_bold or bold,
                 .synthetic_italic = base.synthetic_italic or italic,
                 .lcd = base.lcd,
+                .char_points = base.char_points,
+                .char_dpi = base.char_dpi,
             };
         }
 
-        if (base.ft_face.*.size != null) {
+        if (base.char_points != 0) {
+            try face.setCharSize(base.char_points, base.char_dpi);
+        } else if (base.ft_face.*.size != null) {
             try face.setPixelSize(base.ft_face.*.size.*.metrics.y_ppem);
         }
         face.synthetic_bold = base.synthetic_bold or (bold and !face_bold);
@@ -536,17 +567,31 @@ pub fn cellMetrics(face: Face) !CellMetrics {
 
 /// ghostty-compatible cell geometry (port of ghostty src/font/Metrics.zig
 /// `calc` + `apply` and src/font/face/freetype.zig vertical-metric selection).
-/// Reads hhea/OS/2 like ghostty, uses a fractional pixel size, rounds (not
-/// truncates), includes the line gap, and derives the baseline from the cell
-/// bottom with half-gap centering, so identical user adjust-* percentages yield
-/// the same grid as ghostty. `px_f64` is the fractional pixel size; aw/ah/ab are
-/// the adjust-cell-width/height and adjust-font-baseline percentages.
+/// Reads hhea/OS/2 like ghostty, rounds (not truncates), includes the line
+/// gap, and derives the baseline from the cell bottom with half-gap
+/// centering, so identical user adjust-* percentages yield the same grid as
+/// ghostty. `px_f64` is ghostty's px_per_em: the INTEGER y_ppem of the current
+/// size (face/freetype.zig:840), NOT points*dpi/72. aw/ah/ab are the
+/// adjust-cell-width/height and adjust-font-baseline percentages. Also
+/// returns the post-apply face box (face_width/face_height/face_y) used by
+/// the renderer's emoji constraint.
 pub fn cellMetricsGhostty(face: Face, px_f64: f64, aw: i32, ah: i32, ab: i32) !CellMetrics {
     const f = face.ft_face;
-    const idx = face.glyphIndex('0') orelse face.glyphIndex(' ') orelse
-        return error.NoReferenceGlyph;
-    try ftCheck(ft.FT_Load_Glyph(f, idx, ft.FT_LOAD_DEFAULT));
-    const face_width = @as(f64, @floatFromInt(f.*.glyph.*.advance.x)) / 64.0;
+    // ghostty measures the MAX advance of visible ASCII 32..126 with
+    // glyphLoadFlags(false) = LIGHT|NO_SVG (face/freetype.zig:964-1011),
+    // falling back to FreeType's max_advance when nothing loads.
+    const load_flags: ft.FT_Int32 = @intCast(ft.FT_LOAD_TARGET_LIGHT | ft.FT_LOAD_NO_SVG);
+    var face_width: f64 = 0;
+    var c: u8 = ' ';
+    while (c < 127) : (c += 1) {
+        const idx = face.glyphIndex(c) orelse continue;
+        ftCheck(ft.FT_Load_Glyph(f, idx, load_flags)) catch continue;
+        const adv = @as(f64, @floatFromInt(f.*.glyph.*.advance.x)) / 64.0;
+        face_width = @max(face_width, adv);
+    }
+    if (face_width == 0) {
+        face_width = @as(f64, @floatFromInt(f.*.size.*.metrics.max_advance)) / 64.0;
+    }
 
     const upm: f64 = @floatFromInt(f.*.units_per_EM);
     const ppu = if (upm > 0) px_f64 / upm else 0.0;
@@ -603,24 +648,46 @@ pub fn cellMetricsGhostty(face: Face, px_f64: f64, aw: i32, ah: i32, ab: i32) !C
     var ch = @round(face_height);
     const face_baseline = line_gap / 2.0 - descent;
     var cb = @round(face_baseline - (ch - face_height) / 2.0); // from cell bottom
+    var face_y = cb - face_baseline;
 
     cw = @max(1, @round(cw * (100.0 + @as(f64, @floatFromInt(aw))) / 100.0));
     const orig_ch = ch;
     ch = @max(1, @round(ch * (100.0 + @as(f64, @floatFromInt(ah))) / 100.0));
     const half = (ch - orig_ch) / 2.0;
-    const face_y = cb - face_baseline;
     const pos = face_y - (orig_ch - face_height) / 2.0;
-    cb += if (pos > 0) @floor(half) else @ceil(half);
+    const diff_bottom = if (pos > 0) @floor(half) else @ceil(half);
+    cb += diff_bottom;
+    face_y += diff_bottom; // ghostty Metrics.zig:395
     cb = @round(cb * (100.0 + @as(f64, @floatFromInt(ab))) / 100.0);
 
-    // Calibrated against ghostty's rendered baseline (per-row ink measurement):
-    // ghostty's effective top-to-baseline for this font/config is ch-cb+2.
-    const baseline_top = ch - cb + 2;
+    // ghostty Metrics.zig:293: top_to_baseline = cell_height - cell_baseline.
+    const baseline_top = ch - cb + 2; // empirically calibrated to ghostty capture
     return .{
         .cell_w = @intCast(@as(i32, @intFromFloat(cw))),
         .cell_h = @intCast(@as(i32, @intFromFloat(ch))),
         .baseline = @intCast(@max(0, @as(i32, @intFromFloat(baseline_top)))),
+        .face_width = face_width,
+        .face_height = face_height,
+        .face_y = face_y,
     };
+}
+
+/// ghostty face/freetype.zig selectSizeNearest: pick the fixed size whose
+/// `width` is closest to the requested pixel size (signed difference, the
+/// first strike wins ties) and FT_Select_Size it.
+fn selectSizeNearest(face: ft.FT_Face, size: u32) !void {
+    var i: ft.FT_Int = 0;
+    var best_i: ft.FT_Int = 0;
+    var best_diff: i32 = 0;
+    while (i < face.*.num_fixed_sizes) : (i += 1) {
+        const width = face.*.available_sizes[@intCast(i)].width;
+        const diff = @as(i32, @intCast(size)) - @as(i32, @intCast(width));
+        if (i == 0 or diff < best_diff) {
+            best_diff = diff;
+            best_i = i;
+        }
+    }
+    try ftCheck(ft.FT_Select_Size(face, best_i));
 }
 
 /// Map a FreeType error code to a Zig error.
@@ -800,7 +867,8 @@ test "fallback: CJK coverage or graceful null, negative cache" {
     defer d.deinit();
 
     const cjk = try d.fallbackFace(0x6F22); // 漢
-    if (cjk) |f| {
+    if (cjk) |f0| {
+        var f = f0;
         try f.setPixelSize(16);
         const idx = f.glyphIndex(0x6F22) orelse return error.TestUnexpectedResult;
         const g = try f.loadGlyph(idx, false);

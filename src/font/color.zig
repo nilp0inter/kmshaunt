@@ -4,7 +4,8 @@
 //!
 //!   * CBDT and sbix bitmap strikes through FreeType `FT_LOAD_COLOR`.
 //!     Bitmap-only faces expose fixed strikes; the closest strike is
-//!     selected and box-scaled to the requested pixel size.
+//!     selected and its NATIVE raster returned. The renderer applies
+//!     ghostty's cell constraint and stb resize afterwards (constrainEmoji).
 //!   * COLRv0 and COLRv1 paint graphs through HarfBuzz `hb_raster_paint`
 //!     (libharfbuzz-raster, stable since HarfBuzz 13.0).
 //!
@@ -63,6 +64,7 @@
 const std = @import("std");
 const ft = @import("freetype-c");
 const hb = @import("harfbuzz-c");
+const stbir = @import("stbir.zig");
 
 // translate-c types the C macros as c_long/c_int; pin them to the exact
 // parameter types once instead of casting at every call site.
@@ -87,12 +89,16 @@ pub const FT_Face = ft.FT_Face;
 pub const Error = error{
     /// FT_Set_Pixel_Sizes rejected the requested size.
     SetPixelSizesFailed,
+    /// FT_Set_Char_Size rejected the requested size.
+    SetCharSizeFailed,
     /// hb_ft_font_create returned NULL.
     HbFontCreateFailed,
     /// hb_raster_paint_create_or_fail returned NULL.
     HbPaintCreateFailed,
     /// Width * height overflowed the buffer size arithmetic.
     Overflow,
+    /// The emoji constraint produced an empty target or the resize failed.
+    ResizeFailed,
     OutOfMemory,
 };
 
@@ -100,6 +106,11 @@ pub const Error = error{
 /// BGRA8 pixels with premultiplied alpha, top-down, no row padding
 /// (`pitch == width * 4`). Bearings are in pixels relative to the pen
 /// origin, y up (FreeType `bitmap_left` / `bitmap_top` conventions).
+///
+/// For the CBDT/sbix path these are the NATIVE strike metrics (ghostty
+/// constrains and resizes the strike raster afterwards); `ppem` is the
+/// strike's pixels-per-EM. The glyph rect ghostty's constraint consumes is
+/// (bearing_x, bearing_y - height, width, height).
 pub const ColorGlyph = struct {
     pixels: []u8,
     width: u32,
@@ -107,6 +118,9 @@ pub const ColorGlyph = struct {
     pitch: u32,
     bearing_x: i32,
     bearing_y: i32,
+    /// Pixels-per-EM of the size the glyph was rasterized at (the strike
+    /// ppem for bitmap color, the face ppem for COLR).
+    ppem: u32 = 0,
 
     pub fn deinit(self: *ColorGlyph, alloc: std.mem.Allocator) void {
         alloc.free(self.pixels);
@@ -123,10 +137,12 @@ pub fn hasColorGlyphs(face: *FT_Face) bool {
     return hasTable(face.*, colr_tag);
 }
 
-/// Rasterize one color glyph at `size_px` pixels per EM.
+/// Rasterize one color glyph at `size_px` pixels per EM (legacy integer
+/// sizing; see renderColorCharSize for ghostty's fractional char size).
 ///
 /// CBDT/sbix strikes are loaded at their native ppem (FreeType refuses
-/// other sizes on bitmap-only faces) and box-scaled to `size_px`; COLR
+/// other sizes on bitmap-only faces) and returned UNSCALED: the renderer
+/// applies ghostty's emoji constraint + stb resize (constrainEmoji). COLR
 /// paint graphs are rasterized directly at `size_px`.
 ///
 /// Returns null when the glyph has no color representation (the caller
@@ -145,15 +161,54 @@ pub fn renderColor(
     glyph_index: u32,
     size_px: u16,
 ) Error!?ColorGlyph {
-    if (size_px == 0) return null;
+    return renderColorInner(alloc, face, glyph_index, size_px, 0, 0);
+}
+
+/// ghostty-faithful fractional sizing: size the face with
+/// FT_Set_Char_Size(points*64, dpi) like ghostty setSize_ instead of
+/// FT_Set_Pixel_Sizes, then rasterize as renderColor does. Bitmap strikes
+/// are selected with round(points*dpi/72) compared against the strike
+/// widths (ghostty selectSizeNearest).
+pub fn renderColorCharSize(
+    alloc: std.mem.Allocator,
+    face: *FT_Face,
+    glyph_index: u32,
+    points: u32,
+    dpi: u32,
+) Error!?ColorGlyph {
+    if (points == 0) return null;
+    return renderColorInner(alloc, face, glyph_index, 0, points, dpi);
+}
+
+fn renderColorInner(
+    alloc: std.mem.Allocator,
+    face: *FT_Face,
+    glyph_index: u32,
+    size_px: u16,
+    points: u32,
+    dpi: u32,
+) Error!?ColorGlyph {
+    if (points == 0 and size_px == 0) return null;
     const f = face.*;
     // FT_FACE_FLAG_COLOR alone cannot route: FreeType also sets it for
     // COLR faces. Bitmap strikes (CBDT/sbix) go through FT_LOAD_COLOR,
     // COLR paint graphs through hb-raster.
     const bitmap_color = ft.FT_HAS_COLOR(f) and (ft.FT_HAS_SBIX(f) or hasTable(f, cbdt_tag));
-    if (bitmap_color) return renderBitmapColor(alloc, f, glyph_index, size_px);
+    if (bitmap_color) {
+        // ghostty setSize_: bitmap-only faces select the nearest strike to
+        // the requested PIXEL size (rounded from points when fractional).
+        const req_px: u16 = if (points != 0)
+            @intFromFloat(@round(@as(f32, @floatFromInt(points)) * @as(f32, @floatFromInt(dpi)) / 72.0))
+        else
+            size_px;
+        return renderBitmapColor(alloc, f, glyph_index, req_px);
+    }
     if (hasTable(f, colr_tag)) {
-        if (ft.FT_Set_Pixel_Sizes(f, 0, size_px) != 0) return Error.SetPixelSizesFailed;
+        if (points != 0) {
+            if (ft.FT_Set_Char_Size(f, 0, @intCast(points * 64), dpi, dpi) != 0) return Error.SetCharSizeFailed;
+        } else {
+            if (ft.FT_Set_Pixel_Sizes(f, 0, size_px) != 0) return Error.SetPixelSizesFailed;
+        }
         return renderColr(alloc, f, glyph_index);
     }
     return null;
@@ -165,7 +220,8 @@ fn hasTable(f: ft.FT_Face, tag: ft.FT_ULong) bool {
 }
 
 /// CBDT/sbix path: FT_LOAD_COLOR yields a premultiplied BGRA bitmap at
-/// the strike's native ppem, box-scaled to the requested size.
+/// the strike's native ppem. The native raster is returned as-is; ghostty
+/// constrains it to the cell and resizes with stb (constrainEmoji below).
 fn renderBitmapColor(alloc: std.mem.Allocator, f: ft.FT_Face, glyph_index: u32, size_px: u16) Error!?ColorGlyph {
     const face = &f.*;
     if (face.num_fixed_sizes > 0) {
@@ -205,103 +261,34 @@ fn renderBitmapColor(alloc: std.mem.Allocator, f: ft.FT_Face, glyph_index: u32, 
         @memcpy(pixels[@as(usize, y) * pitch ..][0..row_bytes], src);
     }
 
-    const ppem: u32 = face.size.*.metrics.x_ppem;
-    if (ppem == 0 or ppem == size_px) {
-        return ColorGlyph{
-            .pixels = pixels,
-            .width = width,
-            .height = height,
-            .pitch = pitch,
-            .bearing_x = slot.bitmap_left,
-            .bearing_y = slot.bitmap_top,
-        };
-    }
-
-    // Scale the strike to the requested ppem. Averaging premultiplied
-    // channels is the correct box filter for premultiplied alpha.
-    const dw = scaledDim(width, size_px, ppem);
-    const dh = scaledDim(height, size_px, ppem);
-    const scaled_pitch = try std.math.mul(u32, dw, 4);
-    const scaled = try boxScale(alloc, pixels, width, height, dw, dh);
-    alloc.free(pixels);
     return ColorGlyph{
-        .pixels = scaled,
-        .width = dw,
-        .height = dh,
-        .pitch = scaled_pitch,
-        .bearing_x = scaleCoord(slot.bitmap_left, size_px, ppem),
-        .bearing_y = scaleCoord(slot.bitmap_top, size_px, ppem),
+        .pixels = pixels,
+        .width = width,
+        .height = height,
+        .pitch = pitch,
+        .bearing_x = slot.bitmap_left,
+        .bearing_y = slot.bitmap_top,
+        .ppem = face.size.*.metrics.x_ppem,
     };
 }
 
-/// Index of the strike closest to `size_px`; ties prefer the larger
-/// strike (downscaling keeps more detail than upscaling).
+/// Index of the strike closest to `size_px`, port of ghostty's
+/// selectSizeNearest (face/freetype.zig:259-274): compare the requested
+/// pixels against the strike's `width` with a SIGNED difference (the first
+/// strike wins ties).
 fn bestStrike(face: *const ft.struct_FT_FaceRec_, size_px: u16) ft.FT_Int {
     var best: ft.FT_Int = 0;
-    var best_diff: i64 = std.math.maxInt(i64);
-    var best_ppem: i64 = -1;
+    var best_diff: i32 = 0;
     var i: ft.FT_Int = 0;
     while (i < face.num_fixed_sizes) : (i += 1) {
-        const strike = face.available_sizes[@intCast(i)];
-        const ppem: i64 = (strike.y_ppem + 32) >> 6; // 26.6 -> rounded pixels
-        const diff: i64 = @intCast(@abs(ppem - @as(i64, size_px)));
-        if (diff < best_diff or (diff == best_diff and ppem > best_ppem)) {
+        const width = face.available_sizes[@intCast(i)].width;
+        const diff = @as(i32, @intCast(size_px)) - @as(i32, @intCast(width));
+        if (i == 0 or diff < best_diff) {
             best = i;
             best_diff = diff;
-            best_ppem = ppem;
         }
     }
     return best;
-}
-
-fn scaledDim(dim: u32, size_px: u16, ppem: u32) u32 {
-    const n: u64 = @as(u64, dim) * size_px;
-    const d: u64 = ppem;
-    return @intCast(@max((n + d / 2) / d, 1));
-}
-
-fn scaleCoord(v: i32, size_px: u16, ppem: u32) i32 {
-    const n: i64 = @as(i64, v) * size_px;
-    const d: u64 = ppem;
-    const mag: i64 = @intCast((@abs(n) + d / 2) / d);
-    return @intCast(if (n < 0) -mag else mag);
-}
-
-/// Area-average (box) resample of tight premultiplied BGRA rows.
-fn boxScale(alloc: std.mem.Allocator, src: []const u8, sw: u32, sh: u32, dw: u32, dh: u32) Error![]u8 {
-    const dst = try alloc.alloc(u8, @as(usize, dw) * dh * 4);
-    errdefer alloc.free(dst);
-    var dy: u32 = 0;
-    while (dy < dh) : (dy += 1) {
-        const y0: u64 = @as(u64, dy) * sh / dh;
-        const y1: u64 = @max((@as(u64, dy) + 1) * sh / dh, y0 + 1);
-        var dx: u32 = 0;
-        while (dx < dw) : (dx += 1) {
-            const x0: u64 = @as(u64, dx) * sw / dw;
-            const x1: u64 = @max((@as(u64, dx) + 1) * sw / dw, x0 + 1);
-            var sum = [4]u64{ 0, 0, 0, 0 };
-            var count: u64 = 0;
-            var sy: u64 = y0;
-            while (sy < y1) : (sy += 1) {
-                const row: usize = @intCast(sy * sw);
-                var sx: u64 = x0;
-                while (sx < x1) : (sx += 1) {
-                    const p = src[(row + @as(usize, @intCast(sx))) * 4 ..][0..4];
-                    sum[0] += p[0];
-                    sum[1] += p[1];
-                    sum[2] += p[2];
-                    sum[3] += p[3];
-                    count += 1;
-                }
-            }
-            const o = (@as(usize, dy) * dw + dx) * 4;
-            dst[o + 0] = @intCast((sum[0] + count / 2) / count);
-            dst[o + 1] = @intCast((sum[1] + count / 2) / count);
-            dst[o + 2] = @intCast((sum[2] + count / 2) / count);
-            dst[o + 3] = @intCast((sum[3] + count / 2) / count);
-        }
-    }
-    return dst;
 }
 
 /// COLRv0/v1 path: hb_raster_paint evaluates the paint graph into a
@@ -369,6 +356,7 @@ fn renderColr(alloc: std.mem.Allocator, f: ft.FT_Face, glyph_index: u32) Error!?
         .pitch = pitch,
         .bearing_x = ext.x_origin,
         .bearing_y = ext.y_origin + @as(i32, @intCast(height)),
+        .ppem = f.*.size.*.metrics.x_ppem,
     };
 }
 
@@ -387,6 +375,108 @@ fn outlineExtents(f: ft.FT_Face, glyph_index: u32, gext: *hb.hb_glyph_extents_t)
         .height = @intCast(-m.height),
     };
     return true;
+}
+
+/// Grid metrics for the emoji constraint: the PRIMARY face's post-apply
+/// ghostty Metrics (discovery.CellMetrics carries the same values).
+pub const EmojiGrid = struct {
+    cell_width: f64,
+    cell_height: f64,
+    cell_baseline: f64,
+    face_width: f64,
+    face_height: f64,
+    face_y: f64,
+};
+
+/// Apply ghostty's emoji-presentation constraint to a native color glyph
+/// and resize the raster, returning a NEW owned glyph (the caller keeps
+/// and deinits the original). Port of SharedGrid.zig:416-432 (.cover,
+/// center/center, pad_left = pad_right = 0.025) through Glyph.zig
+/// constrainInner, the bitmap quantization of face/freetype.zig:517-521,
+/// the stb resize (stbir.resizeUint8, Mitchell downsample) and the
+/// whole-pixel bearings of face/freetype.zig:676-677. `constraint_width`
+/// is the cell span available to the glyph (2 for wide cells; the
+/// renderer ports cell.zig constraintWidth for narrow symbols).
+pub fn constrainEmoji(
+    alloc: std.mem.Allocator,
+    g: *const ColorGlyph,
+    grid: EmojiGrid,
+    constraint_width: u2,
+) Error!ColorGlyph {
+    const pad_left: f64 = 0.025;
+    const pad_right: f64 = 0.025;
+    const pad_top: f64 = 0;
+    const pad_bottom: f64 = 0;
+
+    // Glyph rect, cell-relative with y up from the cell BOTTOM
+    // (face/freetype.zig:480-489 shifts the rect by +cell_baseline).
+    var x: f64 = @floatFromInt(g.bearing_x);
+    var y: f64 = @as(f64, @floatFromInt(g.bearing_y - @as(i32, @intCast(g.height)))) + grid.cell_baseline;
+    var w: f64 = @floatFromInt(g.width);
+    var h: f64 = @floatFromInt(g.height);
+    if (w <= 0 or h <= 0) return Error.ResizeFailed;
+
+    // constrainInner with relative_* = 1/0: the scale group IS the rect.
+    const min_cw: f64 = @floatFromInt(@min(@as(u2, 2), constraint_width));
+    const target_w = (min_cw - pad_left - pad_right) * grid.face_width;
+    const target_h = (1.0 - pad_bottom - pad_top) * grid.face_height;
+    var wf = target_w / w;
+    var hf = target_h / h;
+    hf = @min(wf, hf); // .cover: scale to cover, aspect preserved
+    wf = hf;
+    const cx = x + w / 2;
+    const cy = y + h / 2;
+    w *= wf;
+    h *= hf;
+    x = cx - w / 2;
+    y = cy - h / 2;
+
+    // align_vertical .center (Glyph.zig:352-387).
+    const start_y = grid.face_y + pad_bottom * grid.face_height;
+    const end_y = grid.face_y + grid.face_height - h - pad_top * grid.face_height;
+    y = (start_y + end_y) / 2;
+
+    // align_horizontal .center (Glyph.zig:390-433).
+    const span = grid.face_width + (min_cw - 1) * grid.cell_width;
+    const start_x = pad_left * grid.face_width;
+    const end_x = span - w - pad_right * grid.face_width;
+    x = @max(start_x, (start_x + end_x) / 2);
+
+    // Whole-pixel recentering when the cell is wider than the face
+    // (face/freetype.zig:503-512; skipped for the harness: 12 > 11).
+    if (grid.face_width < grid.cell_width)
+        x += @round((grid.cell_width - grid.face_width) / 2);
+
+    // Bitmap quantization (face/freetype.zig:517-521): snap the rect to
+    // whole pixels while preserving its span across the cell edges.
+    const qw = grid.cell_width - @round(grid.cell_width - w - x) - @round(x);
+    const qh = grid.cell_height - @round(grid.cell_height - h - y) - @round(y);
+    x = @round(x);
+    y = @round(y);
+    if (qw <= 0 or qh <= 0) return Error.ResizeFailed;
+    const out_w: u32 = @intFromFloat(@round(qw));
+    const out_h: u32 = @intFromFloat(@round(qh));
+
+    const pitch = try std.math.mul(u32, out_w, 4);
+    const pixels = try alloc.alloc(u8, @as(usize, pitch) * out_h);
+    errdefer alloc.free(pixels);
+    stbir.resizeUint8(alloc, g.pixels, g.width, g.height, g.pitch, pixels, out_w, out_h, pitch, 4) catch |err| switch (err) {
+        error.OutOfMemory => return Error.OutOfMemory,
+        error.InvalidDimensions => return Error.ResizeFailed,
+    };
+
+    // Whole-pixel bearings (face/freetype.zig:676-677): x/y are already
+    // whole pixels and qh is the quantized height, so the floors are
+    // exact; kept for fidelity with the source.
+    return ColorGlyph{
+        .pixels = pixels,
+        .width = out_w,
+        .height = out_h,
+        .pitch = pitch,
+        .bearing_x = @intFromFloat(@floor(x)),
+        .bearing_y = @intFromFloat(@floor(y - grid.cell_baseline + qh)),
+        .ppem = g.ppem,
+    };
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -493,8 +583,11 @@ test "CBDT: NotoColorEmoji U+1F600 at 32px is BGRA with alpha variation" {
         return error.TestUnexpectedNull;
     defer glyph.deinit(alloc);
     try expectShape(glyph);
-    // A 32px strike should be roughly cell-sized, not font-unit sized.
-    try std.testing.expect(glyph.width <= 64 and glyph.height <= 64);
+    // Native strike raster: the returned size is the strike's, not the
+    // requested 32px (the renderer constrains/resizes afterwards), and
+    // the ppem is the selected strike's.
+    try std.testing.expectEqual(@as(u32, tf.face.*.size.*.metrics.x_ppem), glyph.ppem);
+    try std.testing.expect(glyph.width >= 32 and glyph.height >= 32);
 
     const stats = try PixelStats.scan(glyph);
     try std.testing.expect(stats.nonempty > 0);
@@ -514,6 +607,42 @@ test "CBDT: NotoColorEmoji U+1F600 at 32px is BGRA with alpha variation" {
         if (p[3] == 255 and p[2] > 128 and p[1] > 128 and p[0] < 128) yellow += 1;
     }
     try std.testing.expect(yellow > 0);
+}
+
+test "constrainEmoji: ghostty worked example U+1F600 (raster spec §3.1)" {
+    const alloc = std.testing.allocator;
+    // Native strike rect measured on NotoColorEmoji 2.051: 136x128,
+    // bitmap_left 0, bitmap_top 101. Harness grid (ComicCode 14pt@96dpi,
+    // -5%/-15%/+18% adjustments): cell 11x25, cell_baseline 5,
+    // face_width 12, face_height 29.45, face_y -1.89.
+    const pixels = try alloc.alloc(u8, 136 * 128 * 4);
+    defer alloc.free(pixels);
+    @memset(pixels, 0);
+    const native = ColorGlyph{
+        .pixels = pixels,
+        .width = 136,
+        .height = 128,
+        .pitch = 136 * 4,
+        .bearing_x = 0,
+        .bearing_y = 101,
+        .ppem = 109,
+    };
+    const grid = EmojiGrid{
+        .cell_width = 11,
+        .cell_height = 25,
+        .cell_baseline = 5,
+        .face_width = 12,
+        .face_height = 29.45,
+        .face_y = -1.89,
+    };
+    var out = try constrainEmoji(alloc, &native, grid, 2);
+    defer out.deinit(alloc);
+    // ghostty: 24x22 raster, offset (0, 24) -> dst_y = 25 - 24 = +1.
+    try std.testing.expectEqual(@as(u32, 24), out.width);
+    try std.testing.expectEqual(@as(u32, 22), out.height);
+    try std.testing.expectEqual(@as(i32, 0), out.bearing_x);
+    try std.testing.expectEqual(@as(i32, 19), out.bearing_y);
+    try std.testing.expectEqual(@as(u32, 109), out.ppem);
 }
 
 test "COLRv1: noto-glyf_colr_1 U+1F600 at 32px paints multiple colors" {

@@ -1039,19 +1039,20 @@ const Console = struct {
         self.disc = try discovery.Discovery.init(self.alloc);
         self.face = try self.disc.?.primaryFace(self.cfg.font_name, self.size_px);
         if (self.cfg.font_size != 0) try self.face.setCharSize(self.cfg.font_size, 96);
-        const px_f64 = if (self.cfg.font_size != 0)
-            @as(f64, @floatFromInt(self.cfg.font_size)) * 96.0 / 72.0
-        else
-            @as(f64, @floatFromInt(self.size_px));
+        // ghostty's px_per_em is the INTEGER y_ppem of the current size
+        // (face/freetype.zig:840), not points*dpi/72. On the auto-size path
+        // y_ppem == size_px, so one expression covers both.
+        const px_f64 = @as(f64, @floatFromInt(self.face.ft_face.*.size.*.metrics.y_ppem));
         self.cell = try discovery.cellMetricsGhostty(self.face, px_f64, self.cfg.adjust_cell_width, self.cfg.adjust_cell_height, self.cfg.adjust_font_baseline);
         if (self.cell.cell_w == 0 or self.cell.cell_h == 0) return error.InvalidCellMetrics;
 
         self.renderer = try cpu.CpuRenderer.init(self.alloc, &self.disc.?, &self.face, .{
             .size_px = self.size_px,
+            .size_points = self.cfg.font_size, // fractional char-size (ghostty); baseline calibrated +2
         });
-        // The renderer defaults its baseline to the face ascender; use the
-        // ghostty-compatible baseline so text/underlines sit at ghostty's height.
-        self.renderer.?.metrics.baseline = self.cell.baseline;
+        // Use the ghostty-compatible grid: baseline AND the face box the
+        // emoji constraint needs (face_width/face_height/face_y).
+        self.renderer.?.metrics = self.cell;
         try self.rebuildLayout();
     }
 
