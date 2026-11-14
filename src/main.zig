@@ -1049,6 +1049,9 @@ const Console = struct {
         self.renderer = try cpu.CpuRenderer.init(self.alloc, &self.disc.?, &self.face, .{
             .size_px = self.size_px,
         });
+        // The renderer defaults its baseline to the face ascender; use the
+        // ghostty-compatible baseline so text/underlines sit at ghostty's height.
+        self.renderer.?.metrics.baseline = self.cell.baseline;
         try self.rebuildLayout();
     }
 

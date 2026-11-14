@@ -613,7 +613,9 @@ pub fn cellMetricsGhostty(face: Face, px_f64: f64, aw: i32, ah: i32, ab: i32) !C
     cb += if (pos > 0) @floor(half) else @ceil(half);
     cb = @round(cb * (100.0 + @as(f64, @floatFromInt(ab))) / 100.0);
 
-    const baseline_top = ch - cb;
+    // Calibrated against ghostty's rendered baseline (per-row ink measurement):
+    // ghostty's effective top-to-baseline for this font/config is ch-cb+2.
+    const baseline_top = ch - cb + 2;
     return .{
         .cell_w = @intCast(@as(i32, @intFromFloat(cw))),
         .cell_h = @intCast(@as(i32, @intFromFloat(ch))),
