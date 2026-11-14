@@ -137,6 +137,21 @@ pub fn hasColorGlyphs(face: *FT_Face) bool {
     return hasTable(face.*, colr_tag);
 }
 
+/// True if glyph `glyph_index` renders as a color (BGRA) bitmap: port of
+/// ghostty face/freetype.zig:333-352 `isColorGlyph`. Loads with render +
+/// NO_SVG, adding FT_LOAD_COLOR only when the face carries color tables,
+/// and checks the resulting pixel mode; a failed load is non-color. Used
+/// by the renderer to match a cell's text/emoji presentation against a
+/// face (ghostty Collection.Entry.hasCodepoint). Mutates the face's glyph
+/// slot; see the module comment for thread-safety.
+pub fn isColorGlyph(face: *FT_Face, glyph_index: u32) bool {
+    const f = face.*;
+    var flags: ft.FT_Int32 = @intCast(ft.FT_LOAD_RENDER | ft.FT_LOAD_NO_SVG);
+    if (ft.FT_HAS_COLOR(f)) flags |= load_color;
+    if (ft.FT_Load_Glyph(f, glyph_index, flags) != 0) return false;
+    return f.*.glyph.*.bitmap.pixel_mode == pixel_bgra;
+}
+
 /// Rasterize one color glyph at `size_px` pixels per EM (legacy integer
 /// sizing; see renderColorCharSize for ghostty's fractional char size).
 ///
