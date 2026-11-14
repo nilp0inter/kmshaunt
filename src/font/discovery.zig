@@ -491,7 +491,7 @@ pub fn cellMetrics(face: Face) !CellMetrics {
     const advance = face.ft_face.*.glyph.*.advance.x;
     const m = face.metrics();
     const w = @max(1, @as(i32, @intCast(@divTrunc(advance, 64))));
-    const h = @max(1, m.ascender - m.descender);
+    const h = @max(1, m.height);
     return .{
         .cell_w = @intCast(w),
         .cell_h = @intCast(h),

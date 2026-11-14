@@ -1029,14 +1029,16 @@ const Console = struct {
     }
 
     fn setupFont(self: *Console) !void {
+        // ghostty interprets font-size in points at 96 DPI (pt*96/72 = pt*4/3);
+        // match it so the same user value yields the same pixel size.
         self.size_px = if (self.cfg.font_size != 0)
-            @intCast(@min(self.cfg.font_size, std.math.maxInt(u16)))
+            @intCast(@min((self.cfg.font_size * 4) / 3, std.math.maxInt(u16)))
         else
             autoFontSize(self.mode);
 
         self.disc = try discovery.Discovery.init(self.alloc);
         self.face = try self.disc.?.primaryFace(self.cfg.font_name, self.size_px);
-        self.cell = try discovery.cellMetrics(self.face);
+        self.cell = applyCellAdjustments(try discovery.cellMetrics(self.face), self.cfg.*);
         if (self.cell.cell_w == 0 or self.cell.cell_h == 0) return error.InvalidCellMetrics;
 
         self.renderer = try cpu.CpuRenderer.init(self.alloc, &self.disc.?, &self.face, .{
@@ -1044,6 +1046,19 @@ const Console = struct {
         });
         try self.rebuildLayout();
     }
+
+/// ghostty-compatible user cell adjustments (percent), applied to the natural
+/// FreeType metrics so the same settings produce the same grid on both sides.
+fn applyCellAdjustments(cell: discovery.CellMetrics, cfg: config.Config) discovery.CellMetrics {
+    const w = @max(1, @divTrunc(@as(i32, cell.cell_w) * (100 + cfg.adjust_cell_width), 100));
+    const h = @max(1, @divTrunc(@as(i32, cell.cell_h) * (100 + cfg.adjust_cell_height), 100));
+    const b = @max(0, @as(i32, cell.baseline) + @divTrunc(h * cfg.adjust_font_baseline, 100));
+    return .{
+        .cell_w = @intCast(w),
+        .cell_h = @intCast(h),
+        .baseline = @intCast(b),
+    };
+}
 
     /// Recompute the shared canvas + per-output viewports from the current
     /// cell size and rotations (computeLayout, M5.4), resize the renderer and

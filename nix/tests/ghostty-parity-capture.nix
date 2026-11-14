@@ -116,6 +116,11 @@ let
           font-size = fontSize;
           blink = false;
           term = "xterm-ghostty";
+          # Same user settings as the ghostty node below (ghostty-compatible
+          # knobs now exist in kmshaunt); parity comes from identical config.
+          adjust-cell-width = "-5%";
+          adjust-cell-height = "-15%";
+          adjust-font-baseline = "+18%";
         };
       };
     };

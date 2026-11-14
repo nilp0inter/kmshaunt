@@ -173,6 +173,9 @@ pub const Option = enum {
     font_engine,
     font_size,
     font_name,
+    adjust_cell_width,
+    adjust_cell_height,
+    adjust_font_baseline,
     // Palette
     palette,
     palette_black,
@@ -209,6 +212,7 @@ pub const Kind = enum {
     font_engine,
     multi_monitor,
     palette,
+    percent,
 
     /// Whether the option takes a value. `login` is a no-arg (bool-like)
     /// option on the CLI; in a file it requires a value (file_login).
@@ -289,6 +293,9 @@ const specs = [_]Spec{
     .{ .opt = .font_engine, .name = "font-engine", .kind = .font_engine },
     .{ .opt = .font_size, .name = "font-size", .kind = .uint },
     .{ .opt = .font_name, .name = "font-name", .kind = .string },
+    .{ .opt = .adjust_cell_width, .name = "adjust-cell-width", .kind = .percent },
+    .{ .opt = .adjust_cell_height, .name = "adjust-cell-height", .kind = .percent },
+    .{ .opt = .adjust_font_baseline, .name = "adjust-font-baseline", .kind = .percent },
     .{ .opt = .palette, .name = "palette", .kind = .palette },
     .{ .opt = .palette_black, .name = "palette-black", .kind = .color, .color = .black },
     .{ .opt = .palette_red, .name = "palette-red", .kind = .color, .color = .red },
@@ -417,6 +424,10 @@ pub const Config = struct {
     font_engine: ?FontEngine = null,
     font_size: u32 = 0,
     font_name: []const u8 = "monospace",
+    /// ghostty-compatible cell adjustments, in percent (0 = unchanged).
+    adjust_cell_width: i32 = 0,
+    adjust_cell_height: i32 = 0,
+    adjust_font_baseline: i32 = 0,
 
     // Palette Options
     palette: ?palette.Preset = null,
@@ -494,6 +505,16 @@ pub const Config = struct {
                 const v = try parseUint(value.?, d);
                 inline for (specs) |s| {
                     if (s.kind == .uint and s.opt == opt) {
+                        @field(self, @tagName(s.opt)) = v;
+                        return;
+                    }
+                }
+                unreachable;
+            },
+            .percent => {
+                const v = try parsePercent(value.?, d);
+                inline for (specs) |s| {
+                    if (s.kind == .percent and s.opt == opt) {
                         @field(self, @tagName(s.opt)) = v;
                         return;
                     }
@@ -828,6 +849,7 @@ pub const Config = struct {
             "drm",               "hwaccel",           "gpus",           "use_original_mode",
             "multi_monitor",     "font_size",         "font_engine",    "palette",
             "kitty_image_storage_limit",
+            "adjust_cell_width",  "adjust_cell_height",  "adjust_font_baseline",
         };
         inline for (value_fields) |f| @field(self, f) = @field(src, f);
 
@@ -899,6 +921,28 @@ fn copyGrab(alloc: std.mem.Allocator, g: Grab) Error!Grab {
 /// Strict unsigned decimal with u32 bounds. kmscon uses atoi here; the
 /// assignment requires bounds checks and typed errors, so garbage,
 /// negatives and overflow are rejected instead of silently mangled.
+/// Signed percentage like ghostty's adjust-* options: "-5%", "+18%", "10".
+fn parsePercent(s: []const u8, d: *Diag) Error!i32 {
+    var rest = s;
+    if (rest.len > 0 and rest[rest.len - 1] == '%') rest = rest[0 .. rest.len - 1];
+    if (rest.len == 0) {
+        d.print("empty percent value '{s}'", .{s});
+        return error.InvalidValue;
+    }
+    const neg = rest[0] == '-';
+    if (neg or rest[0] == '+') rest = rest[1..];
+    const mag = parseBase0(rest) orelse {
+        d.print("cannot parse percent value '{s}'", .{s});
+        return error.InvalidValue;
+    };
+    if (mag > 1000) {
+        d.print("percent value out of range '{s}'", .{s});
+        return error.InvalidValue;
+    }
+    const v: i32 = @intCast(mag);
+    return if (neg) -v else v;
+}
+
 fn parseUint(s: []const u8, d: *Diag) Error!u32 {
     var rest = s;
     if (rest.len > 0 and rest[0] == '+') rest = rest[1..];
