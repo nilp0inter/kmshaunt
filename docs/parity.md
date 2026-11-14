@@ -82,8 +82,8 @@ Last updated: 2026-11-13. This file is ticked as features land; `nix flake check
 ## Performance (M8)
 | Feature | Status | Evidence / gap |
 |---|---|---|
-| vtebench throughput vs kmscon | ✅ | M8.1; EQUAL-OR-BETTER on all 10 benchmarks (1.20–1.76x kmscon) via adaptive burst coalescing; gap closed (docs/perf.md) |
+| vtebench throughput vs kmscon | ⚠️ | M8.1; 9/10 EQUAL-OR-BETTER (1.33–1.80x kmscon). unicode dropped to 0.52x (72.3→32.2 MiB/s) as the deliberate cost of the 100ms display-rate floor (src/main.zig burstStretchNs): interactive animation was 1-2fps on real 4K, now ~6.7fps. Accepted tradeoff (docs/perf.md) |
 | damage-only presentation | ✅ | M8.2; drm2d + drm3d damage-only done |
 | memory @10k scrollback | ✅ | M8.3; measured 38.9MB vs kmscon 59.2MB; sb-size byte budget fixed |
-| T5 real-hardware checklist | ❌ | M8.4 HARDWARE-BLOCKED: host has only Intel i915, needs ≥2 GPU vendors |
+| T5 real-hardware checklist | ✅ | M8.4; ≥2 vendors COVERED for achievable items — amdgpu (2× R9700, real 4K panel) + nvidia-drm (A2000 headless) run on tensor; i915 read-only on workstation. Panel/rig-dependent items remain (docs/t5-hardware.md) |
 | docs/perf.md | ✅ | M8.5; docs/perf.md written |

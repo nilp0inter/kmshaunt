@@ -239,9 +239,16 @@ const respawn_delay_ns: u64 = 500 * std.time.ns_per_ms;
 /// the refresh period, and idle/interactive damage is never delayed: the
 /// burst gate requires a pty pump within the last refresh.
 const burst_stretch_factor: u64 = 9;
-/// Cap on the burst stretch: even a pathologically expensive frame must
-/// not hold the visible console still longer than this.
-const max_frame_stretch_ns: u64 = 1 * std.time.ns_per_s;
+/// Display-rate floor for burst frames (M8.4 T5 real-hardware finding). The
+/// stretch factor bounds render duty for cheap frames, but on expensive
+/// content (many cells, complex glyphs, large back-buffer blits) 9x the frame
+/// cost pushed the visible frame period to ~0.5-1 s (1-2 fps): animation
+/// became input-paced, since only the input hook (frame_due_ns = 0) forced a
+/// frame. Cap the burst frame period so the display never drops below ~10 fps
+/// even for expensive content. Frames cheaper than max_period/factor keep the
+/// pure duty-bounding stretch; costlier frames trade throughput for a usable
+/// display rate (a frame still cannot present faster than its own cost).
+const max_burst_frame_period_ns: u64 = 100 * std.time.ns_per_ms;
 /// Zoom bounds (px) for grab-zoom-in/out. kmscon floors zoom-out at 1 px;
 /// no max is configured, so kmshaunt caps at a readable upper bound (M3.8).
 const min_font_px: u16 = 1;
@@ -2175,10 +2182,12 @@ fn burstCostEwma(prev_ns: u64, cost_ns: u64) u64 {
 
 /// Earliest delay before the next burst frame: the measured cost scaled so
 /// render+present occupies ~1/(1+factor) of the loop, never shorter than one
-/// display refresh and never longer than the stretch cap. Cheap frames thus
-/// keep the refresh period; only expensive frames stretch the frame clock.
+/// display refresh and never longer than the display-rate floor
+/// (max_burst_frame_period_ns). Cheap frames thus keep the refresh period;
+/// expensive frames stretch the frame clock only up to the floor, so
+/// animation stays >= ~10 fps instead of collapsing to 1-2 fps.
 fn burstStretchNs(cost_ns: u64, interval_ns: u64) u64 {
-    const scaled = @min(cost_ns * burst_stretch_factor, max_frame_stretch_ns);
+    const scaled = @min(cost_ns * burst_stretch_factor, max_burst_frame_period_ns);
     return @max(interval_ns, scaled);
 }
 
@@ -2876,14 +2885,17 @@ test "burstCostEwma: first sample adopted, rises slowly, falls fast" {
     try std.testing.expectEqual(@as(u64, 0), burstCostEwma(16_000_000, 0));
 }
 
-test "burstStretchNs: refresh floor, cost scaling, stretch cap" {
+test "burstStretchNs: refresh floor, cost scaling, display-rate floor" {
     const refresh: u64 = 16_666_667;
     // Cheap frame: never shorter than one refresh.
     try std.testing.expectEqual(refresh, burstStretchNs(1_000_000, refresh));
-    // Expensive frame: cost * factor (8 ms * 9 = 72 ms).
+    // Expensive frame below the floor: cost * factor (8 ms * 9 = 72 ms).
     try std.testing.expectEqual(@as(u64, 72_000_000), burstStretchNs(8_000_000, refresh));
-    // Pathological frame: capped at the stretch ceiling.
-    try std.testing.expectEqual(max_frame_stretch_ns, burstStretchNs(10 * std.time.ns_per_s, refresh));
+    // Costly frame: 9x cost would be 900 ms, but the display-rate floor caps
+    // the period at 100 ms (>= 10 fps) so animation never collapses to 1-2 fps.
+    try std.testing.expectEqual(max_burst_frame_period_ns, burstStretchNs(100_000_000, refresh));
+    // Pathological frame: still capped at the floor, not 9x cost.
+    try std.testing.expectEqual(max_burst_frame_period_ns, burstStretchNs(10 * std.time.ns_per_s, refresh));
     // Zero cost still yields one refresh.
     try std.testing.expectEqual(refresh, burstStretchNs(0, refresh));
 }

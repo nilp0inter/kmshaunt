@@ -7,10 +7,10 @@ Status of the M8 items:
 
 | Item | Status |
 |---|---|
-| M8.1 vtebench throughput vs kmscon | cell/unicode gap closed by burst coalescing (FramePacing, see below); all 10 benchmarks at or above kmscon |
+| M8.1 vtebench throughput vs kmscon | 9/10 at or above kmscon (1.33–1.80x) via burst coalescing; unicode regressed to 0.52x as the deliberate cost of the 100ms display-rate floor added for real-hardware animation (T5 section below) |
 | M8.2 damage-only presentation | drm2d + drm3d implemented (evidence below) |
 | M8.3 memory @ 10k scrollback | measured: kmscon 57.7 MiB, kmshaunt 34.7 MiB peak RSS; sb-size byte-cap fixed (setScrollbackMaxBytes), re-measure pending |
-| M8.4 T5 real hardware | HARDWARE-BLOCKED for the ≥2-vendor exit criterion (assessment below) |
+| M8.4 T5 real hardware | ≥2-vendor exit COVERED for achievable items: amdgpu + nvidia-drm run on tensor (2026-11-14), i915 read-only on the workstation; real-panel DPMS/hotplug/cursor/HiDPI verified on amdgpu. Real-hardware finding: burst pacing made animation input-paced (1-2 fps) → display-rate floor added (see below) |
 | M8.5 this document | written with the 2026-11-13 measured numbers |
 
 ## M8.1 — vtebench throughput: kmscon vs kmshaunt
@@ -216,7 +216,9 @@ sb-size=10000) — the authoritative same-VM comparison:
 | unicode | 60.3 | 72.3 | 1.20 |
 
 **All 10 benchmarks meet or exceed kmscon (1.20–1.76×): the M8.1 target is
-met.** Before the fix (pre-fix tree, same-config pacing probe) the five gap
+met** *(at this pre-floor revision; the 100 ms display-rate floor added later
+for real-hardware animation regressed unicode to 0.52× — see the T5 section)*.
+Before the fix (pre-fix tree, same-config pacing probe) the five gap
 benchmarks were cursor_motion 24.2, dense_cells 22.6, light_cells 39.7,
 scrolling_fullscreen 21.8, unicode 2.7 MiB/s. Pump duty rose from ~66% to
 ~90% (cells) and ~10% to ~85% (unicode); render frequency dropped ~10×.
@@ -478,3 +480,100 @@ Notes:
           services.kmshaunt.package = config.packages.kmshaunt;
         };
       };
+
+## M8.4 T5 — real-hardware run on tensor (2026-11-14)
+
+kmshaunt was built and run on tensor's two GPU vendors (2× AMD R9700 32 GB
+amdgpu + 1× NVIDIA RTX A2000 12 GB nvidia-drm, kernel 6.18.57), giving the
+≥2-vendor coverage the workstation (Intel/i915 only) could not. Compute
+workloads were stopped for the window and restored afterwards; nvidia-drm
+KMS was temporarily enabled (`modeset=1`) and restored to `N`. Full checklist,
+per-vendor evidence and reproduction: `docs/t5-hardware.md`.
+
+Verified on real hardware (amdgpu, with a real 3840x2160@240 Hz panel on the
+second R9700): modeset + rendering (fb captures + notcurses-demo visible on
+the panel), HiDPI auto font (15 px @1080p/530x300 mm, 23 px @4K/700x390 mm,
+11 px @1080p on the 4K panel — all exactly `height_px*254/(height_mm*60)`),
+DPMS real backlight power-off (user-confirmed dark, keypress wake), physical
+hotplug (unplug/replug teardown + re-add) and runtime cross-GPU hotplug add,
+VT/master round-trip (chvt 1↔2), hardware cursor in situ (CRTC CRC changes on
+pointer move, returns on move-back). nvidia-drm headless (forced DP-7 + EDID
+override): modeset, rendering, DPMS Off/On, 4 cursor planes, drm3d init.
+kmscon 10.1.1 modeset + rendered on the same R9700/panel (parity).
+
+### Real-hardware finding: animation was input-paced (burst pacing)
+
+notcurses-demo on the real 4K panel was "very choppy", but each keypress
+produced a frame; fast typing gave "10x-20x more frames". The same demo was
+smooth in the M8 QEMU VM. Measured display rate (GETCRTC fb-id transitions,
+demo bursting, no input): **~1.1 fps (~890 ms gaps)** at 4K, ~2 fps (~500 ms)
+in lighter sections and at 1080p. The demo's own 103–1740 fps is its pty
+write rate (consumption), not the display rate. Keypress→flip ~80 ms
+(render-dominated).
+
+Root cause (NOT a driver/flip-event bug — the flip path is healthy: every
+submitted flip completes, cookie+crtc match works on amdgpu): the M8.1 burst
+coalescing `burstStretchNs = max(refresh, min(9*EWMA(frame_cost), 1 s))`
+bounds render *duty* but not the frame *period*. Expensive content (~20k
+cells of gradient/emoji + ~33 MB write-combining blit into VRAM/GTT) costs
+~55–100 ms/frame → 0.5–0.9 s period → 1–2 fps. The input hook zeroes
+`frame_due_ns`, so typing manually pumps the frame clock. Auto font size
+keeps the cell count ~constant across resolutions (4K 256x77 vs 1080p
+274x77), so the per-cell render cost — not the blit — dominates and the
+choppiness persists at 1080p too. The VM looked fine because it ran 8000
+cells of lighter content in guest RAM (~8 ms frames → ~14 fps).
+
+### Fix: display-rate floor (src/main.zig)
+
+Cap the burst *stretch* (deferral) at `max_burst_frame_period_ns = 100 ms`
+(was 1 s): `burstStretchNs = max(refresh, min(9*cost, 100 ms))`. Cheap frames
+(cost < ~11 ms, e.g. the cell benchmarks at ~8 ms → 72 ms) keep the pure
+duty-bounding stretch unchanged; costlier frames defer at most 100 ms instead
+of up to 1 s. Idle/interactive-exempt and full-redraw-preempt behavior
+unchanged; `burstStretchNs` unit tests extended for the cap.
+
+Note the total frame period is `render_cost + stretch`, so this caps the
+*deferral*, not the absolute period: a ~50 ms frame still presents every
+~150 ms (~6.7 fps). A strict ≥10 fps floor for such frames would require
+capping the total period (`stretch = min(9*cost, 100 ms - cost)`), which is
+further optimization deferred by request — the shipped change is the
+stretch cap.
+
+### Fix verification (2026-11-14)
+
+Real hardware (R9700 + 4K@240 panel, notcurses-demo): instrumented
+`renderIfDirty` measured the per-frame render+present cost at **~50 ms**
+(49–66 ms, EWMA ~50–60 ms) — not the hundreds of ms first suspected. With
+the 1 s cap the deferral was ~9×50 = 450 ms → ~1–2 fps; with the 100 ms cap
+the deferral is 100 ms → ~6.7 fps for those frames. User verdict: "much
+better, but still dropping some frames" (the heaviest sections still render
+slower than 10 fps). The flip-completion path was confirmed healthy
+(GETCRTC fb-id polling: every submitted flip completes; keypress→flip ~80 ms,
+render-dominated).
+
+vtebench, same VM harness (`just m8-perf`, 1280x800, grid 50x160), kmshaunt
+before (1 s cap) vs after (100 ms cap), MiB/s:
+
+| benchmark | kmscon | before | after | after/kmscon |
+|---|---|---|---|---|
+| cursor_motion | 34.4 | 61.1 | 61.8 | 1.80 |
+| dense_cells | 38.8 | 66.2 | 65.9 | 1.70 |
+| light_cells | 76.9 | 108.2 | 107.8 | 1.40 |
+| scrolling | 4.2 | 6.0 | 5.9 | 1.41 |
+| scrolling_bottom_region | 5.2 | 7.1 | 7.1 | 1.38 |
+| scrolling_bottom_small_region | 5.4 | 7.2 | 7.2 | 1.34 |
+| scrolling_fullscreen | 31.4 | 54.1 | 50.0 | 1.59 |
+| scrolling_top_region | 5.3 | 7.1 | 7.0 | 1.33 |
+| scrolling_top_small_region | 4.9 | 7.2 | 7.2 | 1.46 |
+| unicode | 62.0 | 72.3 | 32.2 | 0.52 |
+
+**Tradeoff:** the cell and scrolling benchmarks are essentially unchanged
+(still 1.33–1.80× kmscon). **unicode regressed 72.3 → 32.2 MiB/s (1.20× →
+0.52×), now below kmscon.** This is fundamental, not a tuning miss: unicode
+frames are rasterization-bound (~100–190 ms), so any display-rate floor
+forces high render duty and starves the pty pump. Keeping unicode ≥ kmscon
+requires ~10% duty ≈ ~1 fps display — exactly the animation problem being
+fixed. M8.1 "equal-or-better on every benchmark" therefore no longer holds
+for unicode with the floor enabled (9/10 still ≥ kmscon); the interactive
+usability gain is the accepted trade. Peak RSS unchanged (kmshaunt 38.8 MiB
+vs kmscon 57.8 MiB after `seq 1 20000`).
