@@ -338,8 +338,8 @@ const RoundCapOutline = struct {
 /// Rounded box-drawing corner (U+256D..U+2570): a quarter-arc of radius
 /// r centered on the cell center, joined to the two edge midpoints.
 /// `corner` selects which quadrant the arc bulges into: 0 = top-left
-/// (U+256F), 1 = top-right (U+2570), 2 = bottom-left (U+256E),
-/// 3 = bottom-right (U+256D).
+/// (U+256D), 1 = top-right (U+256E), 2 = bottom-left (U+2570),
+/// 3 = bottom-right (U+256F).
 const CornerArc = struct {
     cx: f64,
     cy: f64,
@@ -586,10 +586,10 @@ fn drawBox(out: []u8, c: Cell, cp: u21) void {
         0x254D => drawDash(out, c, true, 2, c.heavy, c.heavy),
         0x254E => drawDash(out, c, false, 2, c.light, c.heavy),
         0x254F => drawDash(out, c, false, 2, c.heavy, c.heavy),
-        0x256D => drawCornerArc(out, c, 3),
-        0x256E => drawCornerArc(out, c, 2),
-        0x256F => drawCornerArc(out, c, 0),
-        0x2570 => drawCornerArc(out, c, 1),
+        0x256D => drawCornerArc(out, c, 0),
+        0x256E => drawCornerArc(out, c, 1),
+        0x256F => drawCornerArc(out, c, 3),
+        0x2570 => drawCornerArc(out, c, 2),
         0x2571 => drawDiagonal(out, c, false, c.light),
         0x2572 => drawDiagonal(out, c, true, c.light),
         0x2573 => {
