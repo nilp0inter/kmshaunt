@@ -167,6 +167,18 @@ pub const Face = struct {
         try ftCheck(ft.FT_Select_Size(face, best));
     }
 
+    /// Select the size in points at a DPI (FT_Set_Char_Size), giving a
+    /// fractional pixel size like ghostty (pt*dpi/72). Bitmap-only faces fall
+    /// back to the nearest strike via setPixelSize.
+    pub fn setCharSize(self: Face, points: u32, dpi: u32) !void {
+        const face = self.ft_face;
+        if ((face.*.face_flags & ft.FT_FACE_FLAG_SCALABLE) != 0 or face.*.num_fixed_sizes == 0) {
+            try ftCheck(ft.FT_Set_Char_Size(face, 0, @intCast(points * 64), dpi, dpi));
+            return;
+        }
+        try self.setPixelSize(@intCast((points * dpi) / 72));
+    }
+
     /// FT_Get_Char_Index; null when the face has no glyph for `cp`
     /// (FreeType's glyph 0 means "missing").
     pub fn glyphIndex(self: Face, cp: u21) ?u32 {
@@ -500,38 +512,82 @@ pub fn cellMetrics(face: Face) !CellMetrics {
 }
 
 /// ghostty-compatible cell geometry (port of ghostty src/font/Metrics.zig
-/// `calc` + `apply`, with the FreeType vertical metrics). Uses rounding (not
-/// truncation), includes the line gap, and derives the baseline from the cell
-/// bottom with half-gap centering, so the same user adjust-* percentages yield
-/// the same grid as ghostty. `aw/ah/ab` are the adjust-cell-width/height and
-/// adjust-font-baseline percentages.
-pub fn cellMetricsGhostty(face: Face, aw: i32, ah: i32, ab: i32) !CellMetrics {
+/// `calc` + `apply` and src/font/face/freetype.zig vertical-metric selection).
+/// Reads hhea/OS/2 like ghostty, uses a fractional pixel size, rounds (not
+/// truncates), includes the line gap, and derives the baseline from the cell
+/// bottom with half-gap centering, so identical user adjust-* percentages yield
+/// the same grid as ghostty. `px_f64` is the fractional pixel size; aw/ah/ab are
+/// the adjust-cell-width/height and adjust-font-baseline percentages.
+pub fn cellMetricsGhostty(face: Face, px_f64: f64, aw: i32, ah: i32, ab: i32) !CellMetrics {
+    const f = face.ft_face;
     const idx = face.glyphIndex('0') orelse face.glyphIndex(' ') orelse
         return error.NoReferenceGlyph;
-    try ftCheck(ft.FT_Load_Glyph(face.ft_face, idx, ft.FT_LOAD_DEFAULT));
-    const face_width = @as(f64, @floatFromInt(face.ft_face.*.glyph.*.advance.x)) / 64.0;
-    const sm = face.ft_face.*.size.*.metrics;
-    const ascent = @as(f64, @floatFromInt(sm.ascender)) / 64.0;
-    const descent = @as(f64, @floatFromInt(sm.descender)) / 64.0;
-    const face_height = @as(f64, @floatFromInt(sm.height)) / 64.0;
-    const line_gap = face_height - (ascent - descent);
+    try ftCheck(ft.FT_Load_Glyph(f, idx, ft.FT_LOAD_DEFAULT));
+    const face_width = @as(f64, @floatFromInt(f.*.glyph.*.advance.x)) / 64.0;
+
+    const upm: f64 = @floatFromInt(f.*.units_per_EM);
+    const ppu = if (upm > 0) px_f64 / upm else 0.0;
+    const hhea_raw = ft.FT_Get_Sfnt_Table(f, ft.FT_SFNT_HHEA);
+    const os2_raw = ft.FT_Get_Sfnt_Table(f, ft.FT_SFNT_OS2);
+    const hhea: ?*const ft.TT_HoriHeader = if (hhea_raw) |p| @ptrCast(@alignCast(p)) else null;
+    const os2: ?*const ft.TT_OS2 = if (os2_raw) |p| @ptrCast(@alignCast(p)) else null;
+
+    var ascent: f64 = 0;
+    var descent: f64 = 0;
+    var line_gap: f64 = 0;
+    var have = false;
+    if (os2) |o| {
+        if (o.*.fsSelection & (1 << 7) != 0) {
+            ascent = @as(f64, @floatFromInt(o.*.sTypoAscender)) * ppu;
+            descent = @as(f64, @floatFromInt(o.*.sTypoDescender)) * ppu;
+            line_gap = @as(f64, @floatFromInt(o.*.sTypoLineGap)) * ppu;
+            have = true;
+        }
+    }
+    if (!have) {
+        if (hhea) |h| {
+            if (h.*.Ascender != 0 or h.*.Descender != 0) {
+                ascent = @as(f64, @floatFromInt(h.*.Ascender)) * ppu;
+                descent = @as(f64, @floatFromInt(h.*.Descender)) * ppu;
+                line_gap = @as(f64, @floatFromInt(h.*.Line_Gap)) * ppu;
+                have = true;
+            }
+        }
+    }
+    if (!have) {
+        if (os2) |o| {
+            if (o.*.sTypoAscender != 0 or o.*.sTypoDescender != 0) {
+                ascent = @as(f64, @floatFromInt(o.*.sTypoAscender)) * ppu;
+                descent = @as(f64, @floatFromInt(o.*.sTypoDescender)) * ppu;
+                line_gap = @as(f64, @floatFromInt(o.*.sTypoLineGap)) * ppu;
+            } else {
+                ascent = @as(f64, @floatFromInt(o.*.usWinAscent)) * ppu;
+                descent = -@as(f64, @floatFromInt(o.*.usWinDescent)) * ppu;
+                line_gap = 0;
+            }
+            have = true;
+        }
+    }
+    if (!have) {
+        const sm = f.*.size.*.metrics;
+        ascent = @as(f64, @floatFromInt(sm.ascender)) / 64.0;
+        descent = @as(f64, @floatFromInt(sm.descender)) / 64.0;
+        line_gap = @as(f64, @floatFromInt(sm.height)) / 64.0 - (ascent - descent);
+    }
+    const face_height = ascent - descent + line_gap;
 
     var cw = @round(face_width);
     var ch = @round(face_height);
     const face_baseline = line_gap / 2.0 - descent;
     var cb = @round(face_baseline - (ch - face_height) / 2.0); // from cell bottom
 
-    // adjust-cell-width (percent).
     cw = @max(1, @round(cw * (100.0 + @as(f64, @floatFromInt(aw))) / 100.0));
-    // adjust-cell-height (percent) with baseline recentering, as ghostty does.
     const orig_ch = ch;
     ch = @max(1, @round(ch * (100.0 + @as(f64, @floatFromInt(ah))) / 100.0));
     const half = (ch - orig_ch) / 2.0;
     const face_y = cb - face_baseline;
     const pos = face_y - (orig_ch - face_height) / 2.0;
-    const diff_bottom = if (pos > 0) @floor(half) else @ceil(half);
-    cb += diff_bottom;
-    // adjust-font-baseline (percent, relative to cell bottom).
+    cb += if (pos > 0) @floor(half) else @ceil(half);
     cb = @round(cb * (100.0 + @as(f64, @floatFromInt(ab))) / 100.0);
 
     const baseline_top = ch - cb;

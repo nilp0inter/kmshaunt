@@ -1038,7 +1038,12 @@ const Console = struct {
 
         self.disc = try discovery.Discovery.init(self.alloc);
         self.face = try self.disc.?.primaryFace(self.cfg.font_name, self.size_px);
-        self.cell = try discovery.cellMetricsGhostty(self.face, self.cfg.adjust_cell_width, self.cfg.adjust_cell_height, self.cfg.adjust_font_baseline);
+        if (self.cfg.font_size != 0) try self.face.setCharSize(self.cfg.font_size, 96);
+        const px_f64 = if (self.cfg.font_size != 0)
+            @as(f64, @floatFromInt(self.cfg.font_size)) * 96.0 / 72.0
+        else
+            @as(f64, @floatFromInt(self.size_px));
+        self.cell = try discovery.cellMetricsGhostty(self.face, px_f64, self.cfg.adjust_cell_width, self.cfg.adjust_cell_height, self.cfg.adjust_font_baseline);
         if (self.cell.cell_w == 0 or self.cell.cell_h == 0) return error.InvalidCellMetrics;
 
         self.renderer = try cpu.CpuRenderer.init(self.alloc, &self.disc.?, &self.face, .{
