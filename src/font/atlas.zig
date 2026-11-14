@@ -270,7 +270,7 @@ pub const GlyphAtlas = struct {
     };
 
     /// Create an atlas with `width`x`height` pixel pages. A typical console
-    /// atlas is 1024x1024 (~1 MiB a8 + 4 MiB bgra8). Both pages start
+    /// atlas is 4096x4096 (~16 MiB a8 + 64 MiB bgra8). Both pages start
     /// zeroed, so uploading a page before its first glyph cannot expose
     /// stale heap contents.
     pub fn init(allocator: std.mem.Allocator, width: u16, height: u16) InitError!GlyphAtlas {

@@ -346,7 +346,7 @@ pub const TerminalSession = struct {
     /// A sustained output burst must not monopolize input/rendering;
     /// when the budget is hit the caller re-arms the edge-triggered
     /// source so pending data wakes the loop again.
-    pub const pump_budget: usize = 128 * 1024;
+    pub const pump_budget: usize = 256 * 1024;
 
     /// epoll pump: drain the pty master into the terminal, at most
     /// `pump_budget` bytes per call. Effects fire inline (vt.write).
@@ -357,7 +357,7 @@ pub const TerminalSession = struct {
     pub fn onPtyReadable(self: *TerminalSession) anyerror!bool {
         try self.ensureBound();
         if (!self.active) return false;
-        var buf: [16384]u8 = undefined;
+        var buf: [65536]u8 = undefined;
         var drained: usize = 0;
         var more = false;
         while (true) {

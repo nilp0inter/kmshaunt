@@ -140,9 +140,11 @@ pub const Options = struct {
     /// the fractional ppem (14pt@96dpi = 18.671875px, not 18).
     size_points: u32 = 0,
     size_dpi: u32 = 96,
-    /// Atlas page dimensions (shared by the a8 and bgra8 pages).
-    atlas_width: u16 = 1024,
-    atlas_height: u16 = 1024,
+    /// Atlas page dimensions (shared by the a8 and bgra8 pages). 4096x4096
+    /// costs 16 MiB (a8) + 64 MiB (bgra8) and holds ~16x the glyphs of the
+    /// old 1024 default, enough for a full 4K frame of unique glyphs.
+    atlas_width: u16 = 4096,
+    atlas_height: u16 = 4096,
     /// HarfBuzz feature strings from the session's font-features option
     /// ("+liga", "kern=0", ...), parsed with shaper.Feature.parse. They
     /// are applied on top of the shaper defaults (kern ON, liga OFF), so
@@ -1395,7 +1397,7 @@ pub const CpuRenderer = struct {
                         };
                     }
                     const src = if (constrained) |*cc| cc else c;
-                    break :blk try self.atlas.insert(key, .{
+                    break :blk self.atlas.insert(key, .{
                         .bearing_x = clampI16(src.bearing_x),
                         .bearing_y = clampI16(src.bearing_y),
                         .advance_x = clampI16(roundI32(g.x_advance)),
@@ -1405,7 +1407,12 @@ pub const CpuRenderer = struct {
                         .height = @intCast(src.height),
                         .data = src.pixels,
                         .stride = src.pitch,
-                    });
+                    }) catch |err| switch (err) {
+                        // Atlas full of current-frame (pinned) glyphs: skip
+                        // it, keep the frame.
+                        error.AtlasFull => return,
+                        else => return err,
+                    };
                 }
             }
             const bmp = slot.face.loadGlyph(g.glyph_index, slot.has_color) catch |err| switch (err) {
@@ -1414,7 +1421,12 @@ pub const CpuRenderer = struct {
                 error.UnsupportedPixelMode, error.InvalidGlyphIndex, error.CannotRenderGlyph => return,
                 else => return err,
             };
-            break :blk try self.cacheGlyph(key, bmp);
+            break :blk self.cacheGlyph(key, bmp) catch |err| switch (err) {
+                // Atlas full of current-frame (pinned) glyphs: skip it, keep
+                // the frame.
+                error.AtlasFull => return,
+                else => return err,
+            };
         };
         const dst_x = x_px + @as(i32, entry.bearing_x) + roundI32(g.x_offset);
         const dst_y = y_px + @as(i32, self.metrics.baseline) - @as(i32, entry.bearing_y) - roundI32(g.y_offset);
@@ -1479,12 +1491,20 @@ pub const CpuRenderer = struct {
             try self.ensureScratch(n);
             if (!sprite.renderSprite(cp, cw, ch, self.scratch[0..n])) return;
             try self.sprite_cps.append(self.allocator, cp);
-            break :blk try self.atlas.insert(key, .{ .advance_x = @intCast(cw) }, .{
+            break :blk self.atlas.insert(key, .{ .advance_x = @intCast(cw) }, .{
                 .format = .a8,
                 .width = cw,
                 .height = ch,
                 .data = self.scratch[0..n],
-            });
+            }) catch |err| switch (err) {
+                // Atlas full of current-frame (pinned) glyphs: skip it, keep
+                // the frame. Undo the tracking append above.
+                error.AtlasFull => {
+                    _ = self.sprite_cps.pop();
+                    return;
+                },
+                else => return err,
+            };
         };
         self.blitEntry(f, x_px, y_px, entry, fg);
         self.markInked(x_px, y_px, cw, ch);

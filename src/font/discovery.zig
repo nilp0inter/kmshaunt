@@ -774,7 +774,7 @@ test "explicit name, face cache identity, pixel size scaling" {
     var d = try Discovery.init(testing.allocator);
     defer d.deinit();
 
-    const a = try d.primaryFace("monospace", 16);
+    var a = try d.primaryFace("monospace", 16);
     const b = try d.primaryFace(null, 16);
     // Same match, same underlying face: loaded exactly once.
     try testing.expect(a.ft_face == b.ft_face);

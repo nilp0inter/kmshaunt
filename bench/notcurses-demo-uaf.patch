@@ -1,0 +1,16 @@
+--- a/src/demo/demo.c
++++ b/src/demo/demo.c
+@@ -597,13 +597,13 @@
+   notcurses_render(nc); // rid ourselves of any remaining demo output
+   int r = summary_table(nc, spec, canimage, canvideo);
+   notcurses_render(nc); // render our summary table
+-  free(results);
+   if(notcurses_stop(nc)){
+     return EXIT_FAILURE;
+   }
+   if(json && summary_json(json, spec, dimy, dimx)){
+     return EXIT_FAILURE;
+   }
++  free(results);
+   free(datadir);
+   return r ? EXIT_FAILURE : EXIT_SUCCESS;

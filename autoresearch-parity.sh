@@ -9,7 +9,7 @@
 #   Primary metric:   total_abs_diff  sum of per-pixel |dR|+|dG|+|dB| over frames
 #   Secondary metric: pixel_diff      count of pixels with any channel difference
 #
-# run_experiment executes this as `bash autoresearch.sh`. Each iteration rebuilds
+# run_experiment executes this as `bash autoresearch-parity.sh`. Each iteration rebuilds
 # kmshaunt from current src and boots both VMs, so pass a generous
 # timeout_seconds (e.g. 1200) when calling run_experiment.
 set -euo pipefail

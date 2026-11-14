@@ -1502,24 +1502,56 @@ const Console = struct {
     /// Present the shadow canvas into one output's back buffer through its
     /// viewport plan, then flip. `backend` is the fbdev video.Backend or a
     /// DrmFrame selecting the connector (M5.4). The 1:1 unrotated full-canvas
-    /// case uses the fast blitFrom + exact damage; other viewports clear the
-    /// letterbox and use blitViewport with row-band physical damage
-    /// (Plan.damage), or a full frame on full_redraw.
+    /// case -- including an integer letterbox offset -- uses the band-limited
+    /// NT blit shifted by the offset and repaints only the static letterbox
+    /// bands; scaled/rotated/fractional viewports clear the letterbox and use
+    /// blitViewport with row-band physical damage (Plan.damage), or a full
+    /// frame on full_redraw.
     fn present(self: *Console, backend: anytype, plan: layout.Plan, prev_damage: *sess.DamageList) void {
         const shadow = &self.shadow.?;
         const fb = backend.beginFrame() catch |err| {
             log.warn("beginFrame: {t}", .{err});
             return;
         };
-        const trivial = plan.scale == 1 and plan.conn.rotation == .normal and
+        const aligned = plan.scale == 1 and plan.conn.rotation == .normal and
             plan.src.x == 0 and plan.src.y == 0 and
             plan.src.w == self.canvas.width and plan.src.h == self.canvas.height and
-            plan.dst.x == 0 and plan.dst.y == 0;
-        if (trivial) {
-            self.blitShadowBands(fb, shadow, prev_damage);
-            const dmg: []const video.Damage = if (self.full_redraw) &.{} else self.damage.items;
-            backend.endFrame(dmg) catch |err| log.warn("endFrame: {t}", .{err});
-            return;
+            plan.dst.x >= 0 and plan.dst.y >= 0 and
+            @floor(plan.dst.x) == plan.dst.x and @floor(plan.dst.y) == plan.dst.y;
+        if (aligned) {
+            const dx: u32 = @intFromFloat(plan.dst.x);
+            const dy: u32 = @intFromFloat(plan.dst.y);
+            if (dx + shadow.width <= fb.width and dy + shadow.height <= fb.height) {
+                // The letterbox is static black: repaint just its bands
+                // instead of a full-canvas fill every frame.
+                if (dy > 0) fillBand(fb, 0, 0, fb.width, dy);
+                const by = dy + shadow.height;
+                if (by < fb.height) fillBand(fb, 0, by, fb.width, fb.height - by);
+                if (dx > 0) fillBand(fb, 0, dy, dx, shadow.height);
+                const bx = dx + shadow.width;
+                if (bx < fb.width) fillBand(fb, bx, dy, fb.width - bx, shadow.height);
+                self.blitShadowBands(fb, shadow, prev_damage, dx, dy);
+                if (self.full_redraw) {
+                    backend.endFrame(&.{}) catch |err| log.warn("endFrame: {t}", .{err});
+                } else if (dx == 0 and dy == 0) {
+                    backend.endFrame(self.damage.items) catch |err| log.warn("endFrame: {t}", .{err});
+                } else {
+                    self.phys_damage.clearRetainingCapacity();
+                    for (self.damage.items) |r| {
+                        self.phys_damage.append(self.alloc, .{
+                            .x = r.x + dx,
+                            .y = r.y + dy,
+                            .w = r.w,
+                            .h = r.h,
+                        }) catch |err| {
+                            log.warn("damage: {t}", .{err});
+                            break;
+                        };
+                    }
+                    backend.endFrame(self.phys_damage.items) catch |err| log.warn("endFrame: {t}", .{err});
+                }
+                return;
+            }
         }
         // Viewport path: clear the letterbox, paint the rotated/scaled window.
         fb.fill(0);
@@ -1562,10 +1594,12 @@ const Console = struct {
         fb: *video.Framebuffer,
         shadow: *const video.Framebuffer,
         prev_damage: *sess.DamageList,
+        dx: u32,
+        dy: u32,
     ) void {
         const full = video.Damage{ .x = 0, .y = 0, .w = shadow.width, .h = shadow.height };
         if (self.full_redraw) {
-            self.blitBand(fb, shadow, 0, shadow.height);
+            self.blitBand(fb, shadow, 0, shadow.height, dx, dy);
             self.setPrevDamage(prev_damage, &.{full});
             return;
         }
@@ -1587,7 +1621,7 @@ const Console = struct {
             }
         }
         if (overflow) {
-            self.blitBand(fb, shadow, 0, shadow.height);
+            self.blitBand(fb, shadow, 0, shadow.height, dx, dy);
             self.setPrevDamage(prev_damage, &.{full});
             return;
         }
@@ -1615,38 +1649,50 @@ const Console = struct {
             }
         }
         for (iv[0..m]) |band| {
-            self.blitBand(fb, shadow, band[0], band[1] - band[0]);
+            self.blitBand(fb, shadow, band[0], band[1] - band[0], dx, dy);
         }
         self.setPrevDamage(prev_damage, self.damage.items);
     }
 
-    /// Copy full-width shadow rows [y, y+h) into the back buffer. The
-    /// dumb-buffer mapping is write-combining: regular stores flush
-    /// partial WC buffers through the cache hierarchy (~0.5 GB/s), while
-    /// non-temporal stores combine full lines in the WC buffers
-    /// themselves (several GB/s). x86-64 has SSE2 at baseline; other
+    /// Copy full-width shadow rows [y, y+h) into the back buffer at the
+    /// (dx, dy) letterbox offset. The dumb-buffer mapping is write-combining:
+    /// regular stores flush partial WC buffers through the cache hierarchy
+    /// (~0.5 GB/s), while non-temporal stores combine full lines in the WC
+    /// buffers themselves (several GB/s). x86-64 has SSE2 at baseline; other
     /// targets and unaligned pitches keep the plain memcpy (M8.1).
-    fn blitBand(_: *Console, fb: *video.Framebuffer, shadow: *const video.Framebuffer, y: u32, h: u32) void {
+    fn blitBand(_: *Console, fb: *video.Framebuffer, shadow: *const video.Framebuffer, y: u32, h: u32, dx: u32, dy: u32) void {
         if (comptime builtin.cpu.arch == .x86_64) {
             const row_bytes: usize = @as(usize, shadow.width) * 4;
             // movntdq needs 16-byte-aligned destinations: the mmap base
             // is page-aligned, so a 16-aligned pitch keeps every row
-            // start aligned.
+            // start aligned; a whole-pixel x offset must be a multiple
+            // of 4 pixels (16 bytes) as well.
             if (shadow.pitch % 16 == 0 and fb.pitch % 16 == 0 and
-                @intFromPtr(fb.mem.ptr) % 16 == 0)
+                @intFromPtr(fb.mem.ptr) % 16 == 0 and dx % 4 == 0)
             {
                 var r: u32 = 0;
                 while (r < h) : (r += 1) {
                     const row = y + r;
                     const src = shadow.mem[@as(usize, row) * shadow.pitch ..][0..row_bytes];
-                    const dst = fb.mem[@as(usize, row) * fb.pitch ..][0..row_bytes];
+                    const dst = fb.mem[(@as(usize, row + dy) * fb.pitch) + @as(usize, dx) * 4 ..][0..row_bytes];
                     copyRowNT(dst, src);
                 }
                 asm volatile ("sfence" ::: .{ .memory = true });
                 return;
             }
         }
-        fb.blitFrom(shadow.*, 0, 0, .{ .x = 0, .y = y, .w = shadow.width, .h = h });
+        fb.blitFrom(shadow.*, @intCast(dx), @intCast(dy), .{ .x = 0, .y = y, .w = shadow.width, .h = h });
+    }
+
+    /// Paint one letterbox band black, honoring the pitch padding. Only the
+    /// bands outside the canvas are repainted; the content area is covered by
+    /// the blit (a full fb.fill would cost a full-canvas WC write per frame).
+    fn fillBand(fb: *video.Framebuffer, x: u32, y: u32, w: u32, h: u32) void {
+        var r: u32 = 0;
+        while (r < h) : (r += 1) {
+            const off = @as(usize, y + r) * fb.pitch + @as(usize, x) * 4;
+            @memset(fb.mem[off..][0 .. @as(usize, w) * 4], 0);
+        }
     }
 
     /// Append one full-width row band to the merge buffer; false when the
@@ -2382,6 +2428,18 @@ fn createTerminal(
         .grab = hookGrab,
         .child_exit = hookChildExit,
     };
+
+    // Seed the console's known cell metrics before start(): the spawn-time
+    // TIOCSWINSZ must carry real pixel dimensions. A child that starts with
+    // ws_xpixel/ws_ypixel = 0 (metrics only landed on the first render,
+    // ~400 ms later) makes notcurses derive cellpx = 0 and permanently
+    // disable pixel graphics (pixel_draw = NULL), which aborts demos that
+    // require NCBLIT_PIXEL (keller) and silently degrades the others.
+    if (c.cell.cell_w != 0 and c.cell.cell_h != 0) {
+        ts.cell_w = c.cell.cell_w;
+        ts.cell_h = c.cell.cell_h;
+        try ts.session().resize(cols, rows);
+    }
 
     try ts.session().start();
     try c.terminals.append(alloc, ts);
