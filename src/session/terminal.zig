@@ -230,6 +230,10 @@ pub const TerminalSession = struct {
         rows: u16,
     ) !TerminalSession {
         var v = try vt.Vt.init(cols, rows);
+        // ghostty grapheme-width-method=unicode enables mode 2027 by default;
+        // ZWJ emoji sequences must arrive as one grapheme cell. setModeDefault
+        // so RIS (which every parity frame sends) restores it.
+        try v.setModeDefault(vt.mode(2027, false), true);
         errdefer v.deinit();
         var rs = try vt.RenderState.new();
         errdefer rs.deinit();

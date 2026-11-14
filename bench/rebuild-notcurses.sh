@@ -7,7 +7,7 @@
 #
 # Run on tensor. Prints the patched notcurses store path; the demo binary is
 # at <path>/bin/notcurses-demo and its data at <path>/share/notcurses. Point
-# autoresearch.sh's NC/DATA at that path after rebuilding.
+# autoresearch-notcurses.sh's NC/DATA at that path after rebuilding.
 #
 # nixpkgs (flake registry) rev used: 02c087f3fe673c9e317f206a627cb6b910336dbe
 set -euo pipefail

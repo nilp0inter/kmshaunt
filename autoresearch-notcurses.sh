@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# autoresearch.sh — kmshaunt notcurses-demo FPS benchmark on tensor's Radeon.
+# autoresearch-notcurses.sh — kmshaunt notcurses-demo FPS benchmark on tensor's Radeon.
 #
 # Builds the CURRENT kmshaunt source on tensor, runs the full notcurses-demo
 # inside it at 3840x2160@240 (card2-DP-3, the connected panel), captures the
@@ -11,6 +11,7 @@
 # summary_json use-after-free that corrupted the JSON). See /tmp/notcurses-fix
 # on tensor for the patch + rebuild recipe.
 set -euo pipefail
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CP=/home/nil/.ssh/control/tensor
 SSH="ssh -o ControlPath=$CP root@tensor.local"

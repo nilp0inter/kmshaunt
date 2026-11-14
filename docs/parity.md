@@ -5,6 +5,9 @@ Test tiers: T1 unit · T2 render golden · T3 VM integration · T4 parity (same 
 
 Last updated: 2026-11-13. This file is ticked as features land; `nix flake check` runs T1 + the wired T3/T4 checks.
 
+ghostty rendering parity (separate effort, two-VM pixel-diff harness + renderer
+port + config knobs): see [docs/ghostty-parity.md](ghostty-parity.md).
+
 ## Session / system
 | Feature | Status | Evidence / gap |
 |---|---|---|
