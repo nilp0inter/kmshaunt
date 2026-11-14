@@ -76,15 +76,32 @@ pub const Colors = struct {
 // Cursor geometry constants (ghostty defaults)
 // ---------------------------------------------------------------------------
 
-/// ghostty Metrics.cursor_thickness default: 1px (user-configurable in
-/// ghostty via adjust-cursor-thickness; kmshaunt has no knob yet).
-pub const cursor_thickness: u16 = 1;
+/// ghostty Metrics.cursor_thickness default: 1px (font/Metrics.zig:34),
+/// adjusted by adjust-cursor-thickness and clamped >= 1 (Minimums :65).
+/// The console sets this from config (main.applyDecoConfig); the default
+/// reproduces the unconfigured renderer.
+pub var cursor_thickness: u16 = 1;
 
 /// Cell-relative row of the underline-style cursor, i.e. ghostty's
 /// metrics.underline_position. The fixed drawCursor signature cannot carry
-/// font metrics, so the renderer sets this once per font/resize (the same
-/// value passed to drawUnderline). Null falls back to the bottom cell row.
+/// font metrics, so the console sets this when adjust-underline-position
+/// is configured (main.applyDecoConfig). Null falls back to the bottom
+/// cell row (the unconfigured default).
 pub var cursor_underline_pos: ?i16 = null;
+
+/// ghostty metrics.cursor_height for block/hollow/bar cursors
+/// (sprite/Face.zig:211-217): the cursor sprite height, re-centered in
+/// the cell (Face.zig:242-250). Null = full cell height (the ghostty
+/// default, Metrics.zig:320). Set per font/resize because the base value
+/// is the cell height; the underline cursor keeps the full cell height.
+pub var cursor_height: ?u16 = null;
+
+/// ghostty metrics.underline_position with adjust-underline-position
+/// applied (font/Metrics.zig:408-410), set by the console when the knob
+/// is configured. Null = unadjusted: drawUnderline uses the row the
+/// renderer computed from the face metrics. When set, it replaces that
+/// row for every underline style, like ghostty's shared adjusted metric.
+pub var adjusted_underline_pos: ?i16 = null;
 
 // ---------------------------------------------------------------------------
 // Attribute helpers (pure, no framebuffer)
@@ -204,7 +221,7 @@ pub fn drawUnderline(
     const h: u32 = cell_h;
     const pad_y: u32 = h / 4;
     const t: u32 = @max(@as(u32, thickness), 1);
-    const pos: i32 = underline_pos;
+    const pos: i32 = adjusted_underline_pos orelse @as(i32, underline_pos);
 
     switch (style) {
         .none => {},
@@ -275,11 +292,13 @@ pub fn drawOverline(
 /// Draw the software cursor for one cell (ghostty special.zig cursor_*).
 /// `blink_on == false` draws nothing (the off phase of the blink timer).
 /// Shapes, all `cursor_thickness` (1px) unless noted:
-/// * `block` -- the whole cell (the renderer then paints the glyph with
-///   `cursorOverlayColor`).
-/// * `hollow` -- the cell border, cursor_thickness wide (cursor_hollow_rect).
+/// * `block` -- cursor_height tall (default: the whole cell), centered
+///   vertically; the renderer then paints the glyph with
+///   `cursorOverlayColor`.
+/// * `hollow` -- the cursor_height border ring, cursor_thickness wide
+///   (cursor_hollow_rect).
 /// * `bar` -- cursor_thickness wide, centered on the cell's LEFT edge:
-///   x = -((thickness+1)/2), full cell height (cursor_bar).
+///   x = -((thickness+1)/2), cursor_height tall (cursor_bar).
 /// * `underline` -- full cell width, cursor_thickness tall, at
 ///   `cursor_underline_pos` (cursor_underline; falls back to the bottom row).
 ///
@@ -300,27 +319,32 @@ pub fn drawCursor(
     const w: u32 = cell_w;
     const h: u32 = cell_h;
     const ct: u32 = cursor_thickness;
+    // ghostty sprite/Face.zig:211-217,242-250: block/hollow/bar use
+    // metrics.cursor_height, re-centered in the cell; the underline
+    // cursor keeps the full cell height. Null = full height (default).
+    const ch_eff: u32 = cursor_height orelse h;
+    const y_off: i32 = @divTrunc(@as(i32, @intCast(h)) - @as(i32, @intCast(ch_eff)), 2);
 
     switch (style) {
-        .block => solidRect(f, cell_x, cell_y, cell_w, cell_h, 0, 0, w, h, color),
+        .block => solidRect(f, cell_x, cell_y, cell_w, cell_h, 0, y_off, w, ch_eff, color),
         .hollow => {
             // cursor_hollow_rect fills the cell then clears the inside; the
             // net result is the border ring (drawn here directly).
             const cti: i32 = @intCast(ct);
-            const hi: i32 = @intCast(h);
+            const chi: i32 = @intCast(ch_eff);
             const wi: i32 = @intCast(w);
-            solidRect(f, cell_x, cell_y, cell_w, cell_h, 0, 0, w, ct, color);
-            solidRect(f, cell_x, cell_y, cell_w, cell_h, 0, hi -| cti, w, ct, color);
-            const mid_h = h -| (2 *| ct);
+            solidRect(f, cell_x, cell_y, cell_w, cell_h, 0, y_off, w, ct, color);
+            solidRect(f, cell_x, cell_y, cell_w, cell_h, 0, y_off + chi -| cti, w, ct, color);
+            const mid_h = ch_eff -| (2 *| ct);
             if (mid_h > 0) {
-                solidRect(f, cell_x, cell_y, cell_w, cell_h, 0, cti, ct, mid_h, color);
-                solidRect(f, cell_x, cell_y, cell_w, cell_h, wi -| cti, cti, ct, mid_h, color);
+                solidRect(f, cell_x, cell_y, cell_w, cell_h, 0, y_off + cti, ct, mid_h, color);
+                solidRect(f, cell_x, cell_y, cell_w, cell_h, wi -| cti, y_off + cti, ct, mid_h, color);
             }
         },
         .bar => {
             // cursor_bar: half the thickness over the left edge, rounded up.
             const x = -@as(i32, @intCast((ct + 1) / 2));
-            solidRect(f, cell_x, cell_y, cell_w, cell_h, x, 0, ct, h, color);
+            solidRect(f, cell_x, cell_y, cell_w, cell_h, x, y_off, ct, ch_eff, color);
         },
         .underline => {
             // cursor_underline: at the underline position, cursor_thickness
@@ -1934,6 +1958,93 @@ test "cursor underline uses the configured row, 1px tall" {
     drawCursor(f, 2, 2, 6, 8, .underline, 0xFF0000, true);
     try expectRows(f, 2, 8, 9, 0xFF0000); // cell_y 2 + (8 - 1)
     try testing.expectEqual(@as(usize, 6), countColor(f, 0xFF0000));
+}
+
+test "cursor thickness knob widens bar and underline strokes" {
+    const a = testing.allocator;
+    var f = try Framebuffer.create(a, 12, 12, .xrgb8888, null);
+    defer f.destroy(a);
+
+    const saved = cursor_thickness;
+    defer cursor_thickness = saved;
+
+    // bar, thickness 2: x = -((2+1)/2) = -1 -> the two columns at and
+    // left of the cell edge, full height.
+    cursor_thickness = 2;
+    drawCursor(f, 4, 2, 6, 8, .bar, 0x0000FF, true);
+    try testing.expectEqual(@as(usize, 16), countColor(f, 0x0000FF));
+    try testing.expectEqual(@as(u32, 0x0000FF), f.get(3, 2));
+    try testing.expectEqual(@as(u32, 0x0000FF), f.get(4, 9));
+    try testing.expectEqual(@as(u32, 0), f.get(5, 2));
+
+    // underline cursor, thickness 2: two rows at the fallback position.
+    f.fill(0);
+    drawCursor(f, 2, 2, 6, 8, .underline, 0xFF0000, true);
+    try expectRows(f, 2, 8, 8, 0xFF0000); // h -| ct = 6 -> cell_y 2 + 6
+    try expectRows(f, 2, 8, 9, 0xFF0000);
+    try testing.expectEqual(@as(usize, 12), countColor(f, 0xFF0000));
+}
+
+test "cursor height knob centers block/bar/hollow; underline keeps cell height" {
+    const a = testing.allocator;
+    var f = try Framebuffer.create(a, 12, 16, .xrgb8888, null);
+    defer f.destroy(a);
+
+    const saved = cursor_height;
+    defer cursor_height = saved;
+
+    // Cell 8x10 at (2,2), cursor height 6 -> y_off = (10-6)/2 = 2.
+    cursor_height = 6;
+    drawCursor(f, 2, 2, 8, 10, .block, 0x00FF00, true);
+    try testing.expectEqual(@as(usize, 48), countColor(f, 0x00FF00));
+    try testing.expectEqual(@as(u32, 0x00FF00), f.get(2, 4));
+    try testing.expectEqual(@as(u32, 0x00FF00), f.get(9, 9));
+    try testing.expectEqual(@as(u32, 0), f.get(2, 3));
+    try testing.expectEqual(@as(u32, 0), f.get(2, 10));
+
+    // hollow: 8x6 ring, 1px border = 2*8 + 2*4 = 24 px.
+    f.fill(0);
+    drawCursor(f, 2, 2, 8, 10, .hollow, 0x00FF00, true);
+    try testing.expectEqual(@as(usize, 24), countColor(f, 0x00FF00));
+    try testing.expectEqual(@as(u32, 0x00FF00), f.get(2, 4));
+    try testing.expectEqual(@as(u32, 0x00FF00), f.get(9, 9));
+    try testing.expectEqual(@as(u32, 0), f.get(4, 6)); // interior
+
+    // Odd difference truncates toward the top: height 5 -> y_off 2.
+    f.fill(0);
+    cursor_height = 5;
+    drawCursor(f, 2, 2, 8, 10, .bar, 0x0000FF, true);
+    try testing.expectEqual(@as(usize, 5), countColor(f, 0x0000FF));
+    try testing.expectEqual(@as(u32, 0x0000FF), f.get(1, 4));
+    try testing.expectEqual(@as(u32, 0x0000FF), f.get(1, 8));
+    try testing.expectEqual(@as(u32, 0), f.get(1, 9));
+
+    // underline ignores cursor_height (sprite/Face.zig:216): bottom row.
+    f.fill(0);
+    drawCursor(f, 2, 2, 8, 10, .underline, 0xFF0000, true);
+    try expectRows(f, 2, 10, 11, 0xFF0000);
+    try testing.expectEqual(@as(usize, 8), countColor(f, 0xFF0000));
+}
+
+test "adjusted underline position overrides the renderer-computed row" {
+    const a = testing.allocator;
+    var f = try Framebuffer.create(a, 12, 16, .xrgb8888, null);
+    defer f.destroy(a);
+
+    const saved = adjusted_underline_pos;
+    defer adjusted_underline_pos = saved;
+
+    // Null (ghostty default): the passed row is used unchanged.
+    adjusted_underline_pos = null;
+    drawUnderline(f, 2, 2, 8, 12, .single, 0x00FF00, 9, 1);
+    try expectRows(f, 2, 10, 11, 0x00FF00);
+
+    // Set: the adjusted shared metric replaces the passed row.
+    f.fill(0);
+    adjusted_underline_pos = 5;
+    drawUnderline(f, 2, 2, 8, 12, .single, 0x00FF00, 9, 1);
+    try expectRows(f, 2, 10, 7, 0x00FF00);
+    try testing.expectEqual(@as(usize, 8), countColor(f, 0x00FF00));
 }
 
 test "cursor blink off draws nothing" {

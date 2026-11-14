@@ -81,6 +81,7 @@ const drm3d = @import("video/drm3d.zig");
 const fbdev = @import("video/fbdev.zig");
 const render = @import("render.zig");
 const cpu = @import("render/cpu.zig");
+const deco = @import("render/decorations.zig");
 const discovery = @import("font/discovery.zig");
 const vt = @import("vt.zig");
 const layout = @import("video/layout.zig");
@@ -1058,9 +1059,10 @@ const Console = struct {
 
 
     /// Recompute the shared canvas + per-output viewports from the current
-    /// cell size and rotations (computeLayout, M5.4), resize the renderer and
-    /// rebuild the shadow framebuffer. Does not touch the session manager;
-    /// callers that have one resize it separately.
+    /// cell size and rotations (computeLayout, M5.4), resize the renderer,
+    /// rebuild the shadow framebuffer and re-apply the ghostty decoration
+    /// knobs. Does not touch the session manager; callers that have one
+    /// resize it separately.
     fn rebuildLayout(self: *Console) !void {
         var conns: [max_outputs]layout.Connector = undefined;
         var plans: [max_outputs]layout.Plan = undefined;
@@ -1110,6 +1112,37 @@ const Console = struct {
             self.shadow = try video.Framebuffer.create(self.alloc, canvas.width, canvas.height, .xrgb8888, null);
         }
         try self.renderer.?.resize(self.cols, self.rows, self.cell.cell_w, self.cell.cell_h);
+        self.applyDecoConfig();
+    }
+
+    /// Push the ghostty cursor/decoration knobs into the decorations module
+    /// (its fixed draw* signatures carry no config). Runs after every grid
+    /// rebuild because the base values are font/cell metrics. Defaults are
+    /// byte-identical to the unconfigured renderer: thickness 1, full-cell
+    /// cursor height, no underline-position override.
+    fn applyDecoConfig(self: *Console) void {
+        // ghostty Metrics.cursor_thickness: modifier on the 1px base,
+        // clamped >= 1 (font/Metrics.zig:34, Minimums :65).
+        deco.cursor_thickness = @max(1, if (self.cfg.adjust_cursor_thickness) |m| m.apply(@as(u16, 1)) else 1);
+        // ghostty Metrics.cursor_height: modifier on the cell height,
+        // clamped >= 1 (Metrics.zig:320, Minimums :66); null = full cell.
+        deco.cursor_height = if (self.cfg.adjust_cursor_height) |m| @max(1, m.apply(self.cell.cell_h)) else null;
+        // ghostty adjust-underline-position: modifier on the u32 underline
+        // row (Metrics.apply :408-410, unsigned clamp >= 0). Unset keeps
+        // the renderer-computed row and the cursor's bottom-row fallback.
+        if (self.cfg.adjust_underline_position) |m| {
+            const fm = self.face.metrics();
+            const baseline: i16 = @intCast(self.cell.baseline);
+            const base = deco.rowFromBaseline(baseline, clampI16(fm.underline_position));
+            const pos: u32 = @intCast(@max(0, base));
+            const adjusted = m.apply(pos);
+            const row: i16 = @intCast(@min(adjusted, std.math.maxInt(i16)));
+            deco.adjusted_underline_pos = row;
+            deco.cursor_underline_pos = row;
+        } else {
+            deco.adjusted_underline_pos = null;
+            deco.cursor_underline_pos = null;
+        }
     }
 
     fn setupSessions(self: *Console) !void {
@@ -2326,6 +2359,17 @@ fn createTerminal(
         try ts.vt.setOption(.kitty_image_medium_shared_mem, null);
     }
 
+    // ghostty cursor-style (Config.zig:883): the DEFAULT style; DECSCUSR
+    // (CSI q) overrides at runtime and libghostty-vt restores the default
+    // on RIS/DECSTR, like ghostty Terminal.zig:459-495.
+    const cursor_style: vt.CursorStyle = switch (cfg.cursor_style) {
+        .block => .block,
+        .bar => .bar,
+        .underline => .underline,
+        .block_hollow => .block_hollow,
+    };
+    try ts.vt.setOption(.default_cursor_style, &cursor_style);
+
     ts.setRenderer(c.renderer.?.renderer());
     ts.seat_name = c.seatName();
     ts.vt_nr = c.vtNr();
@@ -2411,6 +2455,12 @@ fn autoFontSize(mode: video.Mode) u16 {
     if (mode.height_mm == 0) return 16;
     const px = (@as(u64, mode.height_px) * 254) / (@as(u64, mode.height_mm) * 60);
     return @intCast(std.math.clamp(px, 8, 72));
+}
+
+/// i32 -> i16 saturating clamp (same convention as render/cpu.zig's
+/// clampI16): font metrics outside the cell-row range must not wrap.
+fn clampI16(v: i32) i16 {
+    return @intCast(std.math.clamp(v, std.math.minInt(i16), std.math.maxInt(i16)));
 }
 
 /// The selection for a connector name, or null: the reprobe diff matches

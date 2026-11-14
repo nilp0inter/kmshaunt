@@ -3,7 +3,7 @@
 //! against kmscon 10.1.0 `src/config.c` and `src/misc/conf.c`.
 //!
 //! Layout:
-//!   * `Config` — one typed field per option (all 77), exact kmscon
+//!   * `Config` — one typed field per option (all 86), exact kmscon
 //!     defaults except the two deliberate kmshaunt deviations:
 //!     `configdir = /etc/kmshaunt` and `term = xterm-ghostty` (ROADMAP D6).
 //!   * `parseCli` — `--name value`, `--name=value`, `--no-name` negation,
@@ -103,6 +103,125 @@ pub const MultiMonitor = enum {
     }
 };
 
+/// ghostty `alpha-blending` (Config.zig:9876-9887). The Linux default is
+/// linear-corrected (Config.zig:408-412); macOS defaults to native.
+pub const AlphaBlending = enum {
+    native,
+    linear,
+    @"linear-corrected",
+
+    pub fn parse(s: []const u8, d: *Diag) Error!AlphaBlending {
+        return std.meta.stringToEnum(AlphaBlending, s) orelse {
+            d.print("invalid alpha-blending mode '{s}'", .{s});
+            return error.InvalidValue;
+        };
+    }
+};
+
+/// ghostty `freetype-load-flags` (Config.zig:9912-9924). Defaults match
+/// FreeType itself; `light` is the Fontconfig-world default. Parse per
+/// Config.zig:517-521: comma list, `no-` disables, omitted flags keep
+/// their default, `true`/`false` set ALL flags.
+pub const FreetypeLoadFlags = packed struct {
+    hinting: bool = true,
+    @"force-autohint": bool = false,
+    monochrome: bool = false,
+    autohint: bool = true,
+    light: bool = true,
+
+    pub fn parse(s: []const u8, d: *Diag) Error!FreetypeLoadFlags {
+        var out: FreetypeLoadFlags = .{};
+        var it = std.mem.splitScalar(u8, s, ',');
+        while (it.next()) |raw| {
+            const tok = std.mem.trim(u8, raw, " \t");
+            if (std.mem.eql(u8, tok, "true")) {
+                out = .{ .hinting = true, .@"force-autohint" = true, .monochrome = true, .autohint = true, .light = true };
+                continue;
+            }
+            if (std.mem.eql(u8, tok, "false")) {
+                out = .{ .hinting = false, .@"force-autohint" = false, .monochrome = false, .autohint = false, .light = false };
+                continue;
+            }
+            const neg = std.mem.startsWith(u8, tok, "no-");
+            const name = if (neg) tok[3..] else tok;
+            const on = !neg;
+            if (std.mem.eql(u8, name, "hinting")) out.hinting = on
+            else if (std.mem.eql(u8, name, "force-autohint")) out.@"force-autohint" = on
+            else if (std.mem.eql(u8, name, "monochrome")) out.monochrome = on
+            else if (std.mem.eql(u8, name, "autohint")) out.autohint = on
+            else if (std.mem.eql(u8, name, "light")) out.light = on
+            else {
+                d.print("unknown freetype load flag '{s}'", .{tok});
+                return error.InvalidValue;
+            }
+        }
+        return out;
+    }
+};
+
+/// ghostty font/Metrics.zig:454-479: a DELTA, not a target value.
+/// "20%" -> percent multiplier 1.2 (20% LARGER); "2" -> absolute +2 px.
+/// percent <= -100% clamps to multiplier 0 (:470). No range validation
+/// (Config.zig:422-423 "little to no validation"). Used by the ghostty
+/// cursor/underline adjust-* knobs; the kmscon adjust-cell-* trio keeps
+/// its i32-percent path.
+pub const MetricModifier = union(enum) {
+    percent: f64,
+    absolute: i32,
+
+    pub fn parse(s: []const u8, d: *Diag) Error!MetricModifier {
+        if (s.len == 0) {
+            d.print("empty metric modifier", .{});
+            return error.InvalidValue;
+        }
+        if (s[s.len - 1] == '%') {
+            var p = std.fmt.parseFloat(f64, s[0 .. s.len - 1]) catch {
+                d.print("cannot parse percent value '{s}'", .{s});
+                return error.InvalidValue;
+            };
+            p /= 100;
+            return .{ .percent = if (p <= -1) 0 else 1 + p };
+        }
+        const v = std.fmt.parseInt(i32, s, 10) catch {
+            d.print("cannot parse metric modifier '{s}'", .{s});
+            return error.InvalidValue;
+        };
+        return .{ .absolute = v };
+    }
+
+    /// Port of ghostty font/Metrics.zig:515-547 (integer targets):
+    /// percent = round(v * max(0, p)); absolute = saturating add,
+    /// unsigned targets clamped at 0, overflow -> maxInt * sign.
+    pub fn apply(self: MetricModifier, v: anytype) @TypeOf(v) {
+        const T = @TypeOf(v);
+        return switch (self) {
+            .percent => |p| @intFromFloat(@round(@as(f64, @floatFromInt(v)) * @max(0, p))),
+            .absolute => |a| blk: {
+                const sum = @as(i64, v) +| @as(i64, a);
+                const clamped = if (@typeInfo(T).@"int".signedness == .unsigned) @max(0, sum) else sum;
+                break :blk std.math.cast(T, clamped) orelse
+                    std.math.maxInt(T) * @as(T, @intCast(std.math.sign(clamped)));
+            },
+        };
+    }
+};
+
+/// ghostty `cursor-style` (Config.zig:883 + terminal/cursor.zig:9-25,
+/// names exact). The DEFAULT style; DECSCUSR overrides at runtime.
+pub const CursorStyle = enum {
+    block,
+    bar,
+    underline,
+    block_hollow,
+
+    pub fn parse(s: []const u8, d: *Diag) Error!CursorStyle {
+        return std.meta.stringToEnum(CursorStyle, s) orelse {
+            d.print("invalid cursor style '{s}'", .{s});
+            return error.InvalidValue;
+        };
+    }
+};
+
 /// Every option, in kmscon option-table order (config.c:981-1088).
 /// The order matters: afterchecks run in this order.
 pub const Option = enum {
@@ -176,6 +295,15 @@ pub const Option = enum {
     adjust_cell_width,
     adjust_cell_height,
     adjust_font_baseline,
+    // Ghostty rendering parity (v1.4.0 defaults)
+    alpha_blending,
+    freetype_load_flags,
+    font_thicken,
+    font_thicken_strength,
+    adjust_cursor_thickness,
+    adjust_cursor_height,
+    adjust_underline_position,
+    cursor_style,
     // Palette
     palette,
     palette_black,
@@ -213,6 +341,11 @@ pub const Kind = enum {
     multi_monitor,
     palette,
     percent,
+    metric,
+    alpha_blending,
+    freetype_load_flags,
+    cursor_style,
+    u8,
 
     /// Whether the option takes a value. `login` is a no-arg (bool-like)
     /// option on the CLI; in a file it requires a value (file_login).
@@ -296,6 +429,14 @@ const specs = [_]Spec{
     .{ .opt = .adjust_cell_width, .name = "adjust-cell-width", .kind = .percent },
     .{ .opt = .adjust_cell_height, .name = "adjust-cell-height", .kind = .percent },
     .{ .opt = .adjust_font_baseline, .name = "adjust-font-baseline", .kind = .percent },
+    .{ .opt = .alpha_blending, .name = "alpha-blending", .kind = .alpha_blending },
+    .{ .opt = .freetype_load_flags, .name = "freetype-load-flags", .kind = .freetype_load_flags },
+    .{ .opt = .font_thicken, .name = "font-thicken", .kind = .bool },
+    .{ .opt = .font_thicken_strength, .name = "font-thicken-strength", .kind = .u8 },
+    .{ .opt = .adjust_cursor_thickness, .name = "adjust-cursor-thickness", .kind = .metric },
+    .{ .opt = .adjust_cursor_height, .name = "adjust-cursor-height", .kind = .metric },
+    .{ .opt = .adjust_underline_position, .name = "adjust-underline-position", .kind = .metric },
+    .{ .opt = .cursor_style, .name = "cursor-style", .kind = .cursor_style },
     .{ .opt = .palette, .name = "palette", .kind = .palette },
     .{ .opt = .palette_black, .name = "palette-black", .kind = .color, .color = .black },
     .{ .opt = .palette_red, .name = "palette-red", .kind = .color, .color = .red },
@@ -429,6 +570,18 @@ pub const Config = struct {
     adjust_cell_height: i32 = 0,
     adjust_font_baseline: i32 = 0,
 
+    // Ghostty rendering parity — defaults are ghostty v1.4.0 Linux defaults
+    // (.pixel-perfect-config-spec.md). font-thicken* only take effect on
+    // macOS in ghostty; they are stored for config parity, inert on Linux.
+    alpha_blending: AlphaBlending = .@"linear-corrected", // Config.zig:408-412
+    freetype_load_flags: FreetypeLoadFlags = .{}, // Config.zig:546
+    font_thicken: bool = false, // Config.zig:345
+    font_thicken_strength: u8 = 255, // Config.zig:355
+    adjust_cursor_thickness: ?MetricModifier = null, // Config.zig:467
+    adjust_cursor_height: ?MetricModifier = null, // Config.zig:471
+    adjust_underline_position: ?MetricModifier = null, // Config.zig:447
+    cursor_style: CursorStyle = .block, // Config.zig:883
+
     // Palette Options
     palette: ?palette.Preset = null,
     custom_palette: [palette.palette_len]palette.Color = palette.Preset.custom.get(),
@@ -521,6 +674,16 @@ pub const Config = struct {
                 }
                 unreachable;
             },
+            .metric => {
+                const v = try MetricModifier.parse(value.?, d);
+                inline for (specs) |s| {
+                    if (s.kind == .metric and s.opt == opt) {
+                        @field(self, @tagName(s.opt)) = v;
+                        return;
+                    }
+                }
+                unreachable;
+            },
             .string => {
                 const v = try alloc.dupe(u8, value.?);
                 inline for (specs) |s| {
@@ -549,6 +712,17 @@ pub const Config = struct {
                 self.login = on;
             },
             .gpus => self.gpus = try Gpus.parse(value.?, d),
+            .alpha_blending => self.alpha_blending = try AlphaBlending.parse(value.?, d),
+            .freetype_load_flags => self.freetype_load_flags = try FreetypeLoadFlags.parse(value.?, d),
+            .cursor_style => self.cursor_style = try CursorStyle.parse(value.?, d),
+            .u8 => {
+                const v = try parseUint(value.?, d);
+                if (v > 255) {
+                    d.print("value '{s}' out of range (0..255)", .{value.?});
+                    return error.InvalidValue;
+                }
+                self.font_thicken_strength = @intCast(v);
+            },
             .mode => {
                 const m = try display.parseMode(alloc, value.?, d);
                 try self.modes.append(alloc, m);
@@ -850,6 +1024,9 @@ pub const Config = struct {
             "multi_monitor",     "font_size",         "font_engine",    "palette",
             "kitty_image_storage_limit",
             "adjust_cell_width",  "adjust_cell_height",  "adjust_font_baseline",
+            "alpha_blending",     "freetype_load_flags", "font_thicken",
+            "font_thicken_strength", "adjust_cursor_thickness", "adjust_cursor_height",
+            "adjust_underline_position", "cursor_style",
         };
         inline for (value_fields) |f| @field(self, f) = @field(src, f);
 
@@ -1215,6 +1392,34 @@ const help_raw =
     \\\t                              Font size in pixels, 0 means auto
     \\\t    --font-name <name>      [monospace]
     \\\t                              Font name
+    \\\t    --adjust-cell-width <pct>  [0]
+    \\\t                              Cell width adjustment in percent
+    \\\t    --adjust-cell-height <pct> [0]
+    \\\t                              Cell height adjustment in percent
+    \\\t    --adjust-font-baseline <pct> [0]
+    \\\t                              Font baseline adjustment in percent
+    \\\t    --alpha-blending <mode> [linear-corrected]
+    \\\t                              Alpha blending color space: native,
+    \\\t                              linear or linear-corrected (ghostty)
+    \\\t    --freetype-load-flags <flags>
+    \\\t                              Comma-separated FreeType load flags:
+    \\\t                              hinting, force-autohint, monochrome,
+    \\\t                              autohint, light; no- prefix disables
+    \\\t    --font-thicken            [off]
+    \\\t                              Thicker font stroke (macOS-only in
+    \\\t                              ghostty; inert on Linux)
+    \\\t    --font-thicken-strength <0..255> [255]
+    \\\t                              Thickening strength (macOS-only in
+    \\\t                              ghostty; inert on Linux)
+    \\\t    --adjust-cursor-thickness <mod>
+    \\\t                              Cursor thickness delta: px or percent
+    \\\t    --adjust-cursor-height <mod>
+    \\\t                              Cursor height delta: px or percent
+    \\\t    --adjust-underline-position <mod>
+    \\\t                              Underline position delta: px or percent
+    \\\t    --cursor-style <style>    [block]
+    \\\t                              Default cursor style: block, bar,
+    \\\t                              underline or block_hollow
     \\
     \\Palette Options:
     \\\t    --palette <name>                [default]
@@ -1391,6 +1596,19 @@ test "defaults: every option at its documented kmscon default" {
     try testing.expectEqual(@as(?FontEngine, null), cfg.font_engine);
     try testing.expectEqual(@as(u32, 0), cfg.font_size);
     try testing.expectEqualStrings("monospace", cfg.font_name);
+    // Ghostty rendering parity (v1.4.0 Linux defaults)
+    try testing.expectEqual(AlphaBlending.@"linear-corrected", cfg.alpha_blending);
+    try testing.expect(cfg.freetype_load_flags.hinting);
+    try testing.expect(!cfg.freetype_load_flags.@"force-autohint");
+    try testing.expect(!cfg.freetype_load_flags.monochrome);
+    try testing.expect(cfg.freetype_load_flags.autohint);
+    try testing.expect(cfg.freetype_load_flags.light);
+    try testing.expect(!cfg.font_thicken);
+    try testing.expectEqual(@as(u8, 255), cfg.font_thicken_strength);
+    try testing.expectEqual(@as(?MetricModifier, null), cfg.adjust_cursor_thickness);
+    try testing.expectEqual(@as(?MetricModifier, null), cfg.adjust_cursor_height);
+    try testing.expectEqual(@as(?MetricModifier, null), cfg.adjust_underline_position);
+    try testing.expectEqual(CursorStyle.block, cfg.cursor_style);
     // Palette
     try testing.expectEqual(@as(?palette.Preset, null), cfg.palette);
     try testing.expectEqual(palette.Preset.custom.get(), cfg.custom_palette);
@@ -1407,9 +1625,9 @@ test "defaults: every option at its documented kmscon default" {
     for (std.meta.tags(Option)) |o| try testing.expect(!cfg.locked.get(o));
 }
 
-test "registry: all 78 options, unique names, documented short forms" {
-    try testing.expectEqual(@as(usize, 78), specs.len);
-    try testing.expectEqual(@as(usize, 78), std.meta.tags(Option).len);
+test "registry: all 86 options, unique names, documented short forms" {
+    try testing.expectEqual(@as(usize, 86), specs.len);
+    try testing.expectEqual(@as(usize, 86), std.meta.tags(Option).len);
     for (specs, 0..) |s, i| {
         try testing.expectEqual(@as(Option, @enumFromInt(i)), s.opt);
         try testing.expectEqual(@as(?usize, i), name_map.get(s.name));
@@ -1423,6 +1641,115 @@ test "registry: all 78 options, unique names, documented short forms" {
         }
     }
     try testing.expectEqual(@as(usize, 6), count);
+}
+
+test "MetricModifier: ghostty delta semantics (font/Metrics.zig:454-547)" {
+    var d = Diag{};
+    // Percent is a multiplier delta: "20%" -> 1.2, "-20%" -> 0.8.
+    try testing.expectApproxEqAbs(@as(f64, 1.2), (try MetricModifier.parse("20%", &d)).percent, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0.8), (try MetricModifier.parse("-20%", &d)).percent, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 1.025), (try MetricModifier.parse("2.5%", &d)).percent, 1e-12);
+    // <= -100% clamps to multiplier 0.
+    try testing.expectEqual(@as(f64, 0), (try MetricModifier.parse("-100%", &d)).percent);
+    try testing.expectEqual(@as(f64, 0), (try MetricModifier.parse("-150%", &d)).percent);
+    // No % = absolute pixel delta (ghostty parses i32 base 10).
+    try testing.expectEqual(MetricModifier{ .absolute = 2 }, try MetricModifier.parse("2", &d));
+    try testing.expectEqual(MetricModifier{ .absolute = -2 }, try MetricModifier.parse("-2", &d));
+    // Garbage and empty values are typed errors.
+    try testing.expectError(error.InvalidValue, MetricModifier.parse("", &d));
+    try testing.expectError(error.InvalidValue, MetricModifier.parse("%", &d));
+    try testing.expectError(error.InvalidValue, MetricModifier.parse("abc", &d));
+    try testing.expectError(error.InvalidValue, MetricModifier.parse("1.5", &d));
+
+    // apply: percent rounds (half away from zero), absolute saturates.
+    const p20 = MetricModifier{ .percent = 1.2 };
+    try testing.expectEqual(@as(u16, 12), p20.apply(@as(u16, 10)));
+    try testing.expectEqual(@as(u16, 1), p20.apply(@as(u16, 1)));
+    const p25 = MetricModifier{ .percent = 1.25 };
+    try testing.expectEqual(@as(u16, 13), p25.apply(@as(u16, 10))); // round(12.5)
+    const p100 = MetricModifier{ .percent = 2 };
+    try testing.expectEqual(@as(u16, 2), p100.apply(@as(u16, 1)));
+    const m100 = MetricModifier{ .percent = 0 };
+    try testing.expectEqual(@as(u16, 0), m100.apply(@as(u16, 10)));
+    const neg = MetricModifier{ .absolute = -20 };
+    try testing.expectEqual(@as(u16, 0), neg.apply(@as(u16, 10))); // unsigned clamps at 0
+    try testing.expectEqual(@as(i32, -10), neg.apply(@as(i32, 10)));
+    const big = MetricModifier{ .absolute = std.math.maxInt(i32) };
+    try testing.expectEqual(@as(u16, std.math.maxInt(u16)), big.apply(@as(u16, 10)));
+}
+
+test "FreetypeLoadFlags: defaults, no- prefix, true/false, unknown flag" {
+    var d = Diag{};
+    const def: FreetypeLoadFlags = .{};
+    try testing.expect(def.hinting and def.autohint and def.light);
+    try testing.expect(!def.@"force-autohint" and !def.monochrome);
+
+    const nohint = try FreetypeLoadFlags.parse("no-hinting", &d);
+    try testing.expect(!nohint.hinting);
+    try testing.expect(nohint.autohint and nohint.light); // omitted keep defaults
+
+    const mix = try FreetypeLoadFlags.parse("force-autohint, no-light", &d);
+    try testing.expect(mix.@"force-autohint" and !mix.light and mix.hinting);
+
+    const all = try FreetypeLoadFlags.parse("true", &d);
+    try testing.expect(all.hinting and all.@"force-autohint" and all.monochrome and all.autohint and all.light);
+    const none = try FreetypeLoadFlags.parse("false", &d);
+    try testing.expect(!none.hinting and !none.@"force-autohint" and !none.monochrome and !none.autohint and !none.light);
+
+    try testing.expectError(error.InvalidValue, FreetypeLoadFlags.parse("bogus", &d));
+}
+
+test "AlphaBlending and CursorStyle: enum values and invalid names" {
+    var d = Diag{};
+    try testing.expectEqual(AlphaBlending.native, try AlphaBlending.parse("native", &d));
+    try testing.expectEqual(AlphaBlending.linear, try AlphaBlending.parse("linear", &d));
+    try testing.expectEqual(AlphaBlending.@"linear-corrected", try AlphaBlending.parse("linear-corrected", &d));
+    try testing.expectError(error.InvalidValue, AlphaBlending.parse("srgb", &d));
+
+    try testing.expectEqual(CursorStyle.block, try CursorStyle.parse("block", &d));
+    try testing.expectEqual(CursorStyle.bar, try CursorStyle.parse("bar", &d));
+    try testing.expectEqual(CursorStyle.underline, try CursorStyle.parse("underline", &d));
+    try testing.expectEqual(CursorStyle.block_hollow, try CursorStyle.parse("block_hollow", &d));
+    try testing.expectError(error.InvalidValue, CursorStyle.parse("hollow", &d));
+}
+
+test "ghostty knobs: file parse, seat copy, invalid values are typed errors" {
+    var cfg = Config.init(testing.allocator);
+    defer cfg.deinit();
+    try fileOk(&cfg,
+        \\alpha-blending=linear
+        \\freetype-load-flags=no-hinting,force-autohint
+        \\font-thicken
+        \\font-thicken-strength=0
+        \\adjust-cursor-thickness=100%
+        \\adjust-cursor-height=-2
+        \\adjust-underline-position=2
+        \\cursor-style=block_hollow
+        \\
+    );
+    try testing.expectEqual(AlphaBlending.linear, cfg.alpha_blending);
+    try testing.expect(!cfg.freetype_load_flags.hinting);
+    try testing.expect(cfg.freetype_load_flags.@"force-autohint");
+    try testing.expect(cfg.font_thicken);
+    try testing.expectEqual(@as(u8, 0), cfg.font_thicken_strength);
+    try testing.expectApproxEqAbs(@as(f64, 2), cfg.adjust_cursor_thickness.?.percent, 1e-12);
+    try testing.expectEqual(MetricModifier{ .absolute = -2 }, cfg.adjust_cursor_height.?);
+    try testing.expectEqual(MetricModifier{ .absolute = 2 }, cfg.adjust_underline_position.?);
+    try testing.expectEqual(CursorStyle.block_hollow, cfg.cursor_style);
+
+    // Seat copies carry the knob values (copyFrom value_fields).
+    var seat = try cfg.loadSeat(testing.allocator, testing.io, "seat0");
+    defer seat.deinit();
+    try testing.expectEqual(AlphaBlending.linear, seat.alpha_blending);
+    try testing.expectEqual(CursorStyle.block_hollow, seat.cursor_style);
+    try testing.expectEqual(MetricModifier{ .absolute = 2 }, seat.adjust_underline_position.?);
+
+    var d = Diag{};
+    try testing.expectError(error.InvalidValue, cfg.parseFileText("font-thicken-strength=256\n", &d));
+    try testing.expectError(error.InvalidValue, cfg.parseFileText("alpha-blending=bogus\n", &d));
+    try testing.expectError(error.InvalidValue, cfg.parseFileText("cursor-style=bogus\n", &d));
+    try testing.expectError(error.InvalidValue, cfg.parseFileText("freetype-load-flags=bogus\n", &d));
+    try testing.expectError(error.InvalidValue, cfg.parseFileText("adjust-cursor-thickness=bogus\n", &d));
 }
 
 test "sample config file exercises every option type" {
@@ -1493,6 +1820,14 @@ test "sample config file exercises every option type" {
         \\font-engine=pango
         \\font-size=16
         \\font-name=JetBrains Mono
+        \\alpha-blending=linear
+        \\freetype-load-flags=no-hinting,force-autohint
+        \\font-thicken
+        \\font-thicken-strength=128
+        \\adjust-cursor-thickness=2
+        \\adjust-cursor-height=20%
+        \\adjust-underline-position=-1
+        \\cursor-style=bar
         \\palette=nord
         \\palette-black=1,2,3
         \\palette-red=205, 0, 0
@@ -1569,6 +1904,18 @@ test "sample config file exercises every option type" {
     try testing.expectEqual(FontEngine.freetype, cfg.font_engine.?); // pango alias
     try testing.expectEqual(@as(u32, 16), cfg.font_size);
     try testing.expectEqualStrings("JetBrains Mono", cfg.font_name);
+    // Ghostty rendering parity knobs
+    try testing.expectEqual(AlphaBlending.linear, cfg.alpha_blending);
+    try testing.expect(!cfg.freetype_load_flags.hinting);
+    try testing.expect(cfg.freetype_load_flags.@"force-autohint");
+    try testing.expect(cfg.freetype_load_flags.autohint); // omitted keeps default
+    try testing.expect(cfg.freetype_load_flags.light);
+    try testing.expect(cfg.font_thicken);
+    try testing.expectEqual(@as(u8, 128), cfg.font_thicken_strength);
+    try testing.expectEqual(MetricModifier{ .absolute = 2 }, cfg.adjust_cursor_thickness.?);
+    try testing.expectApproxEqAbs(@as(f64, 1.2), cfg.adjust_cursor_height.?.percent, 1e-12);
+    try testing.expectEqual(MetricModifier{ .absolute = -1 }, cfg.adjust_underline_position.?);
+    try testing.expectEqual(CursorStyle.bar, cfg.cursor_style);
     try testing.expectEqual(palette.Preset.nord, cfg.palette.?);
     try testing.expectEqual(palette.Color{ .r = 1, .g = 2, .b = 3 }, cfg.custom_palette[0]);
     try testing.expectEqual(palette.Color{ .r = 255, .g = 0, .b = 0 }, cfg.custom_palette[16]);
@@ -2121,6 +2468,7 @@ test "seat: deep copy owns its strings, lists and grabs" {
         \\screen=[DP-1]left
         \\grab-zoom-in=<Ctrl>plus,<Ctrl>equal
         \\vt=4
+        \\cursor-style=bar
         \\palette=custom
         \\palette-red=9,9,9
         \\
@@ -2135,6 +2483,7 @@ test "seat: deep copy owns its strings, lists and grabs" {
     try testing.expectEqual(@as(usize, 2), seat.grab_zoom_in.shortcuts.len);
     try testing.expect(seat.grab_zoom_in.matches(grab.control, &.{0x3d}));
     try testing.expectEqualStrings("/dev/tty4", seat.vt.?);
+    try testing.expectEqual(CursorStyle.bar, seat.cursor_style);
     try testing.expectEqual(palette.Color{ .r = 9, .g = 9, .b = 9 }, seat.custom_palette[1]);
     // Mutating the seat must not touch main (independent arenas).
     seat.custom_palette[1] = .{ .r = 0, .g = 0, .b = 0 };

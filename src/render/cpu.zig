@@ -967,7 +967,7 @@ pub const CpuRenderer = struct {
         var face_id: u16 = 0;
         if (base_cp != 0 and !is_sprite and !invisible and width != 0) {
             const cps = self.row_cps.items[cps_start..][0..n_cps];
-            face_id = try self.faceForCell(base_cp, bold, italic, explicitPresentation(cps));
+            face_id = try self.faceForCell(cps, bold, italic, explicitPresentation(cps));
         }
 
         self.row_cells[x] = .{
@@ -995,22 +995,48 @@ pub const CpuRenderer = struct {
     // Face table: style variants + per-codepoint fallback
     // ------------------------------------------------------------------
 
-    /// Face-table slot for one cell's base codepoint, honoring text/emoji
-    /// presentation (ghostty CodepointResolver.getIndex + Collection.Entry
-    /// .hasCodepoint): the explicit style face serves any glyph for the UCD
-    /// default presentation, but an explicit VS15/VS16 must match the
-    /// glyph's color; fallback faces must always match the effective
-    /// presentation. `p` is the cluster's explicit presentation (null =
-    /// UCD default). With no matching face the style face stays selected
-    /// and shaping yields .notdef (tofu).
-    fn faceForCell(self: *CpuRenderer, cp: u21, bold: bool, italic: bool, p: ?Presentation) !u16 {
+    /// Face-table slot for one cell's FULL grapheme cluster, honoring
+    /// text/emoji presentation (ghostty CodepointResolver.getIndex +
+    /// Collection.Entry.hasCodepoint) and whole-cluster coverage (ghostty
+    /// shaper/run.zig indexForCell). The explicit style face serves any glyph
+    /// for the UCD default presentation, but an explicit VS15/VS16 must match
+    /// the glyph's color; fallback faces must always match the effective
+    /// presentation. `p` is the cluster's explicit presentation (null = UCD
+    /// default). With no matching face the style face stays selected and
+    /// shaping yields .notdef (tofu).
+    fn faceForCell(self: *CpuRenderer, cps: []const u21, bold: bool, italic: bool, p: ?Presentation) !u16 {
         const style_idx: usize = @as(usize, @intFromBool(bold)) | (@as(usize, @intFromBool(italic)) << 1);
         const style_face = try self.styleFace(style_idx);
+        const base_face = try self.faceForCodepoint(cps[0], style_face, bold, italic, p);
+
+        // ghostty shaper/run.zig indexForCell: a multi-codepoint grapheme must
+        // shape on a face that covers EVERY component, not just the base. A
+        // primary face carrying the base as a monochrome glyph but lacking the
+        // skin-tone modifier (U+1F3FB..1F3FF) would otherwise split the cluster
+        // into base + .notdef. Try the base face, then the face selected for
+        // each additional codepoint, until one covers the whole cluster.
+        if (cps.len > 1 and !faceCoversCluster(base_face, cps)) {
+            for (cps[1..]) |cp| {
+                if (cp == 0xFE0E or cp == 0xFE0F or cp == 0x200D) continue;
+                const f = try self.faceForCodepoint(cp, style_face, bold, italic, null);
+                if (faceCoversCluster(f, cps)) return self.faceSlot(f);
+            }
+        }
+        return self.faceSlot(base_face);
+    }
+
+    /// The face ghostty selects for a single codepoint, returned as a styled
+    /// handle rather than a table slot so faceForCell can test whole-cluster
+    /// coverage before interning it. Presentation rules are unchanged from the
+    /// per-codepoint path: the style face serves the UCD default presentation,
+    /// an explicit VS must match the glyph's color, fallbacks must match the
+    /// effective presentation.
+    fn faceForCodepoint(self: *CpuRenderer, cp: u21, style_face: discovery.Face, bold: bool, italic: bool, p: ?Presentation) !discovery.Face {
         const want = p orelse defaultPresentation(cp);
 
         if (style_face.glyphIndex(cp) != null and
             (p == null or glyphPresentation(style_face, cp) == p.?))
-            return self.faceSlot(style_face);
+            return style_face;
 
         const fallback = blk: {
             if (self.fallback_faces.get(cp)) |entry| break :blk entry;
@@ -1036,9 +1062,9 @@ pub const CpuRenderer = struct {
             var styled = f;
             styled.synthetic_bold = bold;
             styled.synthetic_italic = italic;
-            return self.faceSlot(styled);
+            return styled;
         }
-        return self.faceSlot(style_face);
+        return style_face;
     }
 
     /// Size a face handle for text: ghostty's fractional char size when
@@ -2142,6 +2168,19 @@ fn explicitPresentation(cps: []const u21) ?Presentation {
     return null;
 }
 
+/// True if `face` carries a glyph for every cluster codepoint HarfBuzz must
+/// shape. ghostty shaper/run.zig indexForCell skips the presentation
+/// selectors and ZWJ when testing coverage; a face that only has the base of
+/// a multi-codepoint grapheme (e.g. a Nerd Font with a monochrome thumbs-up
+/// but no skin-tone modifier) must not be used to shape the whole cluster.
+fn faceCoversCluster(face: discovery.Face, cps: []const u21) bool {
+    for (cps) |cp| {
+        if (cp == 0xFE0E or cp == 0xFE0F or cp == 0x200D) continue;
+        if (face.glyphIndex(cp) == null) return false;
+    }
+    return true;
+}
+
 /// Presentation of one glyph on a sized face: ghostty face/freetype.zig
 /// isColorGlyph (BGRA pixel mode after a color load). Faces without color
 /// tables short-circuit to text without loading (the common text path).
@@ -2991,6 +3030,53 @@ test "cpu: mode 2027 clusters compose emoji on the color face (ZWJ, VS16, keycap
     const kentry = env.cpu.cluster_cache.get(keycap.face_id, 0, kcps) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 1), kentry.glyphs.len);
+}
+
+test "cpu: skin-tone cluster shapes on the color face, not monochrome base + box" {
+    const a = testing.allocator;
+    // A Nerd Font primary carries some emoji (U+1F44D) as MONOCHROME glyphs
+    // but lacks the skin-tone modifiers (U+1F3FB..1F3FF). ghostty's
+    // indexForCell requires the face to cover the WHOLE cluster, so the
+    // sequence must shape on the color emoji face as one composed glyph
+    // instead of splitting into a monochrome base + .notdef box.
+    var env = Env.initWithFont(a, 4, 4, "ComicCodeLigatures Nerd Font", &.{}) catch |err| switch (err) {
+        error.NoFontMatch, error.BadFontName => return error.SkipZigTest, // no Nerd Font installed
+        else => return err,
+    };
+    defer env.deinit(a);
+    // Only meaningful when the primary has the base but not the modifier.
+    if (env.cpu.face.glyphIndex(0x1F44D) == null or env.cpu.face.glyphIndex(0x1F3FD) != null)
+        return error.SkipZigTest;
+    try env.t.setMode(vt.mode(2027, false), true);
+    env.f.fill(env.palette[17]);
+    var d0: DamageList = .empty;
+    defer d0.deinit(a);
+    try env.renderNoCursor(&d0); // consume the initial full-dirty frame
+
+    // 👍🏽 U+1F44D U+1F3FD: one wide cell, ONE composed color glyph.
+    env.t.write("\x1b[?25h\xf0\x9f\x91\x8d\xf0\x9f\x8f\xbd");
+    var d1: DamageList = .empty;
+    defer d1.deinit(a);
+    try env.renderNoCursor(&d1);
+    const rc = env.cpu.row_cells[0];
+    try testing.expectEqual(@as(u32, 2), rc.n_cps);
+    try testing.expectEqual(@as(u8, 2), rc.width);
+    const cps = env.cpu.row_cps.items[rc.cps_start..][0..rc.n_cps];
+    try testing.expectEqualSlices(u21, &.{ 0x1F44D, 0x1F3FD }, cps);
+    try testing.expect(env.cpu.faces.items[rc.face_id].has_color);
+    const entry = env.cpu.cluster_cache.get(rc.face_id, 0, cps) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), entry.glyphs.len);
+    const slot = &env.cpu.faces.items[rc.face_id];
+    const key = atlas.GlyphKey{
+        .face_id = rc.face_id,
+        .glyph_index = entry.glyphs[0].glyph_index,
+        .size_px = env.cpu.size_px,
+        .flags = CpuRenderer.faceFlags(slot.face),
+    };
+    const atl = env.cpu.atlas.get(key) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(atlas.PixelFormat.bgra8, atl.format);
+    try testing.expect(env.cellHasInk(0, 0));
 }
 
 test "cpu: fallback face for codepoints missing from the primary (M3.2)" {
