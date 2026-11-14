@@ -353,7 +353,7 @@ pub const TerminalSession = struct {
     pub fn onPtyReadable(self: *TerminalSession) anyerror!bool {
         try self.ensureBound();
         if (!self.active) return false;
-        var buf: [16384]u8 = undefined;
+        var buf: [65536]u8 = undefined;
         var drained: usize = 0;
         var more = false;
         while (true) {
