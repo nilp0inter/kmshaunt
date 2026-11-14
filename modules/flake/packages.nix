@@ -16,6 +16,9 @@
     };
 
     checks = {
+      # Builds the console without the unit-test gate: nix/package.nix ships
+      # doCheck = false so this passes in the default sandbox. The unit suite
+      # is opt-in via `overrideAttrs { doCheck = true; }`.
       package = config.packages.kmshaunt;
 
       # M3.10/M4.6 exit gate (ROADMAP §4 T2, R6): every fixtures/t2 fixture
