@@ -2492,6 +2492,10 @@ pub const KeyEvent = struct {
     action: KeyAction = .press,
     key: Key,
     mods: Mods = 0,
+    /// Modifier bits the key's level selection consumed (Shift for a
+    /// shifted character, Shift|Caps for a letter...). Ghostty subtracts
+    /// them from `mods` when `utf8` is non-empty.
+    consumed_mods: Mods = 0,
     utf8: []const u8 = "",
     unshifted_codepoint: u32 = 0,
 };
@@ -2530,6 +2534,9 @@ pub const KeyEncoder = struct {
         try check(c.ghostty_key_event_set_action(self.event, @intCast(@intFromEnum(ev.action))));
         try check(c.ghostty_key_event_set_key(self.event, @intFromEnum(ev.key)));
         try check(c.ghostty_key_event_set_mods(self.event, ev.mods));
+        // Always set, including zero: the handle is reused across events,
+        // so stale consumed bits would otherwise leak into the next key.
+        try check(c.ghostty_key_event_set_consumed_mods(self.event, ev.consumed_mods));
         try check(c.ghostty_key_event_set_utf8(self.event, toCString(ev.utf8)));
         try check(c.ghostty_key_event_set_unshifted_codepoint(self.event, ev.unshifted_codepoint));
         var written: usize = 0;

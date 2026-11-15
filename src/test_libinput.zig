@@ -7,6 +7,10 @@
 //! layout, headless), so the xkb-c module and libxkbcommon are linked.
 //! `LibinputOps.real` is referenced only by the final binding test (no
 //! calls), which is why the command also wires libinput-c/-linput/-ludev.
+//! The key-translation acceptance tests feed the adapter's output through
+//! the REAL libghostty-vt key encoder (the same call TerminalSession makes),
+//! so they also need the `vt-c` module and libghostty-vt; the canonical
+//! runner is `zig build test`, which wires every module.
 //!
 //! Exact command (paths from `nix build --print-out-paths --no-link` of
 //! nixpkgs#libinput.dev, nixpkgs#libinput, nixpkgs#systemd.dev,
@@ -34,6 +38,7 @@ const xkb = @import("input/xkb.zig");
 const kt = @import("input/keymap_table.zig");
 const config = @import("config/config.zig");
 const session = @import("session.zig");
+const vt = @import("vt.zig");
 
 const testing = std.testing;
 const linux = std.os.linux;
@@ -500,6 +505,78 @@ fn nullSink(userdata: usize, event: session.InputEvent) void {
     _ = event;
 }
 
+/// Bridges the adapter's session events into the REAL libghostty-vt key
+/// encoder, the same call chain TerminalSession.handleKey performs: map the
+/// event onto `vt.Key`/`vt.KeyAction`, refresh the encoder's terminal modes,
+/// encode. Only the pty write is omitted, so the assertions below are on the
+/// exact bytes a terminal would receive. Terminal modes (Kitty flags,
+/// modifyOtherKeys) are negotiated the way a program does it: by writing the
+/// sequence into the terminal.
+const KeyPipe = struct {
+    allocator: std.mem.Allocator,
+    terminal: vt.Vt,
+    encoder: vt.KeyEncoder,
+    /// Everything encoded so far, in order.
+    out: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) !KeyPipe {
+        var terminal = try vt.Vt.init(80, 24);
+        errdefer terminal.deinit();
+        const encoder = try vt.KeyEncoder.new();
+        return .{ .allocator = allocator, .terminal = terminal, .encoder = encoder };
+    }
+
+    fn deinit(self: *KeyPipe) void {
+        self.out.deinit(self.allocator);
+        self.encoder.free();
+        self.terminal.deinit();
+        self.* = undefined;
+    }
+
+    /// Drop encoded bytes without touching terminal or encoder state.
+    fn clear(self: *KeyPipe) void {
+        self.out.clearRetainingCapacity();
+    }
+
+    /// Program output that changes keyboard reporting (e.g. "\x1b[>1u").
+    fn negotiate(self: *KeyPipe, sequence: []const u8) void {
+        self.terminal.write(sequence);
+    }
+
+    fn sink(userdata: usize, event: session.InputEvent) void {
+        const self: *KeyPipe = @ptrFromInt(userdata);
+        switch (event) {
+            .key => |k| self.encode(k) catch @panic("key pipe: encode failed"),
+            // Grabs never reach the encoder; other events are irrelevant here.
+            else => {},
+        }
+    }
+
+    fn encode(self: *KeyPipe, k: session.InputEvent.Key) !void {
+        const key = std.enums.fromInt(vt.Key, k.ghostty_key) orelse return;
+        const action = std.enums.fromInt(vt.KeyAction, k.action) orelse return;
+        try self.encoder.setFromTerminal(&self.terminal);
+        const ev: vt.KeyEvent = .{
+            .action = action,
+            .key = key,
+            .mods = k.mods,
+            .consumed_mods = k.consumed_mods,
+            .utf8 = k.utf8 orelse "",
+            .unshifted_codepoint = k.unshifted_codepoint orelse 0,
+        };
+        var buf: [64]u8 = undefined;
+        const bytes = self.encoder.encode(ev, &buf) catch |err| switch (err) {
+            error.OutOfSpace => {
+                var big: [256]u8 = undefined;
+                try self.out.appendSlice(self.allocator, try self.encoder.encode(ev, &big));
+                return;
+            },
+            else => return err,
+        };
+        try self.out.appendSlice(self.allocator, bytes);
+    }
+};
+
 /// Injected physical key state for the resume re-sync (the real source
 /// reads EVIOCGKEY on evdev fds, which do not exist here). Tests set the
 /// codes the "device" reports held across the suspend/resume.
@@ -517,6 +594,7 @@ const Harness = struct {
     cfg: config.Config,
     fake: Fake,
     rec: Recorder,
+    pipe: ?*KeyPipe = null,
     input: libinput.Input,
 
     const Opts = struct {
@@ -530,6 +608,7 @@ const Harness = struct {
         const alloc = testing.allocator;
         const h = try alloc.create(Harness);
         errdefer alloc.destroy(h);
+        h.pipe = null;
         h.km = try xkb.Keymap.init(testing.io, alloc, opts.km);
         errdefer h.km.deinit();
         h.cfg = config.Config.init(alloc);
@@ -548,8 +627,23 @@ const Harness = struct {
         return h;
     }
 
+    /// Route key events through the real terminal encoder instead of the
+    /// Recorder. Call at most once per harness.
+    fn attachPipe(self: *Harness) !*KeyPipe {
+        const p = try testing.allocator.create(KeyPipe);
+        errdefer testing.allocator.destroy(p);
+        p.* = try KeyPipe.init(testing.allocator);
+        self.pipe = p;
+        self.input.setSink(KeyPipe.sink, @intFromPtr(p));
+        return p;
+    }
+
     fn deinit(self: *Harness) void {
         self.input.deinit();
+        if (self.pipe) |p| {
+            p.deinit();
+            testing.allocator.destroy(p);
+        }
         self.rec.deinit();
         self.fake.deinit();
         self.cfg.deinit();
@@ -662,8 +756,11 @@ test "keyboard: press/release, shift, ctrl through the real us keymap" {
     h.fake.pushKey(kt.key_code.key_a, true);
     try h.input.dispatch();
     const controlled = h.rec.last();
-    try expectKey(controlled, .a, 1, "\x01");
+    // Ghostty applies the Control transformation from the modifiers; the
+    // adapter hands over the layout text.
+    try expectKey(controlled, .a, 1, "a");
     try testing.expectEqual(kt.mod_ctrl, controlled.key.mods);
+    try testing.expectEqual(kt.mod_shift | kt.mod_caps_lock, controlled.key.consumed_mods);
 
     // Every queued event was destroyed exactly once.
     try testing.expectEqual(@as(usize, 8), h.fake.destroyed);
@@ -857,27 +954,49 @@ test "repeat: kmscon clamping of delay and rate" {
     try testing.expectEqual(@as(u64, std.time.ns_per_s), timer2.lastArm().interval_ns);
 }
 
-test "repeat: text and mods are frozen at press time" {
+test "repeat: re-translates with the current modifiers (Shift release mid-repeat)" {
     const h = try Harness.init(.{});
     defer h.deinit();
     var timer = FakeTimer{};
     defer timer.deinit();
     h.input.attachRepeatTimer(timer.ops());
 
+    // Hold Shift, hold A: press and repeats are uppercase.
     h.fake.pushKey(kt.key_code.key_leftshift, true);
     h.fake.pushKey(kt.key_code.key_a, true);
     try h.input.dispatch();
+    h.input.repeatExpired(1);
+    const upper = h.rec.last();
+    try expectKey(upper, .a, 2, "A");
+    try testing.expectEqual(kt.mod_shift, upper.key.mods);
+
+    // Release Shift while A is still held: the release must not cancel the
+    // repeat, and the next repeats translate against the new state.
     h.fake.pushKey(kt.key_code.key_leftshift, false);
     try h.input.dispatch();
-    // Releasing a different key must not cancel the 'a' repeat.
     try testing.expectEqual(@as(usize, 0), timer.disarms);
     h.input.repeatExpired(1);
-    const rep = h.rec.last();
-    try expectKey(rep, .a, 2, "A");
-    try testing.expectEqual(kt.mod_shift, rep.key.mods);
+    const lower = h.rec.last();
+    try expectKey(lower, .a, 2, "a");
+    try testing.expectEqual(@as(u16, 0), lower.key.mods);
+
+    // Pressing Shift again mid-repeat changes the next repeat back to
+    // uppercase instead of stopping it.
+    h.fake.pushKey(kt.key_code.key_leftshift, true);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 0), timer.disarms);
+    h.input.repeatExpired(1);
+    try expectKey(h.rec.last(), .a, 2, "A");
+
+    // Releasing the repeating key still cancels.
+    h.fake.pushKey(kt.key_code.key_a, false);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 1), timer.disarms);
+    h.input.repeatExpired(2);
+    try testing.expectEqual(@as(usize, 3), h.rec.countAction(2));
 }
 
-test "repeat: non-repeatable press cancels; modifiers never arm" {
+test "repeat: modifiers neither arm nor cancel; a repeatable press replaces" {
     const h = try Harness.init(.{});
     defer h.deinit();
     var timer = FakeTimer{};
@@ -888,16 +1007,18 @@ test "repeat: non-repeatable press cancels; modifiers never arm" {
     try h.input.dispatch();
     try testing.expectEqual(@as(usize, 1), timer.arms.items.len);
 
-    // A modifier press replaces the repeat with nothing.
+    // A modifier press leaves the running repeat alone...
     h.fake.pushKey(kt.key_code.key_leftctrl, true);
     try h.input.dispatch();
-    try testing.expectEqual(@as(usize, 1), timer.disarms);
-    try testing.expectEqual(@as(usize, 1), timer.arms.items.len);
+    try testing.expectEqual(@as(usize, 0), timer.disarms);
     h.input.repeatExpired(1);
-    try testing.expectEqual(@as(usize, 0), h.rec.countAction(2));
-
-    // A lone modifier never arms; a new repeatable press re-arms.
+    const rep = h.rec.last();
+    try expectKey(rep, .a, 2, "a");
+    try testing.expectEqual(kt.mod_ctrl, rep.key.mods);
     h.fake.pushKey(kt.key_code.key_leftctrl, false);
+    try h.input.dispatch();
+
+    // ...and a lone modifier never arms.
     h.fake.pushKey(kt.key_code.key_leftshift, true);
     try h.input.dispatch();
     try testing.expectEqual(@as(usize, 1), timer.arms.items.len);
@@ -907,6 +1028,38 @@ test "repeat: non-repeatable press cancels; modifiers never arm" {
     try testing.expectEqual(@as(usize, 2), timer.arms.items.len);
     h.input.repeatExpired(1);
     try expectKey(h.rec.last(), .q, 2, "q");
+}
+
+test "repeat: grabs match the modifiers held at repeat time" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    var timer = FakeTimer{};
+    defer timer.deinit();
+    h.input.attachRepeatTimer(timer.ops());
+
+    // Default scroll-up grab: Shift+Up.
+    h.fake.pushKey(kt.key_code.key_leftshift, true);
+    h.fake.pushKey(kt.key_code.key_up, true);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 1), h.rec.countGrabs(@intFromEnum(libinput.GrabId.scroll_up)));
+    h.input.repeatExpired(1);
+    try testing.expectEqual(@as(usize, 2), h.rec.countGrabs(@intFromEnum(libinput.GrabId.scroll_up)));
+
+    // Releasing Shift while Up repeats: the grab no longer matches, so the
+    // repeat is delivered as a plain Up key event instead.
+    h.fake.pushKey(kt.key_code.key_leftshift, false);
+    try h.input.dispatch();
+    h.input.repeatExpired(1);
+    try testing.expectEqual(@as(usize, 2), h.rec.countGrabs(@intFromEnum(libinput.GrabId.scroll_up)));
+    const rep = h.rec.last();
+    try expectKey(rep, .arrow_up, 2, null);
+    try testing.expectEqual(@as(u16, 0), rep.key.mods);
+
+    // Pressing Shift again re-matches the grab on the next repeat.
+    h.fake.pushKey(kt.key_code.key_leftshift, true);
+    try h.input.dispatch();
+    h.input.repeatExpired(1);
+    try testing.expectEqual(@as(usize, 3), h.rec.countGrabs(@intFromEnum(libinput.GrabId.scroll_up)));
 }
 
 test "repeat: a grabbed key repeats as grab events (Shift+Up scrolls on)" {
@@ -941,6 +1094,191 @@ test "repeat: without a timer seam presses do not repeat" {
     h.input.repeatExpired(3);
     try testing.expectEqual(@as(usize, 0), h.rec.countAction(2));
     try testing.expectEqual(@as(usize, 1), h.rec.entries.items.len);
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard translation: xkb adapter -> session event -> real key encoder
+//
+// These exercise the adapter that produced the malformed events (Ctrl text
+// transformed twice, consumed modifiers dropped) and hand its output to the
+// same libghostty-vt encoder TerminalSession.handleKey uses. Expectations are
+// the C0/CSI bytes a terminal receives, not hand-corrected encoder inputs.
+// ---------------------------------------------------------------------------
+
+/// Dispatch ctrl+<code> (press/release, in that order) and assert the exact
+/// bytes the encoder emits for the pair.
+fn expectCtrlSequence(h: *Harness, pipe: *KeyPipe, code: u32, want: []const u8) !void {
+    pipe.clear();
+    h.fake.pushKey(kt.key_code.key_leftctrl, true);
+    h.fake.pushKey(code, true);
+    h.fake.pushKey(code, false);
+    h.fake.pushKey(kt.key_code.key_leftctrl, false);
+    try h.input.dispatch();
+    try testing.expectEqualStrings(want, pipe.out.items);
+}
+
+test "keyboard: ctrl control bytes across the adapter (A1)" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    const pipe = try h.attachPipe();
+
+    // Ctrl-A .. Ctrl-Z. Most map to C0 directly; i and m are deliberately
+    // CSI u in Paul Evans' fixterms (distinct from Tab and CR), and the
+    // adapter must not special-case them into legacy bytes.
+    const cases = [_]struct { code: u32, want: []const u8 }{
+        .{ .code = kt.key_code.key_a, .want = "\x01" },
+        .{ .code = kt.key_code.key_b, .want = "\x02" },
+        .{ .code = kt.key_code.key_c, .want = "\x03" },
+        .{ .code = kt.key_code.key_d, .want = "\x04" },
+        .{ .code = kt.key_code.key_e, .want = "\x05" },
+        .{ .code = kt.key_code.key_f, .want = "\x06" },
+        .{ .code = kt.key_code.key_g, .want = "\x07" },
+        .{ .code = kt.key_code.key_h, .want = "\x08" },
+        .{ .code = kt.key_code.key_i, .want = "\x1b[105;5u" },
+        .{ .code = kt.key_code.key_j, .want = "\x0a" },
+        .{ .code = kt.key_code.key_k, .want = "\x0b" },
+        .{ .code = kt.key_code.key_l, .want = "\x0c" },
+        .{ .code = kt.key_code.key_m, .want = "\x1b[109;5u" },
+        .{ .code = kt.key_code.key_n, .want = "\x0e" },
+        .{ .code = kt.key_code.key_o, .want = "\x0f" },
+        .{ .code = kt.key_code.key_p, .want = "\x10" },
+        .{ .code = kt.key_code.key_q, .want = "\x11" },
+        .{ .code = kt.key_code.key_r, .want = "\x12" },
+        .{ .code = kt.key_code.key_s, .want = "\x13" },
+        .{ .code = kt.key_code.key_t, .want = "\x14" },
+        .{ .code = kt.key_code.key_u, .want = "\x15" },
+        .{ .code = kt.key_code.key_v, .want = "\x16" },
+        .{ .code = kt.key_code.key_w, .want = "\x17" },
+        .{ .code = kt.key_code.key_x, .want = "\x18" },
+        .{ .code = kt.key_code.key_y, .want = "\x19" },
+        .{ .code = kt.key_code.key_z, .want = "\x1a" },
+    };
+    for (cases) |case| try expectCtrlSequence(h, pipe, case.code, case.want);
+
+    // Ctrl-Space is NUL; representative control punctuation.
+    try expectCtrlSequence(h, pipe, kt.key_code.key_space, "\x00");
+    try expectCtrlSequence(h, pipe, kt.key_code.key_rightbrace, "\x1d");
+    try expectCtrlSequence(h, pipe, kt.key_code.key_backslash, "\x1c");
+    try expectCtrlSequence(h, pipe, kt.key_code.key_slash, "\x1f");
+    // '[' stays CSI u (fixterms keeps it distinct from ESC).
+    try expectCtrlSequence(h, pipe, kt.key_code.key_leftbrace, "\x1b[91;5u");
+}
+
+test "keyboard: ctrl+L and ctrl+R under legacy, modifyOtherKeys=2, Kitty (A2)" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    const pipe = try h.attachPipe();
+
+    // Legacy: the encoder builds the C0 byte from text "l"/"r" plus Ctrl.
+    try expectCtrlSequence(h, pipe, kt.key_code.key_l, "\x0c");
+    try expectCtrlSequence(h, pipe, kt.key_code.key_r, "\x12");
+
+    // modifyOtherKeys=2: xterm's CSI 27 form carries the UNSHIFTED codepoint
+    // of the layout text (108/114), not the C0 byte (12/18).
+    pipe.negotiate("\x1b[>4;2m");
+    try expectCtrlSequence(h, pipe, kt.key_code.key_l, "\x1b[27;5;108~");
+    try expectCtrlSequence(h, pipe, kt.key_code.key_r, "\x1b[27;5;114~");
+    pipe.negotiate("\x1b[>4;0m");
+
+    // Kitty disambiguation: text plus Ctrl, and Ctrl is not consumed.
+    pipe.negotiate("\x1b[>1u");
+    try expectCtrlSequence(h, pipe, kt.key_code.key_l, "\x1b[108;5u");
+    try expectCtrlSequence(h, pipe, kt.key_code.key_r, "\x1b[114;5u");
+}
+
+test "keyboard: consumed modifiers keep text out of shortcut encoding (A3)" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    const pipe = try h.attachPipe();
+    // Kitty disambiguation encodes every modified key as CSI u unless the
+    // modifier was consumed producing the text.
+    pipe.negotiate("\x1b[>1u");
+
+    // Shift+A: text "A" with Shift consumed -> plain "A" (not CSI 97;2u).
+    pipe.clear();
+    h.fake.pushKey(kt.key_code.key_leftshift, true);
+    h.fake.pushKey(kt.key_code.key_a, true);
+    try h.input.dispatch();
+    try testing.expectEqualStrings("A", pipe.out.items);
+
+    // Shift+2 (US): text "@" with Shift consumed -> plain "@" (not 50;2u).
+    pipe.clear();
+    h.fake.pushKey(kt.key_code.key_2, true);
+    try h.input.dispatch();
+    try testing.expectEqualStrings("@", pipe.out.items);
+
+    h.fake.pushKey(kt.key_code.key_2, false);
+    h.fake.pushKey(kt.key_code.key_a, false);
+    h.fake.pushKey(kt.key_code.key_leftshift, false);
+    try h.input.dispatch();
+
+    // Caps Lock is consumed by the letter too: "A" stays text.
+    pipe.clear();
+    h.fake.pushKey(kt.key_code.key_capslock, true);
+    h.fake.pushKey(kt.key_code.key_capslock, false);
+    h.fake.pushKey(kt.key_code.key_a, true);
+    try h.input.dispatch();
+    try testing.expectEqualStrings("A", pipe.out.items);
+    h.fake.pushKey(kt.key_code.key_a, false);
+    h.fake.pushKey(kt.key_code.key_capslock, true);
+    h.fake.pushKey(kt.key_code.key_capslock, false);
+    try h.input.dispatch();
+
+    // A shortcut that really is a shortcut still encodes as one. Ctrl+Up
+    // (Shift+Up is the default scroll grab and would never reach here)
+    // encodes with the Ctrl modifier.
+    pipe.clear();
+    h.fake.pushKey(kt.key_code.key_leftctrl, true);
+    h.fake.pushKey(kt.key_code.key_up, true);
+    try h.input.dispatch();
+    try testing.expectEqualStrings("\x1b[1;5A", pipe.out.items);
+    h.fake.pushKey(kt.key_code.key_up, false);
+    h.fake.pushKey(kt.key_code.key_leftctrl, false);
+}
+
+test "keyboard: AltGr text and a non-US layout reach the encoder (A3)" {
+    const h = try Harness.init(.{ .km = .{ .layout = "de" } });
+    defer h.deinit();
+    const pipe = try h.attachPipe();
+    pipe.negotiate("\x1b[>1u");
+
+    // AltGr+q on German is '@'. AltGr is not a Ghostty modifier (kmscon
+    // parity), so only the layout text reaches the encoder.
+    pipe.clear();
+    h.fake.pushKey(kt.key_code.key_rightalt, true);
+    h.fake.pushKey(kt.key_code.key_q, true);
+    try h.input.dispatch();
+    try testing.expectEqualStrings("@", pipe.out.items);
+    h.fake.pushKey(kt.key_code.key_q, false);
+    h.fake.pushKey(kt.key_code.key_rightalt, false);
+    try h.input.dispatch();
+
+    // The active layout decides the text: evdev y is 'z' on de.
+    pipe.clear();
+    h.fake.pushKey(kt.key_code.key_y, true);
+    try h.input.dispatch();
+    try testing.expectEqualStrings("z", pipe.out.items);
+}
+
+test "keyboard: composed text is delivered, not the dead key (A3)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/Compose", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(path);
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "Compose",
+        .data = "<dead_acute> <a> : \"á\" aacute\n",
+    });
+
+    // us(intl) puts dead_acute on the apostrophe key (evdev 40).
+    const h = try Harness.init(.{ .km = .{ .layout = "us", .variant = "intl" }, .compose_file = path });
+    defer h.deinit();
+    const pipe = try h.attachPipe();
+
+    h.fake.pushKey(kt.key_code.key_apostrophe, true);
+    h.fake.pushKey(kt.key_code.key_a, true);
+    try h.input.dispatch();
+    try testing.expectEqualStrings("á", pipe.out.items);
 }
 
 // ---------------------------------------------------------------------------

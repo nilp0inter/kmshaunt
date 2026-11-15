@@ -69,6 +69,11 @@ pub const InputEvent = union(enum) {
         mods: u16,
         /// GhosttyKeyAction: 0 = release, 1 = press, 2 = repeat.
         action: u8,
+        /// Modifier bits the key's level selection consumed (XKB consumed
+        /// mods as GhosttyMods bits, e.g. SHIFT|CAPS_LOCK for alphabetic
+        /// keys). Ghostty subtracts them from `mods` when the event carries
+        /// text, so Shift+A reports text "A" without a shortcut modifier.
+        consumed_mods: u16 = 0,
         /// Layout-produced UNMODIFIED UTF-8 text (never C0 controls),
         /// borrowed; null when the key produces no text. Bytes must outlive
         /// the event's delivery.

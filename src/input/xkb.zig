@@ -49,11 +49,12 @@
 //!   input_set_conf (input.c:573-580): 0 -> default, >= 1000 -> 999.
 //!
 //! KeyEvent lifetimes: `utf8` borrows `State.utf8_buf` and is valid until
-//! the next `State.processKey` on the same state (or reload/deinit). For a
-//! composed event it borrows `Compose.buf` instead and is valid until the
-//! next `Compose.feed`/`reset`. Both buffers are 64 bytes; longer strings
-//! are truncated (xkb_state_key_get_utf8 / xkb_compose_state_get_utf8
-//! semantics). `Keymap.layoutName` borrows the keymap until reload/deinit.
+//! the next `State.processKey`/`State.translateKey` on the same state (or
+//! reload/deinit). For a composed event it borrows `Compose.buf` instead
+//! and is valid until the next `Compose.feed`/`reset`. Both buffers are 64
+//! bytes; longer strings are truncated (xkb_keysym_to_utf8 /
+//! xkb_compose_state_get_utf8 semantics). `Keymap.layoutName` borrows the
+//! keymap until reload/deinit.
 //!
 //! Modifier mapping: xkb_state_serialize_mods(EFFECTIVE) is decoded through
 //! the keymap's real-modifier indices — Shift -> mod_shift, Control ->
@@ -79,9 +80,21 @@
 //! composed result that has UTF-8 but no keysym is kept, and ctrl/alt/super
 //! bypass Compose so shortcuts are never swallowed by a dead-key sequence.
 //!
-//! ctrl+a: xkbcommon applies the Control keysym transformation in
-//! xkb_state_key_get_utf8, so the event carries utf8 "\x01" (not empty).
-//! `keysym` stays 'a' — keysyms are not control-transformed.
+//! ctrl+a: the adapter must hand Ghostty layout-produced text BEFORE the
+//! Control/Meta transformations, plus the modifiers — the C API docs forbid
+//! C0 control characters in `utf8` and `KeyEncoder` applies the C0
+//! transformation from the modifier bits itself (Ctrl-L -> text "l" -> 0x0C
+//! on the legacy protocol, CSI 12;5u under Kitty). `xkb_state_key_get_utf8`
+//! performs that transformation (it would return "\x0C"), so the text is
+//! built here from `xkb_state_key_get_syms` + `xkb_keysym_to_utf8`: layout,
+//! Shift, Caps Lock and AltGr are already resolved into the syms, only the
+//! Control/Meta rewrite is skipped. `keysym` stays 'a' either way.
+//!
+//! Consumed modifiers: `xkb_state_key_get_consumed_mods` is decoded through
+//! the keymap's modifier indices into GhosttyMods bits (Shift|Caps for
+//! alphabetic keys, Shift for shifted punctuation). Ghostty subtracts them
+//! from the reported modifiers when the event carries text, so Shift-A
+//! arrives as text "A" with no shortcut modifier instead of CSI 97;2u.
 //!
 //! `reload` rebuilds keymap and state preserving *nothing*: depressed,
 //! latched and locked modifiers, the active layout and any Compose progress
@@ -157,17 +170,19 @@ pub const RepeatConfig = struct {
 /// One processed key event. `utf8` is borrowed — see the module header for
 /// lifetimes. `keysym` is the effective single keysym (Caps-transformed,
 /// or the composed keysym); 0 (NoSymbol) when the key yields several
-/// keysyms or none. `consumed_mods` is the raw xkb modifier mask the key's
-/// type consumes for level selection (xkb_state_key_get_consumed_mods) —
-/// a static property of the key, e.g. Shift|Lock for alphabetic keys,
-/// independent of which modifiers are currently active. Not GhosttyMods bits.
+/// keysyms or none. `consumed_mods` is the key type's consumed modifier
+/// mask (xkb_state_key_get_consumed_mods) converted to GhosttyMods bits —
+/// a static property of the key, e.g. Shift|Caps for alphabetic keys,
+/// independent of which modifiers are currently active. Ghostty subtracts
+/// it from `mods` when the event carries text, so text-producing modifiers
+/// must not report as shortcut modifiers.
 pub const KeyEvent = struct {
     ghostty_key: GhosttyKey,
     mods: GhosttyMods,
     utf8: ?[]const u8,
     unshifted_codepoint: ?u21,
     keysym: u32,
-    consumed_mods: u32,
+    consumed_mods: GhosttyMods,
 };
 
 /// A compiled keymap plus its xkb context. Owns both; `deinit` releases
@@ -396,29 +411,19 @@ pub const State = struct {
     /// composed event) until the next processKey/feed — copy it if it must
     /// outlive that.
     pub fn processKey(self: *State, evdev_code: u32, pressed: bool) ?KeyEvent {
-        const kc = evdev_code +| evdev_offset;
-
-        // Query before xkb_state_update_key (xkbcommon ordering; kmscon
-        // input_uxkb.c:475-482).
-        var syms: [*c]const u32 = null;
-        const num_syms = c.xkb_state_key_get_syms(self.state, kc, &syms);
-        var one_sym: u32 = c.XKB_KEY_NoSymbol;
-        if (num_syms == 1) one_sym = c.xkb_state_key_get_one_sym(self.state, kc);
-        const consumed = c.xkb_state_key_get_consumed_mods(self.state, kc);
-        const unshifted = self.unshiftedCodepoint(kc);
+        const q = self.query(evdev_code);
+        const unshifted = self.unshiftedCodepoint(q.kc);
 
         var utf8: ?[]const u8 = null;
-        if (pressed and num_syms > 0) {
-            const n = c.xkb_state_key_get_utf8(self.state, kc, @ptrCast(&self.utf8_buf), self.utf8_buf.len);
-            if (n > 0) utf8 = self.utf8_buf[0..@min(@as(usize, @intCast(n)), self.utf8_buf.len)];
-        }
+        if (pressed and q.num_syms > 0) utf8 = self.layoutText(q.syms, q.num_syms);
 
         // Compose runs on presses only, fed with the single keysym (or
         // NoSymbol for multi-keysym keys, per xkb_compose_state_feed docs).
         var suppressed = false;
+        var one_sym = q.one_sym;
         if (pressed) {
             if (self.compose) |cp| {
-                const feed_sym: u32 = if (num_syms == 1) one_sym else c.XKB_KEY_NoSymbol;
+                const feed_sym: u32 = if (q.num_syms == 1) one_sym else c.XKB_KEY_NoSymbol;
                 switch (cp.feed(feed_sym, self.mods())) {
                     .none => {},
                     .composing, .cancelled => suppressed = true,
@@ -434,7 +439,7 @@ pub const State = struct {
         // same before its -ENOKEY return).
         _ = c.xkb_state_update_key(
             self.state,
-            kc,
+            q.kc,
             if (pressed) c.XKB_KEY_DOWN else c.XKB_KEY_UP,
         );
         self.trackRightModifier(evdev_code, pressed);
@@ -442,19 +447,98 @@ pub const State = struct {
         if (suppressed) return null;
 
         return .{
-            .ghostty_key = kt.xkbKeycodeToGhosttyKey(kc),
+            .ghostty_key = kt.xkbKeycodeToGhosttyKey(q.kc),
             .mods = self.mods(),
             .utf8 = utf8,
             .unshifted_codepoint = unshifted,
             .keysym = one_sym,
-            .consumed_mods = consumed,
+            .consumed_mods = self.modsFromMask(q.consumed),
         };
+    }
+
+    /// Translate the key with the CURRENT state without touching it: no
+    /// xkb_state_update_key and no Compose feed. Key repeat uses this so
+    /// every repeat reflects the modifiers held right now (release Shift
+    /// mid-repeat and the text becomes lowercase) and so a repeat can be
+    /// matched against grabs with the current modifiers. `utf8` borrows the
+    /// state buffer like `processKey`.
+    pub fn translateKey(self: *State, evdev_code: u32) KeyEvent {
+        const q = self.query(evdev_code);
+        return .{
+            .ghostty_key = kt.xkbKeycodeToGhosttyKey(q.kc),
+            .mods = self.mods(),
+            .utf8 = if (q.num_syms > 0) self.layoutText(q.syms, q.num_syms) else null,
+            .unshifted_codepoint = self.unshiftedCodepoint(q.kc),
+            .keysym = q.one_sym,
+            .consumed_mods = self.modsFromMask(q.consumed),
+        };
+    }
+
+    /// Raw per-key query, taken before any state update (xkbcommon ordering;
+    /// kmscon input_uxkb.c:475-482). `syms` points into keymap-owned storage
+    /// valid until the state or keymap changes.
+    const Query = struct {
+        kc: u32,
+        syms: [*c]const u32,
+        num_syms: c_int,
+        one_sym: u32,
+        consumed: u32,
+    };
+
+    fn query(self: *State, evdev_code: u32) Query {
+        const kc = evdev_code +| evdev_offset;
+        var syms: [*c]const u32 = null;
+        const num_syms = c.xkb_state_key_get_syms(self.state, kc, &syms);
+        return .{
+            .kc = kc,
+            .syms = syms,
+            .num_syms = num_syms,
+            .one_sym = if (num_syms == 1) c.xkb_state_key_get_one_sym(self.state, kc) else c.XKB_KEY_NoSymbol,
+            .consumed = c.xkb_state_key_get_consumed_mods(self.state, kc),
+        };
+    }
+
+    /// Layout-produced text for the key's current level, WITHOUT
+    /// xkbcommon's Control/Meta transformation. `xkb_state_key_get_utf8`
+    /// rewrites Ctrl-L to U+000C; Ghostty's encoder applies that
+    /// transformation itself from the modifier bits and explicitly rejects
+    /// C0 control text, so the adapter hands over the raw layout text
+    /// (Ctrl-L -> "l") and lets the encoder own every protocol. Shift, Caps
+    /// Lock, AltGr and the active layout are already reflected in the syms.
+    /// Returns a slice of `utf8_buf`.
+    fn layoutText(self: *State, syms: [*c]const u32, num_syms: c_int) ?[]const u8 {
+        if (num_syms <= 0) return null;
+        var total: usize = 0;
+        var i: usize = 0;
+        const count: usize = @intCast(num_syms);
+        // xkb_keysym_to_utf8 counts the terminating byte and needs room for
+        // at least 5; anything shorter is left for the next sym.
+        while (i < count and self.utf8_buf.len - total >= 5) : (i += 1) {
+            const n = c.xkb_keysym_to_utf8(syms[i], @ptrCast(&self.utf8_buf[total]), self.utf8_buf.len - total);
+            if (n <= 0) continue;
+            total += @as(usize, @intCast(n)) - 1;
+        }
+        if (total == 0) return null;
+        return self.utf8_buf[0..total];
     }
 
     /// Effective modifiers as GhosttyMods (see the module header for the
     /// index mapping). Useful for grab matching between key events.
     pub fn mods(self: *State) GhosttyMods {
         const mask = c.xkb_state_serialize_mods(self.state, c.XKB_STATE_MODS_EFFECTIVE);
+        var m = self.modsFromMask(mask);
+        if (m & kt.mod_shift != 0 and self.rightDown(kt.key_code.key_rightshift)) m |= kt.mod_shift_side;
+        if (m & kt.mod_ctrl != 0 and self.rightDown(kt.key_code.key_rightctrl)) m |= kt.mod_ctrl_side;
+        if (m & kt.mod_alt != 0 and self.rightDown(kt.key_code.key_rightalt)) m |= kt.mod_alt_side;
+        if (m & kt.mod_super != 0 and self.rightDown(kt.key_code.key_rightmeta)) m |= kt.mod_super_side;
+        return m;
+    }
+
+    /// Decode an xkb modifier mask through the keymap's real-modifier
+    /// indices into GhosttyMods base bits. Never hand raw xkb masks to
+    /// Ghostty: the bit assignments differ (xkb uses per-keymap indices,
+    /// Ghostty uses its own flag order).
+    fn modsFromMask(self: *const State, mask: u32) GhosttyMods {
         const mi = &self.keymap.mods;
         var m: GhosttyMods = 0;
         if (modActive(mask, mi.shift)) m |= kt.mod_shift;
@@ -463,10 +547,6 @@ pub const State = struct {
         if (modActive(mask, mi.super)) m |= kt.mod_super;
         if (modActive(mask, mi.caps)) m |= kt.mod_caps_lock;
         if (modActive(mask, mi.num)) m |= kt.mod_num_lock;
-        if (m & kt.mod_shift != 0 and self.rightDown(kt.key_code.key_rightshift)) m |= kt.mod_shift_side;
-        if (m & kt.mod_ctrl != 0 and self.rightDown(kt.key_code.key_rightctrl)) m |= kt.mod_ctrl_side;
-        if (m & kt.mod_alt != 0 and self.rightDown(kt.key_code.key_rightalt)) m |= kt.mod_alt_side;
-        if (m & kt.mod_super != 0 and self.rightDown(kt.key_code.key_rightmeta)) m |= kt.mod_super_side;
         return m;
     }
 
@@ -694,7 +774,9 @@ pub const Compose = struct {
                 const sym = c.xkb_compose_state_get_one_sym(self.state);
                 var n = c.xkb_compose_state_get_utf8(self.state, @ptrCast(&self.buf), self.buf.len);
                 if (n <= 0 and sym != c.XKB_KEY_NoSymbol) {
-                    n = c.xkb_keysym_to_utf8(sym, @ptrCast(&self.buf), self.buf.len);
+                    // xkb_keysym_to_utf8 counts the terminating byte.
+                    const sym_n = c.xkb_keysym_to_utf8(sym, @ptrCast(&self.buf), self.buf.len);
+                    n = if (sym_n > 0) sym_n - 1 else sym_n;
                 }
                 c.xkb_compose_state_reset(self.state);
                 if (n <= 0) return .none;
@@ -767,10 +849,9 @@ test "us: 'a' press and release" {
     try testing.expectEqual(@as(GhosttyMods, 0), ev.mods);
     try testing.expectEqual(@as(?u21, 'a'), ev.unshifted_codepoint);
     // Alphabetic keys consume Shift and Lock for level selection, even
-    // when no modifier is active.
-    const shift_lock = c.xkb_keymap_mod_get_mask(km.map, c.XKB_MOD_NAME_SHIFT) |
-        c.xkb_keymap_mod_get_mask(km.map, c.XKB_MOD_NAME_CAPS);
-    try testing.expectEqual(shift_lock, ev.consumed_mods);
+    // when no modifier is active; reported as Ghostty bits, never as the
+    // raw xkb mask.
+    try testing.expectEqual(kt.mod_shift | kt.mod_caps_lock, ev.consumed_mods);
 
     const rel = st.processKey(kt.key_code.key_a, false) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(GhosttyKey.a, rel.ghostty_key);
@@ -805,7 +886,7 @@ test "us: shift+a -> 'A' with shift mod; side bits track the right key" {
     _ = st.processKey(kt.key_code.key_rightshift, false);
 }
 
-test "us: ctrl+a -> ctrl mod and utf8 0x01 (xkb Control transformation)" {
+test "us: ctrl+a carries layout text 'a', not the C0 transformation" {
     var km = try testKeymap(.{ .layout = "us" });
     defer km.deinit();
     var st = try State.init(&km);
@@ -815,9 +896,65 @@ test "us: ctrl+a -> ctrl mod and utf8 0x01 (xkb Control transformation)" {
     try testing.expectEqual(kt.mod_ctrl, ctrl.mods);
     const ev = st.processKey(kt.key_code.key_a, true).?;
     try testing.expectEqual(kt.mod_ctrl, ev.mods);
-    try testing.expectEqualStrings("\x01", ev.utf8.?);
+    // Ghostty applies the Control transformation itself from `mods`; the
+    // adapter must not pre-apply it (C0 text is rejected by the C API).
+    try testing.expectEqualStrings("a", ev.utf8.?);
+    try testing.expectEqual(@as(u32, 'a'), ev.keysym);
+    try testing.expectEqual(@as(?u21, 'a'), ev.unshifted_codepoint);
+    // Shift|Lock are consumed by the key type, Ctrl is not.
+    try testing.expectEqual(kt.mod_shift | kt.mod_caps_lock, ev.consumed_mods);
     _ = st.processKey(kt.key_code.key_a, false);
     _ = st.processKey(kt.key_code.key_leftctrl, false);
+}
+
+test "translateKey: current modifiers and text, never mutates state" {
+    var km = try testKeymap(.{ .layout = "us" });
+    defer km.deinit();
+    var st = try State.init(&km);
+    defer st.deinit();
+
+    // Bare key.
+    _ = st.processKey(kt.key_code.key_a, true);
+    const plain = st.translateKey(kt.key_code.key_a);
+    try testing.expectEqualStrings("a", plain.utf8.?);
+    try testing.expectEqual(@as(GhosttyMods, 0), plain.mods);
+
+    // Shift state changes the translation but not the key state: feeding
+    // the same key again still reports "A", and a release of the shift key
+    // returns to "a" — the repeat path relies on that.
+    _ = st.processKey(kt.key_code.key_leftshift, true);
+    const shifted = st.translateKey(kt.key_code.key_a);
+    try testing.expectEqualStrings("A", shifted.utf8.?);
+    try testing.expectEqual(kt.mod_shift, shifted.mods);
+    try testing.expectEqual(kt.mod_shift | kt.mod_caps_lock, shifted.consumed_mods);
+
+    _ = st.processKey(kt.key_code.key_leftshift, false);
+    const lowered = st.translateKey(kt.key_code.key_a);
+    try testing.expectEqualStrings("a", lowered.utf8.?);
+    try testing.expectEqual(@as(GhosttyMods, 0), lowered.mods);
+
+    // No synthetic key transitions: the still-held 'a' is exactly one
+    // depressed key, so releasing it once returns to the neutral state.
+    _ = st.processKey(kt.key_code.key_a, false);
+    try testing.expectEqual(@as(GhosttyMods, 0), st.mods());
+    try expectUtf8(st.processKey(kt.key_code.key_a, true), "a");
+}
+
+test "altgr: level-3 text is preserved (de: AltGr+q -> @)" {
+    var km = try testKeymap(.{ .layout = "de" });
+    defer km.deinit();
+    var st = try State.init(&km);
+    defer st.deinit();
+
+    const altgr = st.processKey(kt.key_code.key_rightalt, true).?;
+    // AltGr is Mod5 (ISO_Level3_Shift), deliberately not mod_alt (kmscon).
+    try testing.expectEqual(@as(GhosttyMods, 0), altgr.mods);
+    const ev = st.processKey(kt.key_code.key_q, true).?;
+    try testing.expectEqualStrings("@", ev.utf8.?);
+    try testing.expectEqual(@as(u32, '@'), ev.keysym);
+    try testing.expectEqual(@as(?u21, 'q'), ev.unshifted_codepoint);
+    _ = st.processKey(kt.key_code.key_q, false);
+    _ = st.processKey(kt.key_code.key_rightalt, false);
 }
 
 test "modifier bits: alt, super, caps lock, num lock; LEDs" {

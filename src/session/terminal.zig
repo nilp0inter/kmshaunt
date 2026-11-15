@@ -586,6 +586,7 @@ pub const TerminalSession = struct {
             .action = action,
             .key = key,
             .mods = k.mods,
+            .consumed_mods = k.consumed_mods,
             .utf8 = k.utf8 orelse "",
             .unshifted_codepoint = k.unshifted_codepoint orelse 0,
         };

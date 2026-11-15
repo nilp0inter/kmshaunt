@@ -122,12 +122,17 @@
 //! so 0 -> default and >= 1000 -> 999; the rate is converted to an
 //! interval via Hz). The owner's timer callback forwards expirations to
 //! `repeatExpired`, which emits `key` with action=repeat — through the
-//! same grab check as the original press, so holding Shift+Up keeps
-//! scrolling. Any key press replaces the current repeat; a
-//! non-repeatable press (e.g. a modifier) cancels it; releasing the
-//! repeating key cancels it (`disarm`). Without a timer there is no
-//! repeat. The repeat text is copied at press time (the xkb UTF-8
-//! buffer is borrowed); modifiers/keysym are frozen at press time too.
+//! same grab check as the original press.
+//!
+//! The repeat tracks the repeating PHYSICAL key, not a translated event:
+//! every expiration re-translates it with `xkb.State.translateKey`, using
+//! the modifiers held at that moment and without updating the xkb state or
+//! feeding Compose. Releasing Shift mid-repeat therefore turns "A" into
+//! "a", and grab matching sees the current modifiers. A repeatable press
+//! replaces the current repeat; a non-repeatable press (a modifier, a lock,
+//! a function key) leaves it running because it changes how the held key
+//! translates, not whether it repeats. Releasing the repeating key cancels
+//! it (`disarm`). Without a timer there is no repeat.
 //!
 //! The seam keeps this module independent of loop.zig: importing
 //! loop.zig into a libc-linked test build currently fails because its
@@ -563,23 +568,9 @@ pub const double_click_window_ms: i64 = 400;
 const btn_left: u32 = 0x110;
 const mouse_button_count = 8;
 
-/// Size of the repeat text copy; matches the xkb UTF-8 buffer.
-const utf8_buf_len = 64;
-
 const ClickState = struct {
     last_ms: i64 = 0,
     count: u8 = 0,
-};
-
-/// The frozen press event a running repeat re-emits.
-const RepeatKey = struct {
-    evdev_code: u32,
-    ghostty_key: u32,
-    mods: kt.GhosttyMods,
-    unshifted_codepoint: ?u21,
-    keysym: u32,
-    utf8_len: usize,
-    utf8_buf: [utf8_buf_len]u8,
 };
 
 /// libinput dispatch for one seat. Create with `init`, place at a stable
@@ -623,7 +614,8 @@ pub const Input = struct {
 
     repeat_timer: ?RepeatTimerOps = null,
     repeat_cfg: xkb.RepeatConfig,
-    repeat: ?RepeatKey = null,
+    /// Evdev code of the key currently repeating; null when idle.
+    repeat: ?u32 = null,
 
     /// True between `suspend_` and `resume_` (seat inactive): `dispatch` is a
     /// no-op so no evdev input reaches the sink while the seat is away.
@@ -806,13 +798,13 @@ pub const Input = struct {
         const kev = self.state.processKey(code, pressed) orelse return;
 
         if (pressed) {
-            if (self.keymap.shouldRepeat(code)) {
-                try self.startRepeat(code, kev);
-            } else {
-                try self.stopRepeat();
-            }
-        } else if (self.repeat) |r| {
-            if (r.evdev_code == code) try self.stopRepeat();
+            // A repeatable press takes over the repeat. Non-repeatable
+            // presses (modifiers, locks, function keys) leave a running
+            // repeat alone: they change how the held key translates, not
+            // whether it repeats.
+            if (self.keymap.shouldRepeat(code)) try self.startRepeat(code);
+        } else if (self.repeat) |repeating| {
+            if (repeating == code) try self.stopRepeat();
         }
 
         const action: u8 = if (pressed)
@@ -833,29 +825,19 @@ pub const Input = struct {
         self.emit(.{ .key = .{
             .ghostty_key = @intFromEnum(kev.ghostty_key),
             .mods = kev.mods,
+            .consumed_mods = kev.consumed_mods,
             .action = action,
             .utf8 = kev.utf8,
             .unshifted_codepoint = kev.unshifted_codepoint,
         } });
     }
 
-    fn startRepeat(self: *Input, code: u32, kev: xkb.KeyEvent) !void {
+    /// Arm repeat for `code`. Only the physical key is stored: every repeat
+    /// is translated against the state current at that moment.
+    fn startRepeat(self: *Input, code: u32) !void {
         const timer = self.repeat_timer orelse return;
         try self.stopRepeat();
-        var r = RepeatKey{
-            .evdev_code = code,
-            .ghostty_key = @intFromEnum(kev.ghostty_key),
-            .mods = kev.mods,
-            .unshifted_codepoint = kev.unshifted_codepoint,
-            .keysym = kev.keysym,
-            .utf8_len = 0,
-            .utf8_buf = undefined,
-        };
-        if (kev.utf8) |text| {
-            r.utf8_len = @min(text.len, utf8_buf_len);
-            @memcpy(r.utf8_buf[0..r.utf8_len], text[0..r.utf8_len]);
-        }
-        self.repeat = r;
+        self.repeat = code;
         // One arm covers both phases: first fire after the delay, then
         // every rate interval (timerfd it_value + it_interval).
         const delay_ns = @as(u64, self.repeat_cfg.delay_ms) * std.time.ns_per_ms;
@@ -871,20 +853,16 @@ pub const Input = struct {
 
     /// Forward timer expirations here (the owner's timer callback calls
     /// this with the expiration count; timerfd coalesces after a stall,
-    /// so one repeat is emitted per expiration). Only meaningful after a
-    /// dispatch armed the repeat; requires the sink to be set.
+    /// so one repeat is emitted per expiration). Each repeat is translated
+    /// afresh from the current xkb state — text, modifiers, keysym and
+    /// consumed mods all follow modifier changes while the key is held —
+    /// and without synthetic key transitions or Compose replay. Requires
+    /// the sink to be set.
     pub fn repeatExpired(self: *Input, expirations: u64) void {
-        const r = self.repeat orelse return;
+        const code = self.repeat orelse return;
         var i: u64 = 0;
         while (i < expirations) : (i += 1) {
-            self.emitKey(.{
-                .ghostty_key = @enumFromInt(r.ghostty_key),
-                .mods = r.mods,
-                .utf8 = if (r.utf8_len > 0) r.utf8_buf[0..r.utf8_len] else null,
-                .unshifted_codepoint = r.unshifted_codepoint,
-                .keysym = r.keysym,
-                .consumed_mods = 0,
-            }, @intFromEnum(kt.GhosttyKeyAction.repeat));
+            self.emitKey(self.state.translateKey(code), @intFromEnum(kt.GhosttyKeyAction.repeat));
         }
     }
 
