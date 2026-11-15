@@ -99,6 +99,17 @@ pub const Options = struct {
     idle_timeout_ns: i64 = default_idle_timeout_ns,
 };
 
+/// Recommended integer sprite scale for a canvas of the given height, so the
+/// arrow stays a usable size on large/HiDPI panels instead of a tiny 12x19
+/// speck. The base arrow is sized for ~720 rows; each additional 720 rows of
+/// canvas add one scale step, capped at 4. <=720 rows (incl. the 768-row test
+/// VM) and 1080p keep scale 1, 1440p -> 2, 4K -> 3. In a scaled viewport the
+/// canvas is small, so this returns 1 and the viewport's own upscale sizes the
+/// sprite -- no double scaling.
+pub fn scaleForCanvasHeight(canvas_h: u32) u32 {
+    return std.math.clamp(canvas_h / 720, 1, 4);
+}
+
 pub const InitError = std.mem.Allocator.Error || error{
     /// canvas_w or canvas_h is zero.
     InvalidCanvas,
@@ -321,6 +332,30 @@ test "pointer: sprite is a deterministic ARGB arrow" {
     }
     try testing.expectEqual(@as(u32, 112), opaque_count);
     try testing.expectEqual(@as(u32, 65), white_count);
+}
+
+test "pointer: scaleForCanvasHeight grows the sprite for HiDPI canvases" {
+    try testing.expectEqual(@as(u32, 1), scaleForCanvasHeight(480));
+    try testing.expectEqual(@as(u32, 1), scaleForCanvasHeight(768));
+    try testing.expectEqual(@as(u32, 1), scaleForCanvasHeight(1080));
+    try testing.expectEqual(@as(u32, 2), scaleForCanvasHeight(1440));
+    try testing.expectEqual(@as(u32, 3), scaleForCanvasHeight(2160));
+    try testing.expectEqual(@as(u32, 4), scaleForCanvasHeight(4320)); // capped
+}
+
+test "pointer: scaled sprite is an integer-multiple arrow" {
+    const a = testing.allocator;
+    var p = try Pointer.init(a, 3840, 2160, .{ .scale = scaleForCanvasHeight(2160) });
+    defer p.deinit();
+    const s = p.sprite();
+    try testing.expectEqual(@as(u32, 36), s.width);
+    try testing.expectEqual(@as(u32, 57), s.height);
+    // Tip stays the hotspot; a base fill pixel (1,2) scales to (3,6).
+    try testing.expectEqual(outline_color, s.get(0, 0));
+    try testing.expectEqual(fill_color, s.get(3, 6));
+    // Bounds reflect the scaled sprite.
+    p.motion(100, 100, 0);
+    try testing.expectEqual(Damage{ .x = 100, .y = 100, .w = 36, .h = 57 }, p.bounds());
 }
 
 test "pointer: motion clamps to canvas bounds and shows" {

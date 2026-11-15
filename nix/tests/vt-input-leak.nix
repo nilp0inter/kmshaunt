@@ -18,6 +18,12 @@
 # goes away), so without the resume_ xkb-modifier reset every key typed after
 # the switch would carry stale Ctrl+Alt and never reach the shell.
 #
+# The held-chord subtest regresses the other half of the resume re-sync:
+# switching TO kmshaunt while still holding Ctrl+Alt (the kernel handled the
+# chord on the other VT) must keep those modifiers depressed, so a subsequent
+# Ctrl+Alt+F2 switches away again. A blind reset-to-zero on resume clears the
+# stale modifiers but breaks this held-chord case and traps the user.
+#
 # Run:
 #   nix build --impure --expr \
 #     'let f = builtins.getFlake (toString ./.); \
@@ -37,6 +43,10 @@ in
 pkgs.testers.runNixOSTest {
   name = "kmshaunt-vt-input-leak";
   enableOCR = true;
+  # QMP input-send-event uses nested event structures that the driver's
+  # `dict[str, str]` send() annotation and Optional qmp_client do not model.
+  skipTypeCheck = true;
+  skipLint = true;
   nodes.machine =
     { ... }:
     {
@@ -93,10 +103,46 @@ pkgs.testers.runNixOSTest {
 
     with subtest("input still works after returning"):
         # Test input DELIVERY directly via a marker file, independent of the
-        # render/DRM-master path. Regresses the resume_ xkb-modifier reset:
-        # without it the dropped Ctrl/Alt releases leave every key stuck with
-        # stale modifiers, so this command never reaches the shell.
+        # render/DRM-master path. Regresses the resume_ physical key re-sync:
+        # the dropped Ctrl/Alt releases must not leave every key stuck with
+        # stale modifiers, so this command must reach the shell.
         machine.send_chars("touch /tmp/afterok\n")
         machine.wait_until_succeeds("test -e /tmp/afterok", timeout=60)
+
+    with subtest("held Ctrl+Alt switch chord survives: can switch away again"):
+        # Regression: switch TO kmshaunt while still holding Ctrl+Alt (the
+        # kernel handled the chord on tty2), then tap F2 with the chord
+        # still held. The resume re-sync must keep the physically-held
+        # modifiers; a blind reset leaves F2 with mods=0 and the user
+        # trapped on kmshaunt's VT.
+        machine.send_key("ctrl-alt-f2")
+        machine.wait_until_succeeds("test $(cat /sys/class/tty/tty0/active) = tty2")
+        time.sleep(1.0)
+
+        def key(qcode, down):
+            machine.qmp_client.send("input-send-event", {
+                "events": [
+                    {"type": "key", "data": {
+                        "down": down,
+                        "key": {"type": "qcode", "data": qcode},
+                    }},
+                ]
+            })
+
+        # Hold Ctrl+Alt, press F1, release ONLY F1: the switch to tty1
+        # happens with the chord still physically held (the user's case).
+        key("ctrl", True)
+        key("alt", True)
+        key("f1", True)
+        machine.wait_until_succeeds("test $(cat /sys/class/tty/tty0/active) = tty1")
+        time.sleep(1.0)
+        key("f1", False)
+        # Still holding Ctrl+Alt: tap F2. This must leave kmshaunt.
+        key("f2", True)
+        key("f2", False)
+        machine.wait_until_succeeds(
+            "test $(cat /sys/class/tty/tty0/active) = tty2", timeout=10)
+        key("ctrl", False)
+        key("alt", False)
   '';
 }

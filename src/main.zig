@@ -1134,16 +1134,20 @@ const Console = struct {
             self.shadow = try video.Framebuffer.create(self.alloc, canvas.width, canvas.height, .xrgb8888, null);
         }
         // The software pointer is canvas-space: rebuild it when the canvas
-        // size changes (zoom/hotplug); pure rotations keep it. Init failure
-        // is non-fatal — the console works without a pointer. Every caller
-        // sets full_redraw, which erases any sprite left in the back buffers.
+        // size changes (zoom/hotplug); pure rotations keep it. The sprite scale
+        // tracks the canvas height so the arrow stays usable on HiDPI panels.
+        // Init failure is non-fatal — the console works without a pointer. Every
+        // caller sets full_redraw, which erases any sprite left in the back
+        // buffers.
         const ptr_stale = if (self.pointer) |*p|
             p.canvas_w != canvas.width or p.canvas_h != canvas.height
         else
             true;
         if (ptr_stale) {
             if (self.pointer) |*p| p.deinit();
-            self.pointer = pointer.Pointer.init(self.alloc, canvas.width, canvas.height, .{}) catch |err| blk: {
+            self.pointer = pointer.Pointer.init(self.alloc, canvas.width, canvas.height, .{
+                .scale = pointer.scaleForCanvasHeight(canvas.height),
+            }) catch |err| blk: {
                 log.warn("pointer init: {t}", .{err});
                 break :blk null;
             };
@@ -1553,9 +1557,9 @@ const Console = struct {
     /// DrmFrame selecting the connector (M5.4). The 1:1 unrotated full-canvas
     /// case -- including an integer letterbox offset -- uses the band-limited
     /// NT blit shifted by the offset and repaints only the static letterbox
-    /// bands; scaled/rotated/fractional viewports clear the letterbox and use
-    /// blitViewport with row-band physical damage (Plan.damage), or a full
-    /// frame on full_redraw.
+    /// bands; scaled/rotated/fractional viewports blit only the damaged row
+    /// bands through the plan (blitViewportBands) with row-band physical damage
+    /// (Plan.damage), or a full frame on full_redraw / unmergeable damage.
     fn present(self: *Console, backend: anytype, plan: layout.Plan, prev_damage: *sess.DamageList) void {
         const shadow = &self.shadow.?;
         const fb = backend.beginFrame() catch |err| {
@@ -1603,15 +1607,32 @@ const Console = struct {
                 return;
             }
         }
-        // Viewport path: clear the letterbox, paint the rotated/scaled window.
-        fb.fill(0);
-        render.blitViewport(fb.*, shadow.*, plan);
-        self.compositePointer(fb, plan, 0, 0, false);
+        // Viewport path (fractional letterbox, scaled or rotated): paint the
+        // window through the plan. A full redraw clears the letterbox and blits
+        // everything; incremental frames blit only the damaged row bands
+        // (current + previous, for double-buffer staleness) so a pointer move
+        // does not fill + repaint the whole canvas. The letterbox is static
+        // black once a buffer is fully painted and is never written by the band
+        // blit or the pointer, so it needs no per-frame clear.
         if (self.full_redraw) {
+            fb.fill(0);
+            render.blitViewport(fb.*, shadow.*, plan);
+            self.compositePointer(fb, plan, 0, 0, false);
             self.setPrevDamage(prev_damage, &.{.{ .x = 0, .y = 0, .w = shadow.width, .h = shadow.height }});
             backend.endFrame(&.{}) catch |err| log.warn("endFrame: {t}", .{err});
             return;
         }
+        if (!self.blitViewportBands(fb, shadow, plan, prev_damage)) {
+            // Unmergeable damage: repaint the whole viewport and mark the next
+            // frame full so the other back buffer is repainted too.
+            fb.fill(0);
+            render.blitViewport(fb.*, shadow.*, plan);
+            self.compositePointer(fb, plan, 0, 0, false);
+            self.setPrevDamage(prev_damage, &.{.{ .x = 0, .y = 0, .w = shadow.width, .h = shadow.height }});
+            backend.endFrame(&.{}) catch |err| log.warn("endFrame: {t}", .{err});
+            return;
+        }
+        self.compositePointer(fb, plan, 0, 0, false);
         self.phys_damage.clearRetainingCapacity();
         const cell = layout.Cell{ .w = self.cell.cell_w, .h = self.cell.cell_h };
         for (self.damage.items) |r| {
@@ -1740,6 +1761,60 @@ const Console = struct {
             self.blitBand(fb, shadow, band[0], band[1] - band[0], dx, dy);
         }
         self.setPrevDamage(prev_damage, self.damage.items);
+    }
+
+    /// Band-limited viewport blit: merge this frame's damage with the previous
+    /// frame's (the back buffer is two frames stale) into full-width row bands
+    /// and repaint only those through the plan. When the merged bands span the
+    /// whole canvas the buffer is (re)initialized -- clear the letterbox and
+    /// blit the full viewport -- which also covers the frame after a full_redraw
+    /// (its prev_damage is the full canvas), so both back buffers get a full
+    /// paint. Returns false when the damage is not mergeable into bands, so the
+    /// caller falls back to a full repaint. Mirrors blitShadowBands' merging.
+    fn blitViewportBands(
+        self: *Console,
+        fb: *video.Framebuffer,
+        shadow: *const video.Framebuffer,
+        plan: layout.Plan,
+        prev_damage: *sess.DamageList,
+    ) bool {
+        var iv: [256][2]u32 = undefined;
+        var n: usize = 0;
+        for (self.damage.items) |d| {
+            if (!bandInsert(&iv, &n, d, shadow.width)) return false;
+        }
+        for (prev_damage.items) |d| {
+            if (!bandInsert(&iv, &n, d, shadow.width)) return false;
+        }
+        if (n == 0) return true;
+        // Insertion sort by y0 (n is small), then merge in place.
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            const band = iv[i];
+            var j: usize = i;
+            while (j > 0 and iv[j - 1][0] > band[0]) : (j -= 1) {
+                iv[j] = iv[j - 1];
+            }
+            iv[j] = band;
+        }
+        var m: usize = 0;
+        for (iv[0..n]) |band| {
+            if (m > 0 and band[0] <= iv[m - 1][1]) {
+                iv[m - 1][1] = @max(iv[m - 1][1], band[1]);
+            } else {
+                iv[m] = band;
+                m += 1;
+            }
+        }
+        if (m == 1 and iv[0][0] == 0 and iv[0][1] == shadow.height) {
+            fb.fill(0);
+            render.blitViewport(fb.*, shadow.*, plan);
+            return true;
+        }
+        for (iv[0..m]) |band| {
+            render.blitViewportBand(fb.*, shadow.*, plan, band[0], band[1]);
+        }
+        return true;
     }
 
     /// Copy full-width shadow rows [y, y+h) into the back buffer at the

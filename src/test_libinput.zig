@@ -500,6 +500,16 @@ fn nullSink(userdata: usize, event: session.InputEvent) void {
     _ = event;
 }
 
+/// Injected physical key state for the resume re-sync (the real source
+/// reads EVIOCGKEY on evdev fds, which do not exist here). Tests set the
+/// codes the "device" reports held across the suspend/resume.
+var fake_physical_keys: []const u32 = &.{};
+fn fakePhysicalKeys(buf: []u32) usize {
+    const n = @min(fake_physical_keys.len, buf.len);
+    @memcpy(buf[0..n], fake_physical_keys[0..n]);
+    return n;
+}
+
 /// Heap-allocated so every pointer handed to the Input (sink userdata,
 /// fake, keymap, cfg) stays stable.
 const Harness = struct {
@@ -1072,6 +1082,123 @@ test "suspend/resume: dropped VT-switch modifier releases are cleared on resume"
     try testing.expect(e.key.mods == 0);
 }
 
+test "suspend/resume: physically held modifiers survive the re-sync (VT-switch chord)" {
+    // Regression (nix/tests/vt-input-leak.nix "held Ctrl+Alt switch chord
+    // survives"): the user switches TO kmshaunt with Ctrl+Alt+F1 and keeps
+    // holding Ctrl+Alt. Those presses happened while the seat was inactive
+    // (never seen as events); resume_ must re-sync them from the physical
+    // key state so the next Ctrl+Alt+Fn switches away again. A blind
+    // reset-to-zero drops them and traps the user on the VT.
+    const h = try Harness.init(.{});
+    defer h.deinit();
+
+    // Ctrl+Alt go down while the seat is active, then the seat deactivates
+    // with the chord still physically held (no releases ever arrive).
+    h.fake.pushKey(kt.key_code.key_leftctrl, true);
+    h.fake.pushKey(kt.key_code.key_leftalt, true);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 2), h.rec.entries.items.len);
+    try h.input.suspend_();
+
+    // The device reports the chord still held across the resume.
+    fake_physical_keys = &.{ kt.key_code.key_leftctrl, kt.key_code.key_leftalt };
+    defer fake_physical_keys = &.{};
+    h.input.physical_keys = fakePhysicalKeys;
+    try h.input.resume_();
+
+    // The re-sync emits no key events of its own.
+    try testing.expectEqual(@as(usize, 2), h.rec.entries.items.len);
+
+    // F2 tapped with the chord held carries Ctrl+Alt — exactly what
+    // Console.onInput matches to call switchVt.
+    h.fake.pushKey(kt.key_code.key_f2, true);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 3), h.rec.entries.items.len);
+    const e = h.rec.last();
+    try expectKey(e, .f2, 1, null);
+    try testing.expect(e.key.mods & (kt.mod_ctrl | kt.mod_alt) == (kt.mod_ctrl | kt.mod_alt));
+
+    // Releasing the chord clears the modifiers again (no stuck state).
+    h.fake.pushKey(kt.key_code.key_leftctrl, false);
+    h.fake.pushKey(kt.key_code.key_leftalt, false);
+    try h.input.dispatch();
+    h.fake.pushKey(kt.key_code.key_a, true);
+    try h.input.dispatch();
+    const a = h.rec.last();
+    try expectKey(a, .a, 1, "a");
+    try testing.expect(a.key.mods == 0);
+}
+
+test "suspend/resume: re-sync clears released keys and keeps held ones" {
+    // The physical key state is authoritative in BOTH directions: keys
+    // released while the seat was away must go, keys still held must stay.
+    const h = try Harness.init(.{});
+    defer h.deinit();
+
+    // xkb state: Ctrl+Alt+Shift depressed.
+    h.fake.pushKey(kt.key_code.key_leftctrl, true);
+    h.fake.pushKey(kt.key_code.key_leftalt, true);
+    h.fake.pushKey(kt.key_code.key_leftshift, true);
+    try h.input.dispatch();
+    try h.input.suspend_();
+
+    // Physical truth on resume: only Alt is still held (Ctrl and Shift
+    // were released while the seat was away; those releases were dropped).
+    fake_physical_keys = &.{kt.key_code.key_leftalt};
+    defer fake_physical_keys = &.{};
+    h.input.physical_keys = fakePhysicalKeys;
+    try h.input.resume_();
+
+    h.fake.pushKey(kt.key_code.key_a, true);
+    try h.input.dispatch();
+    const e = h.rec.last();
+    try testing.expect(e == .key);
+    try testing.expect(e.key.mods & kt.mod_alt != 0);
+    try testing.expect(e.key.mods & (kt.mod_ctrl | kt.mod_shift) == 0);
+}
+
+test "suspend/resume: re-sync rebuilds right-modifier side bits" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    try h.input.suspend_();
+
+    // Right Ctrl held across the switch: the side bit must come back too
+    // (updateMask-style clears lose the physical right-key tracking).
+    fake_physical_keys = &.{kt.key_code.key_rightctrl};
+    defer fake_physical_keys = &.{};
+    h.input.physical_keys = fakePhysicalKeys;
+    try h.input.resume_();
+
+    h.fake.pushKey(kt.key_code.key_a, true);
+    try h.input.dispatch();
+    const e = h.rec.last();
+    try testing.expect(e == .key);
+    try testing.expect(e.key.mods & kt.mod_ctrl != 0);
+    try testing.expect(e.key.mods & kt.mod_ctrl_side != 0);
+}
+
+test "suspend/resume: re-sync preserves Caps Lock" {
+    // Locks are not physical key state: Caps Lock stays locked across the
+    // switch even though no key is held.
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    h.fake.pushKey(kt.key_code.key_capslock, true);
+    h.fake.pushKey(kt.key_code.key_capslock, false);
+    try h.input.dispatch();
+    try h.input.suspend_();
+
+    fake_physical_keys = &.{};
+    defer fake_physical_keys = &.{};
+    h.input.physical_keys = fakePhysicalKeys;
+    try h.input.resume_();
+
+    h.fake.pushKey(kt.key_code.key_a, true);
+    try h.input.dispatch();
+    const e = h.rec.last();
+    try expectKey(e, .a, 1, "A");
+    try testing.expect(e.key.mods & kt.mod_caps_lock != 0);
+}
+
 test "pointer: relative motion accumulates; absolute reports device position" {
     const h = try Harness.init(.{});
     defer h.deinit();
@@ -1118,6 +1245,37 @@ test "pointer: setScreenSize transforms absolute coords to pixels" {
     try testing.expect(m.absolute);
     try testing.expectEqual(@as(f64, 500.0), m.x);
     try testing.expectEqual(@as(f64, 250.0), m.y);
+}
+
+test "pointer: relative motion clamps to the canvas; no edge drift" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    h.input.setScreenSize(100, 80);
+
+    // Accumulate toward the bottom-right; the position clamps to (99,79).
+    h.fake.pushMotion(200.0, 150.0);
+    try h.input.dispatch();
+    const m1 = h.rec.last().pointer_motion;
+    try testing.expect(!m1.absolute);
+    try testing.expectEqual(@as(f64, 99.0), m1.x);
+    try testing.expectEqual(@as(f64, 79.0), m1.y);
+
+    // A small reverse move responds immediately: the accumulator did not drift
+    // past the edge, so there is no excess motion to undo first.
+    h.fake.pushMotion(-10.0, -5.0);
+    try h.input.dispatch();
+    const m2 = h.rec.last().pointer_motion;
+    try testing.expectEqual(@as(f64, 89.0), m2.x);
+    try testing.expectEqual(@as(f64, 74.0), m2.y);
+    try testing.expectEqual(@as(f64, -10.0), m2.dx);
+    try testing.expectEqual(@as(f64, -5.0), m2.dy);
+
+    // Clamp at the top-left too.
+    h.fake.pushMotion(-500.0, -500.0);
+    try h.input.dispatch();
+    const m3 = h.rec.last().pointer_motion;
+    try testing.expectEqual(@as(f64, 0.0), m3.x);
+    try testing.expectEqual(@as(f64, 0.0), m3.y);
 }
 
 test "pointer: buttons carry position; double/triple click window per button" {

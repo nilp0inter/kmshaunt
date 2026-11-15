@@ -59,7 +59,7 @@
 //! | libinput event                    | InputEvent       | notes |
 //! |-----------------------------------|------------------|-------|
 //! | KEYBOARD_KEY (300)                | key / grab       | xkb processKey; grab match intercepts presses and repeats |
-//! | POINTER_MOTION (400)              | pointer_motion   | relative dx/dy; x/y accumulate from (0,0) |
+//! | POINTER_MOTION (400)              | pointer_motion   | relative dx/dy; x/y accumulate from (0,0), clamped to the canvas |
 //! | POINTER_MOTION_ABSOLUTE (401)     | pointer_motion   | absolute=true; x/y in device space (mm), dx/dy vs previous position |
 //! | POINTER_BUTTON (402)              | pointer_button   | click_count from a 400 ms window (1/2/3, capped) |
 //! | POINTER_SCROLL_WHEEL (404)        | pointer_axis     | get_axis_value, natural-scrolling invert |
@@ -183,10 +183,12 @@
 //! session owns the console, key repeat is disarmed, and events queued
 //! before the switch are dropped. `Input.resume_` (on activation) re-opens
 //! the devices and drains the DEVICE_ADDED queue. `dispatch` is a no-op
-//! while suspended. Because the dropped events include the VT-switch
-//! chord's modifier releases, `resume_` also clears the stale xkb modifier
-//! state (keeping the active layout) and any in-progress Compose sequence,
-//! so keys typed after the switch are not stuck with the old Ctrl+Alt.
+//! while suspended. The dropped events include the VT-switch chord's
+//! modifier releases, but the user may also still HOLD the chord that
+//! switched to us, so `resume_` re-syncs the xkb state with the physical
+//! key state (EVIOCGKEY on the open evdev fds) instead of resetting blind:
+//! stale modifiers are cleared, held ones survive (Ctrl+Alt+Fn must keep
+//! switching), and any in-progress Compose sequence is reset.
 //! The sink owner additionally gates on seat ownership
 //! (Console.onInput drops events while the seat is inactive) so the
 //! no-input-while-inactive invariant holds even if a backend cannot
@@ -613,6 +615,11 @@ pub const Input = struct {
     clicks: [mouse_button_count]ClickState = @splat(.{}),
     /// Monotonic millisecond clock; injectable for hermetic click tests.
     now_ms: *const fn () i64 = monotonicNowMs,
+    /// Physical key-state source for the resume re-sync: fills the buffer
+    /// with the evdev codes currently depressed and returns the count. The
+    /// default queries EVIOCGKEY on the evdev fds libinput opened through
+    /// `interface`; hermetic tests inject a fake (no real devices there).
+    physical_keys: *const fn (buf: []u32) usize = realPhysicalKeys,
 
     repeat_timer: ?RepeatTimerOps = null,
     repeat_cfg: xkb.RepeatConfig,
@@ -775,13 +782,17 @@ pub const Input = struct {
         if (!self.suspended) return;
         if (self.ops.resume_(self.li) < 0) return error.ResumeFailed;
         self.suspended = false;
-        // suspend_ dropped the VT-switch chord's modifier releases (Ctrl,
-        // Alt and Fn are released after the seat goes away), so the xkb
-        // state still holds them pressed. Clear the stale modifiers —
-        // keeping the active layout — and any half-finished Compose
-        // sequence before new events are delivered; otherwise every key
-        // typed after the switch would carry the old Ctrl+Alt.
-        self.state.updateMask(0, 0, 0, 0, 0, self.state.activeLayout());
+        // Re-sync the xkb state with the PHYSICAL key state. suspend_
+        // dropped the VT-switch chord's releases, so stale modifiers must
+        // go; but the user may still hold Ctrl+Alt from the chord that
+        // switched TO us, and those must stay depressed or Ctrl+Alt+Fn
+        // can never switch away again. libinput discards its key-state
+        // sync on resume (evdev_device_resume: "Our device is in a neutral
+        // state already"), so query the devices directly (EVIOCGKEY)
+        // instead of resetting blind.
+        var down: [key_max + 1]u32 = undefined;
+        const n = self.physical_keys(&down);
+        self.state.resyncPhysical(down[0..n]);
         if (self.compose) |cp| cp.reset();
         try self.dispatch();
     }
@@ -941,10 +952,18 @@ pub const Input = struct {
             self.ptr_x = x;
             self.ptr_y = y;
         } else {
-            dx = self.ops.pointer_get_dx(ev);
-            dy = self.ops.pointer_get_dy(ev);
-            self.ptr_x += dx;
-            self.ptr_y += dy;
+            // Relative device: accumulate the libinput deltas, but clamp the
+            // running position to the canvas. Without the clamp the
+            // accumulator drifts arbitrarily far past an edge, so the pointer
+            // sticks there and needs excess reverse motion to come back (the
+            // model clamps only the displayed position, not this accumulator).
+            // Report the effective (post-clamp) delta so x/y and dx/dy agree.
+            const old_x = self.ptr_x;
+            const old_y = self.ptr_y;
+            self.ptr_x = clampPointerAxis(old_x + self.ops.pointer_get_dx(ev), self.screen_w);
+            self.ptr_y = clampPointerAxis(old_y + self.ops.pointer_get_dy(ev), self.screen_h);
+            dx = self.ptr_x - old_x;
+            dy = self.ptr_y - old_y;
         }
         self.emit(.{ .pointer_motion = .{
             .dx = dx,
@@ -955,8 +974,22 @@ pub const Input = struct {
         } });
     }
 
-    /// Set the output size in pixels so absolute (tablet) coordinates are
-    /// transformed to framebuffer pixels (M5.7 absolute-pointer transform).
+    /// Clamp one accumulated pointer coordinate to [0, extent - 1]. An extent
+    /// of 0 means the canvas size is not yet known, so the value passes
+    /// through unchanged (relative motion then accumulates unbounded, as the
+    /// hermetic tests expect). NaN parks at the origin so a poisoned delta
+    /// cannot run the pointer away.
+    fn clampPointerAxis(v: f64, extent: u32) f64 {
+        if (extent == 0) return v;
+        if (std.math.isNan(v)) return 0;
+        const max: f64 = @floatFromInt(extent - 1);
+        return @max(0.0, @min(v, max));
+    }
+
+    /// Set the output size in pixels: absolute (tablet) coordinates are
+    /// transformed to framebuffer pixels (M5.7 absolute-pointer transform),
+    /// and relative motion is clamped to it so the accumulator cannot drift
+    /// past the canvas edge.
     pub fn setScreenSize(self: *Input, w: u32, h: u32) void {
         self.screen_w = w;
         self.screen_h = h;
@@ -1061,13 +1094,122 @@ fn openRestricted(path: [*c]const u8, flags: c_int, user_data: ?*anyopaque) call
     const o: linux.O = @bitCast(@as(u32, @bitCast(flags)));
     const rc = linux.openat(linux.AT.FDCWD, path_z, o, 0);
     const e = linux.errno(rc);
-    if (e == .SUCCESS) return @intCast(rc);
+    if (e == .SUCCESS) {
+        trackFd(@intCast(rc));
+        return @intCast(rc);
+    }
     return -@as(c_int, @intCast(@intFromEnum(e)));
 }
 
 fn closeRestricted(fd: c_int, user_data: ?*anyopaque) callconv(.c) void {
     _ = user_data;
+    untrackFd(fd);
     _ = linux.close(fd);
+}
+
+/// EVIOCGKEY bitmap size: KEY_MAX (0x2ff, linux/input-event-codes.h) + 1
+/// bits, rounded up to bytes.
+const key_max: u32 = 0x2ff;
+const key_bitmap_len = (key_max + 1 + 7) / 8;
+
+/// EVIOCGKEY(len) = _IOC(_IOC_READ, 'E', 0x18, len): the global key-state
+/// bitmap of an evdev device (linux/input.h). NOT 0x06, which is EVIOCGNAME.
+const eviocgkey: u32 = linux.IOCTL.IOR('E', 0x18, [key_bitmap_len]u8);
+
+/// EVIOCGBIT(ev, len) = _IOC(_IOC_READ, 'E', 0x20 + ev, len): the device's
+/// capability bitmap for event type `ev` (0 = the event-type bitmap itself).
+const eviocgbit_ev: u32 = linux.IOCTL.IOR('E', 0x20, [8]u8);
+const eviocgbit_key: u32 = linux.IOCTL.IOR('E', 0x21, [key_bitmap_len]u8);
+
+comptime {
+    std.debug.assert(eviocgkey == 0x80604518);
+}
+
+fn bitSet(bits: []const u8, code: u32) bool {
+    return bits[code / 8] & (@as(u8, 1) << @intCast(code % 8)) != 0;
+}
+
+/// Whether the evdev fd is a keyboard: it must report EV_KEY and the letter
+/// keys Q/A/Z. Non-keyboard devices (mice, tablets, ACPI buttons) also answer
+/// EVIOCGKEY, but their bitmaps carry button/tool codes — unioning those into
+/// the key state would press spurious modifiers on resume.
+fn isKeyboard(fd: std.posix.fd_t) bool {
+    var evbits: [8]u8 = @splat(0);
+    if (linux.errno(linux.ioctl(fd, eviocgbit_ev, @intFromPtr(&evbits))) != .SUCCESS) return false;
+    if (!bitSet(&evbits, 1)) return false; // EV_KEY
+    var keybits: [key_bitmap_len]u8 = @splat(0);
+    if (linux.errno(linux.ioctl(fd, eviocgbit_key, @intFromPtr(&keybits))) != .SUCCESS) return false;
+    return bitSet(&keybits, kt.key_code.key_q) and
+        bitSet(&keybits, kt.key_code.key_a) and
+        bitSet(&keybits, kt.key_code.key_z);
+}
+
+/// evdev fds libinput opened through `interface`, tracked so `resume_` can
+/// query the physical key state (EVIOCGKEY): libinput exposes no device-fd
+/// getter. One Input per process (seat workers are separate processes), so
+/// a module-level table is safe. Fixed-size: a seat opens a handful of
+/// nodes; an fd that does not fit is simply not tracked (the resume re-sync
+/// then sees fewer devices, never a wrong key state).
+const max_tracked_fds = 64;
+var tracked_fds: [max_tracked_fds]std.posix.fd_t = @splat(-1);
+
+fn trackFd(fd: std.posix.fd_t) void {
+    for (&tracked_fds) |*slot| {
+        if (slot.* < 0) {
+            slot.* = fd;
+            return;
+        }
+    }
+}
+
+fn untrackFd(fd: std.posix.fd_t) void {
+    for (&tracked_fds) |*slot| {
+        if (slot.* == fd) {
+            slot.* = -1;
+            return;
+        }
+    }
+}
+
+/// Fill `buf` with the evdev codes physically depressed on the tracked
+/// devices (the EVIOCGKEY bitmaps unioned) and return the count. Devices
+/// that cannot be queried are skipped; no tracked device means an empty
+/// result, which makes the resume re-sync clear all stale modifiers.
+///
+/// EVIOCGKEY flushes pending EV_KEY events from the queried fd's queue
+/// (kernel evdev_handle_get_val), so this MUST run immediately after
+/// libinput_resume — which drained the fds — and before dispatch: the
+/// queue is empty then, and the bitmap is the physical truth. (kmscon
+/// reverted its EVIOCGKEY re-sync, e083e3c, because its async wake-up
+/// raced queued events; the synchronous drain-query-dispatch order here
+/// leaves no such window.)
+fn realPhysicalKeys(buf: []u32) usize {
+    var bitmap: [key_bitmap_len]u8 = @splat(0);
+    var any = false;
+    for (tracked_fds) |fd| {
+        if (fd < 0) continue;
+        if (!isKeyboard(fd)) continue;
+        var b: [key_bitmap_len]u8 = @splat(0);
+        const rc = linux.ioctl(fd, eviocgkey, @intFromPtr(&b));
+        if (linux.errno(rc) != .SUCCESS) continue;
+        // KEY_RESERVED (code 0) is never a real key: a device reporting it
+        // depressed is returning an uninitialized/garbage key bitmap (e.g. a
+        // secondary raw keyboard node). Skip it rather than press its keys.
+        if (b[0] & 1 != 0) continue;
+        for (&bitmap, b) |*dst, src| dst.* |= src;
+        any = true;
+    }
+    if (!any) return 0;
+    var n: usize = 0;
+    for (bitmap, 0..) |byte, i| {
+        var bits = byte;
+        while (bits != 0) : (bits &= bits - 1) {
+            if (n == buf.len) return n;
+            buf[n] = @intCast(i * 8 + @as(usize, @ctz(bits)));
+            n += 1;
+        }
+    }
+    return n;
 }
 
 fn monotonicNowMs() i64 {

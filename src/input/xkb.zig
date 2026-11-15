@@ -495,6 +495,39 @@ pub const State = struct {
         self.right_down = 0;
     }
 
+    /// Rebuild the depressed-key state from the physical key set (seat
+    /// resume): keys released while the seat was away are cleared, keys
+    /// still physically held (the VT-switch chord) stay depressed. Locked
+    /// modifiers (Caps/Num/Scroll Lock) and the locked layout survive;
+    /// latched state is dropped. Produces no key events. On allocation
+    /// failure falls back to clearing all transient state, so a resume
+    /// always drops stale modifiers at minimum.
+    pub fn resyncPhysical(self: *State, down_codes: []const u32) void {
+        const fresh = c.xkb_state_new(self.keymap.map) orelse {
+            self.updateMask(0, 0, 0, 0, 0, self.activeLayout());
+            return;
+        };
+        for (down_codes) |code| {
+            _ = c.xkb_state_update_key(fresh, code +| evdev_offset, c.XKB_KEY_DOWN);
+        }
+        // Restore the locks the old state held; latches are transient and
+        // do not survive the switch. Depressed mods/layout come from the
+        // physical keys just fed in.
+        _ = c.xkb_state_update_mask(
+            fresh,
+            c.xkb_state_serialize_mods(fresh, c.XKB_STATE_MODS_DEPRESSED),
+            0,
+            c.xkb_state_serialize_mods(self.state, c.XKB_STATE_MODS_LOCKED),
+            c.xkb_state_serialize_layout(fresh, c.XKB_STATE_LAYOUT_DEPRESSED),
+            0,
+            c.xkb_state_serialize_layout(self.state, c.XKB_STATE_LAYOUT_LOCKED),
+        );
+        c.xkb_state_unref(self.state);
+        self.state = fresh;
+        self.right_down = 0;
+        for (down_codes) |code| self.trackRightModifier(code, true);
+    }
+
     /// Lock a layout of a multi-layout keymap (layout switching without a
     /// reload). Preserves the modifier state; depressed/latched layout are
     /// cleared. `layout` is a keymap layout index, not an RMLVO name.
