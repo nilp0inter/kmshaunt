@@ -1761,8 +1761,12 @@ pub const Drm3d = struct {
     /// frame: full upload, full clear, full-screen quad. Otherwise (M8.2)
     /// damage-only: sub-upload each rect, then scissor-clear + draw a quad
     /// per rect, so clear/upload/draw touch only damaged pixels. xrgb8888
-    /// memory is B,G,R,X, so it uploads as GL_BGRA (no swizzle); the clear
-    /// keeps the blend result independent of the undefined X byte.
+    /// memory is B,G,R,X, so it uploads as GL_BGRA (no swizzle) and the
+    /// unused X byte arrives as alpha 0. The staging buffer is already the
+    /// composited frame, so it is presented with blending off: SRC_ALPHA
+    /// blending would discard every pixel whose X byte is 0 (all CPU-drawn
+    /// content, i.e. the whole terminal). Blending is restored afterwards for
+    /// the transparent GL hooks (drawCells/drawImage).
     fn presentStaging(self: *Drm3d, rects: ?[]const Damage) !void {
         if (rects) |rs| {
             if (rs.len == 0) return; // nothing changed: the back buffer is current
@@ -1796,6 +1800,10 @@ pub const Drm3d = struct {
         g.uniform4f(ctx, q.u_color, 1, 1, 1, 1);
         g.uniform1f(ctx, q.u_opacity, 1.0);
         g.clear_color(ctx, 0, 0, 0, 1);
+        // Opaque copy: the X byte is padding, not coverage (see the doc
+        // comment). Restore the blend state for the GL hooks.
+        g.disable(ctx, gl.BLEND);
+        defer g.enable(ctx, gl.BLEND);
 
         if (rects) |rs| {
             for (rs) |r| {
@@ -2641,6 +2649,10 @@ const FakeGpu = struct {
     uploads: std.ArrayList(TexUpload) = .empty,
     draw_count: usize = 0,
     scissor_enabled: bool = false,
+    /// GL_BLEND state (initGl enables it; the model starts enabled).
+    blend_enabled: bool = true,
+    /// Blend state active at each draw: false for the opaque staging copy.
+    draw_blend: std.ArrayList(bool) = .empty,
     scissor_boxes: std.ArrayList(ScissorBox) = .empty,
     clears: std.ArrayList(ClearRec) = .empty,
     /// Scissor box active at each draw (null = scissor disabled).
@@ -2690,6 +2702,7 @@ const FakeGpu = struct {
         self.scissor_boxes.deinit(self.allocator);
         self.clears.deinit(self.allocator);
         self.draw_boxes.deinit(self.allocator);
+        self.draw_blend.deinit(self.allocator);
         self.dst_rects.deinit(self.allocator);
         self.calls.deinit(self.allocator);
     }
@@ -3004,6 +3017,7 @@ const FakeGpu = struct {
         self.record(.gl_draw);
         self.draw_count += 1;
         self.draw_boxes.append(self.allocator, self.currentScissor()) catch @panic("fake: oom");
+        self.draw_blend.append(self.allocator, self.blend_enabled) catch @panic("fake: oom");
     }
     fn currentScissor(self: *const FakeGpu) ?ScissorBox {
         if (!self.scissor_enabled or self.scissor_boxes.items.len == 0) return null;
@@ -3068,11 +3082,13 @@ const FakeGpu = struct {
         const self = cast(ctx);
         self.record(.gl_enable);
         if (cap == gl.SCISSOR_TEST) self.scissor_enabled = true;
+        if (cap == gl.BLEND) self.blend_enabled = true;
     }
     fn disable(ctx: ?*anyopaque, cap: u32) void {
         const self = cast(ctx);
         self.record(.gl_disable);
         if (cap == gl.SCISSOR_TEST) self.scissor_enabled = false;
+        if (cap == gl.BLEND) self.blend_enabled = false;
     }
     fn scissor(ctx: ?*anyopaque, x: i32, y: i32, w: i32, h: i32) void {
         const self = cast(ctx);
@@ -3509,6 +3525,44 @@ test "damage: empty damage presents the full frame (M8.2 contract)" {
     try testing.expect(clr.scissor == null);
     try testing.expectEqual([4]f32{ 0, 0, 1920, 1080 }, gpu.dst_rects.items[gpu.dst_rects.items.len - 1]);
     try testing.expect(d.flipPending());
+}
+
+test "present: staging is drawn unblended (X byte is padding), GL hooks still blend" {
+    const a = testing.allocator;
+    var drm: FakeDrm = .{ .allocator = a };
+    defer drm.deinit();
+    var gpu: FakeGpu = .{ .allocator = a };
+    defer gpu.deinit();
+    const d = try setupActive(a, &drm, &gpu);
+    defer d.deinit();
+
+    // initGl enables blending for the transparent GL hooks.
+    try testing.expect(gpu.blend_enabled);
+
+    // A CPU-rendered frame: staging pixels are 0x00RRGGBB, so BGRA alpha
+    // reads 0. With SRC_ALPHA blending the whole terminal would vanish.
+    _ = try d.beginFrame();
+    try d.endFrame(&.{}); // full present
+    try testing.expectEqual(false, gpu.draw_blend.items[gpu.draw_blend.items.len - 1]);
+    try testing.expect(gpu.blend_enabled); // restored after the present
+
+    drm.queueFlipEvent(41, Drm3d.flip_cookie);
+    try d.readEvents();
+
+    const r = Damage{ .x = 100, .y = 200, .w = 300, .h = 50 };
+    _ = try d.beginFrame();
+    try d.endFrame(&.{r}); // damage present: still unblended
+    try testing.expectEqual(false, gpu.draw_blend.items[gpu.draw_blend.items.len - 1]);
+    try testing.expect(gpu.blend_enabled);
+
+    drm.queueFlipEvent(41, Drm3d.flip_cookie);
+    try d.readEvents();
+
+    // Transparent GL content keeps blending.
+    _ = try d.beginFrame();
+    const pixels: [64]u8 = @splat(0xFF);
+    try d.drawImage(.{ .width = 4, .height = 4, .pixels = &pixels }, .{ .x = 10, .y = 10, .w = 4, .h = 4 });
+    try testing.expectEqual(true, gpu.draw_blend.items[gpu.draw_blend.items.len - 1]);
 }
 
 test "damage: endFrame restricts upload, clear and draw to the damage rect" {
