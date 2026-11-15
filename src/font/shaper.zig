@@ -34,8 +34,8 @@
 //! ligature, or a base + combining marks) reports its first cell. `cell` is
 //! run-local: add `Run.start` to get the absolute grid index.
 //!
-//! Feature defaults (see `default_features`): `kern` ON, `liga` OFF (ROADMAP:
-//! ligatures are optional and default off). `calt` is left at HarfBuzz's
+//! Feature defaults (see `default_features`): `kern` ON, `liga` ON (matches
+//! ghostty shape/feature.zig). `calt` is left at HarfBuzz's
 //! built-in default (ON) -- we do not override it. Passing `features = null`
 //! uses the defaults; passing a slice uses EXACTLY that slice (full control),
 //! so a caller that wants to keep the defaults should prepend
@@ -233,11 +233,12 @@ pub fn tag(s: *const [4]u8) u32 {
         (@as(u32, s[2]) << 8) | @as(u32, s[3]);
 }
 
-/// Default features: kern ON, liga OFF. `calt` is intentionally absent so it
+/// Default features: kern ON, liga ON (ghostty shape/feature.zig
+/// default_features hardcodes liga=1). `calt` is intentionally absent so it
 /// keeps HarfBuzz's built-in default (ON). See the module comment.
 pub const default_features = [_]Feature{
     .{ .tag = tag("kern"), .value = 1 },
-    .{ .tag = tag("liga"), .value = 0 },
+    .{ .tag = tag("liga"), .value = 1 },
 };
 
 pub const ShapeError = error{
@@ -662,19 +663,19 @@ test "shaping: AV kerning changes advance vs unkerned" {
     try testing.expect(totalAdvance(kerned.glyphs) != totalAdvance(unkerned.glyphs));
 }
 
-test "shaping: fi ligature off -> 2 glyphs, +liga -> 1 glyph" {
+test "shaping: -liga -> 2 glyphs, default (+liga) -> 1 glyph" {
     if (comptime !builtin.link_libc) return error.SkipZigTest;
     var tf = try TestFont.init();
     defer tf.deinit();
 
     const cells = [_]CellDesc{ cell('f'), cell('i') };
 
-    const off = try tf.shape(&cells, null); // defaults: liga off
+    const liga_off = [_]Feature{.{ .tag = tag("liga"), .value = 0 }};
+    const off = try tf.shape(&cells, &liga_off);
     defer testing.allocator.free(off.glyphs);
     try testing.expectEqual(@as(usize, 2), off.glyphs.len);
 
-    const liga_on = [_]Feature{.{ .tag = tag("liga"), .value = 1 }};
-    const on = try tf.shape(&cells, &liga_on);
+    const on = try tf.shape(&cells, null); // defaults: liga on
     defer testing.allocator.free(on.glyphs);
     try testing.expectEqual(@as(usize, 1), on.glyphs.len);
     // The ligature belongs to the cluster's first cell.
@@ -791,11 +792,11 @@ test "feature: parse +liga / -liga / kern" {
     try testing.expectError(error.InvalidFeature, Feature.parse("not a feature!!"));
 }
 
-test "feature: default features are kern on, liga off" {
+test "feature: default features are kern on, liga on" {
     if (comptime !builtin.link_libc) return error.SkipZigTest;
     try testing.expectEqual(@as(usize, 2), default_features.len);
     try testing.expectEqual(tag("kern"), default_features[0].tag);
     try testing.expectEqual(@as(u32, 1), default_features[0].value);
     try testing.expectEqual(tag("liga"), default_features[1].tag);
-    try testing.expectEqual(@as(u32, 0), default_features[1].value);
+    try testing.expectEqual(@as(u32, 1), default_features[1].value);
 }
