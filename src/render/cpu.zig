@@ -1680,7 +1680,7 @@ pub const CpuRenderer = struct {
 
         if (flags.underline != .none) {
             const underline_color = resolveStyleColor(style.underlineColor(), null, opts.palette, fg);
-            const pos = deco.rowFromBaseline(baseline, clampI16(fm.underline_position));
+            const pos = deco.rowFromBaseline(baseline, clampI16(fm.underline_position)) + 1;
             const thickness: u16 = @intCast(@max(1, fm.underline_thickness));
             deco.drawUnderline(f.*, x_px, y_px, cw, ch, underlineStyle(flags.underline), underline_color, pos, thickness);
         }
