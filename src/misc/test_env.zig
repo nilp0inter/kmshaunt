@@ -47,19 +47,52 @@ pub fn pathEnv() []const u8 {
 /// Absolute path of `name`: searched in the directories of the process `PATH`
 /// in order, then in `/run/current-system/sw/bin`, `/usr/bin` and `/bin`. Null
 /// when no such entry exists.
+///
+/// Each distinct `name` gets its own cache slot, so two tools can be held at
+/// the same time (the returned slice is never overwritten while the process
+/// lives). The slots are keyed by the name at runtime on purpose: a static
+/// `var` declared inside this generic function is shared by every
+/// instantiation, which made the second tool resolve to the first one's path
+/// (the pty controlling-tty test ran `stty -o tty= -p $$` because `ps`
+/// answered the `stty` path).
 pub fn tool(comptime name: []const u8) ?[]const u8 {
-    // One cache per instantiation, so two tools can be held at the same time.
-    const Cache = struct {
-        var storage: [std.fs.max_path_bytes]u8 = undefined;
-        var value: ?[]const u8 = null;
-        var resolved: bool = false;
-    };
-    if (!Cache.resolved) {
-        Cache.value = resolveTool(name, &Cache.storage);
-        Cache.resolved = true;
+    for (&tool_slots) |*slot| {
+        if (!std.mem.eql(u8, slot.name, name)) continue;
+        if (!slot.resolved) {
+            slot.value = resolveTool(name, &slot.storage);
+            slot.resolved = true;
+        }
+        return slot.value;
     }
-    return Cache.value;
+    // First request for this name: claim a free slot.
+    for (&tool_slots) |*slot| {
+        if (slot.name.len != 0) continue;
+        slot.name = name;
+        slot.value = resolveTool(name, &slot.storage);
+        slot.resolved = true;
+        return slot.value;
+    }
+    // More distinct tools than slots (never happens: the suite asks for
+    // `stty` and `ps`): report "not found" rather than hand out a path
+    // that another name owns.
+    return null;
 }
+
+/// One resolved tool path. `value` points into `storage` and stays valid
+/// for the rest of the process.
+const ToolSlot = struct {
+    name: []const u8 = "",
+    storage: [std.fs.max_path_bytes]u8 = undefined,
+    value: ?[]const u8 = null,
+    resolved: bool = false,
+};
+
+const tool_slot_count = 8;
+
+var tool_slots: [tool_slot_count]ToolSlot = .{
+    .{}, .{}, .{}, .{},
+    .{}, .{}, .{}, .{},
+};
 
 fn resolveShell() []const u8 {
     if (envValue("KMSHAUNT_TEST_SH")) |value| {
@@ -122,4 +155,20 @@ fn envValue(name: [:0]const u8) ?[]const u8 {
 
 fn exists(path: [*:0]const u8) bool {
     return linux.errno(linux.faccessat(linux.AT.FDCWD, path, linux.F_OK, 0)) == .SUCCESS;
+}
+
+const testing = std.testing;
+
+test "tool keeps one path per name (regression: shared cache)" {
+    // The pty controlling-tty test resolves `ps` after the resize test
+    // resolved `stty`; a cache shared across instantiations handed the ps
+    // test the stty path, so the child ran `stty -o tty= -p $$` and the
+    // test failed with exit 1 instead of a pts/<N> reading.
+    const stty = tool("stty") orelse return error.SkipZigTest;
+    const ps = tool("ps") orelse return error.SkipZigTest;
+    try testing.expect(std.mem.endsWith(u8, stty, "/stty"));
+    try testing.expect(std.mem.endsWith(u8, ps, "/ps"));
+    // Repeated requests keep returning the same per-name answers.
+    try testing.expectEqualStrings(stty, tool("stty").?);
+    try testing.expectEqualStrings(ps, tool("ps").?);
 }
