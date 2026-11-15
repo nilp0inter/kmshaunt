@@ -510,29 +510,9 @@ pub const Pty = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const test_env = @import("test_env.zig");
 
-const test_path_env = "PATH=/run/current-system/sw/bin:/usr/bin:/bin";
 const default_reap_flags: u32 = std.posix.W.NOHANG | std.posix.W.UNTRACED;
-
-fn fileExistsZ(path: [*:0]const u8) bool {
-    return linux.errno(linux.faccessat(linux.AT.FDCWD, path, linux.F_OK, 0)) == .SUCCESS;
-}
-
-fn findSh() []const u8 {
-    if (fileExistsZ("/bin/sh")) return "/bin/sh";
-    if (fileExistsZ("/run/current-system/sw/bin/sh")) return "/run/current-system/sw/bin/sh";
-    return "sh";
-}
-
-fn findTool(comptime name: []const u8) ?[]const u8 {
-    const nixos = "/run/current-system/sw/bin/" ++ name;
-    if (fileExistsZ(nixos)) return nixos;
-    const usr = "/usr/bin/" ++ name;
-    if (fileExistsZ(usr)) return usr;
-    const bin = "/bin/" ++ name;
-    if (fileExistsZ(bin)) return bin;
-    return null;
-}
 
 fn sleepMs(ms: u64) void {
     const req = linux.timespec{
@@ -584,8 +564,8 @@ test "(a) spawn /bin/sh -c 'echo hello' -> parent reads 'hello'" {
 
     try pty.spawn(.{
         .allocator = testing.allocator,
-        .argv = &.{ findSh(), "-c", "echo hello" },
-        .env = &.{test_path_env},
+        .argv = &.{ test_env.shell(), "-c", "echo hello" },
+        .env = &.{test_env.pathEnv()},
     });
 
     var buf: [256]u8 = undefined;
@@ -603,8 +583,8 @@ test "(b) spawn /bin/sh -c 'exit 42' -> reap reports exited(42)" {
 
     try pty.spawn(.{
         .allocator = testing.allocator,
-        .argv = &.{ findSh(), "-c", "exit 42" },
-        .env = &.{test_path_env},
+        .argv = &.{ test_env.shell(), "-c", "exit 42" },
+        .env = &.{test_env.pathEnv()},
     });
 
     var buf: [64]u8 = undefined;
@@ -622,8 +602,8 @@ test "(c) env passing: MYVAR=kmshaunt replaces child environment" {
     // caller's environment list fully replaces the parent's environment.
     try pty.spawn(.{
         .allocator = testing.allocator,
-        .argv = &.{ findSh(), "-c", "printf '%s:%s' \"$MYVAR\" \"${HOME:-UNSET}\"" },
-        .env = &.{ "MYVAR=kmshaunt", test_path_env },
+        .argv = &.{ test_env.shell(), "-c", "printf '%s:%s' \"$MYVAR\" \"${HOME:-UNSET}\"" },
+        .env = &.{ "MYVAR=kmshaunt", test_env.pathEnv() },
     });
 
     var buf: [256]u8 = undefined;
@@ -655,11 +635,11 @@ test "(d) resize carries grid + pixels into getWinsize and child stty size" {
     try testing.expectEqual(@as(u16, 960), updated.xpixel);
     try testing.expectEqual(@as(u16, 640), updated.ypixel);
 
-    const stty_bin = findTool("stty") orelse "stty";
+    const stty_bin = test_env.tool("stty") orelse "stty";
     try pty.spawn(.{
         .allocator = testing.allocator,
         .argv = &.{ stty_bin, "size" },
-        .env = &.{test_path_env},
+        .env = &.{test_env.pathEnv()},
     });
 
     var buf: [128]u8 = undefined;
@@ -670,7 +650,7 @@ test "(d) resize carries grid + pixels into getWinsize and child stty size" {
 }
 
 test "(e) controlling tty: child ps -o tty= reports pts/<N>" {
-    const ps_bin = findTool("ps") orelse return error.SkipZigTest;
+    const ps_bin = test_env.tool("ps") orelse return error.SkipZigTest;
 
     var pty = try Pty.open(80, 24);
     defer pty.deinit();
@@ -680,8 +660,8 @@ test "(e) controlling tty: child ps -o tty= reports pts/<N>" {
 
     try pty.spawn(.{
         .allocator = testing.allocator,
-        .argv = &.{ findSh(), "-c", cmd },
-        .env = &.{test_path_env},
+        .argv = &.{ test_env.shell(), "-c", cmd },
+        .env = &.{test_env.pathEnv()},
     });
 
     var buf: [128]u8 = undefined;
@@ -705,8 +685,8 @@ test "(f) SIGCHLD-driven WNOHANG reap loop + write/kill roundtrip" {
     // it receives it. While it waits on stdin, WNOHANG reap must return null.
     try pty.spawn(.{
         .allocator = testing.allocator,
-        .argv = &.{ findSh(), "-c", "read line; exit 7" },
-        .env = &.{test_path_env},
+        .argv = &.{ test_env.shell(), "-c", "read line; exit 7" },
+        .env = &.{test_env.pathEnv()},
     });
 
     try testing.expect((try pty.reap(default_reap_flags)) == null);
@@ -730,11 +710,11 @@ test "(g) spawn-time winsize carries pixels; unknown cells report 0" {
 
     // The spawn-time winsize overrides open(): grid and pixels both land
     // in TIOCGWINSZ before the child's first read.
-    const stty_bin = findTool("stty") orelse "stty";
+    const stty_bin = test_env.tool("stty") orelse "stty";
     try pty.spawn(.{
         .allocator = testing.allocator,
         .argv = &.{ stty_bin, "size" },
-        .env = &.{test_path_env},
+        .env = &.{test_env.pathEnv()},
         .winsize = .{ .cols = 100, .rows = 30, .xpixel = 800, .ypixel = 480 },
     });
 

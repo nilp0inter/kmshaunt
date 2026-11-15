@@ -3,7 +3,7 @@
 //! against kmscon 10.1.0 `src/config.c` and `src/misc/conf.c`.
 //!
 //! Layout:
-//!   * `Config` — one typed field per option (all 86), exact kmscon
+//!   * `Config` — one typed field per option (all 89), exact kmscon
 //!     defaults except the two deliberate kmshaunt deviations:
 //!     `configdir = /etc/kmshaunt` and `term = xterm-ghostty` (ROADMAP D6).
 //!   * `parseCli` — `--name value`, `--name=value`, `--no-name` negation,
@@ -1625,9 +1625,9 @@ test "defaults: every option at its documented kmscon default" {
     for (std.meta.tags(Option)) |o| try testing.expect(!cfg.locked.get(o));
 }
 
-test "registry: all 86 options, unique names, documented short forms" {
-    try testing.expectEqual(@as(usize, 86), specs.len);
-    try testing.expectEqual(@as(usize, 86), std.meta.tags(Option).len);
+test "registry: all 89 options, unique names, documented short forms" {
+    try testing.expectEqual(@as(usize, 89), specs.len);
+    try testing.expectEqual(@as(usize, 89), std.meta.tags(Option).len);
     for (specs, 0..) |s, i| {
         try testing.expectEqual(@as(Option, @enumFromInt(i)), s.opt);
         try testing.expectEqual(@as(?usize, i), name_map.get(s.name));

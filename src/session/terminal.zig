@@ -1093,11 +1093,16 @@ fn monotonicNs() u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: real vt + hermetic /bin/sh children (never /bin/login). Run via
-// src/test_terminal.zig; the command is in that file's header.
+// Tests: real vt + spawned shell children — never /bin/login. The shell is
+// resolved by misc/test_env.zig (KMSHAUNT_TEST_SH, default /bin/sh) so the
+// suite also runs in the Nix sandbox, where /bin/sh is busybox and cannot run
+// the `read -t`/`read -N` scripts below. Run via src/test_terminal.zig; the
+// command is in that file's header.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+const test_env = @import("../misc/test_env.zig");
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
@@ -1238,7 +1243,7 @@ fn sendChar(s: sess.Session, key: vt.Key, ch: ?u8) !void {
 }
 
 test "terminal: start spawns child, output renders, env constructed" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'hello terminal'; printf ' T=%s C=%s S=%s' \"$TERM\" \"$COLORTERM\" \"$TERM_SESSION_TYPE\"" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf 'hello terminal'; printf ' T=%s C=%s S=%s' \"$TERM\" \"$COLORTERM\" \"$TERM_SESSION_TYPE\"" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1260,7 +1265,7 @@ test "terminal: start spawns child, output renders, env constructed" {
 }
 
 test "terminal: echo round-trip via onInput key encoding" {
-    var cfg = testCfg(&.{"/bin/sh"});
+    var cfg = testCfg(&.{test_env.shell()});
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1298,18 +1303,6 @@ test "terminal: echo round-trip via onInput key encoding" {
     try testing.expect(s.isActive());
 }
 
-/// stty for the echo-off login test; same lookup order as misc/pty.zig's
-/// findTool (NixOS system path first, then FHS). Existence probe through the
-/// io-based std.Io.Dir API: std.fs.cwd() was removed in Zig 0.17.
-fn findStty(io: std.Io) ?[]const u8 {
-    const paths = [_][]const u8{ "/run/current-system/sw/bin/stty", "/usr/bin/stty", "/bin/stty" };
-    for (paths) |p| {
-        _ = std.Io.Dir.cwd().statFile(io, p, .{}) catch continue;
-        return p;
-    }
-    return null;
-}
-
 test "terminal: echo-off canonical read receives typed keys (login password parity)" {
     // util-linux login reads the password through PAM misc_conv: a canonical
     // read(2) with ECHO cleared via TCSAFLUSH, after the username was read
@@ -1322,10 +1315,10 @@ test "terminal: echo-off canonical read receives typed keys (login password pari
     // so bytes typed ahead of the prompt are discarded by the kernel and the
     // password arrives truncated. Interactive-login scenarios (VM or T4) must
     // type the password only after the prompt is on screen.
-    const stty = findStty(std.testing.io) orelse return error.SkipZigTest;
+    const stty = test_env.tool("stty") orelse return error.SkipZigTest;
     var cmd_buf: [320]u8 = undefined;
     const cmd = try std.fmt.bufPrint(&cmd_buf, "read u; {s} -echo; printf 'Password: ' >&2; read p; {s} echo; printf 'GOT:%s:%s\\n' \"$u\" \"$p\"", .{ stty, stty });
-    const argv = [_][]const u8{ "/bin/sh", "-c", cmd };
+    const argv = [_][]const u8{ test_env.shell(), "-c", cmd };
     var cfg = testCfg(&argv);
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
@@ -1354,7 +1347,7 @@ test "terminal: echo-off canonical read receives typed keys (login password pari
 }
 
 test "terminal: resize propagates to vt and pty winsize" {
-    var cfg = testCfg(&.{"/bin/sh"});
+    var cfg = testCfg(&.{test_env.shell()});
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1370,7 +1363,7 @@ test "terminal: resize propagates to vt and pty winsize" {
 }
 
 test "terminal: pty winsize reports pixel dimensions (kitten icat parity)" {
-    var cfg = testCfg(&.{"/bin/sh"});
+    var cfg = testCfg(&.{test_env.shell()});
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1416,7 +1409,7 @@ test "terminal: pty winsize reports pixel dimensions (kitten icat parity)" {
 }
 
 test "terminal: spawn-time winsize carries known cell pixels" {
-    var cfg = testCfg(&.{"/bin/sh"});
+    var cfg = testCfg(&.{test_env.shell()});
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1443,7 +1436,7 @@ test "terminal: pixelExtent saturates at u16 and yields 0 for unknown cells" {
 }
 
 test "terminal: mode-change resize reflows the terminal grid (M2.5)" {
-    var cfg = testCfg(&.{"/bin/sh"});
+    var cfg = testCfg(&.{test_env.shell()});
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1480,7 +1473,7 @@ test "terminal: mode-change resize reflows the terminal grid (M2.5)" {
 }
 
 test "terminal: sb-size scrollback retained, not byte-pruned (M8.3)" {
-    var cfg = testCfg(&.{"/bin/sh"});
+    var cfg = testCfg(&.{test_env.shell()});
     cfg.sb_size = 4000;
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
@@ -1518,7 +1511,7 @@ fn playbackSink(ud: ?*anyopaque, bytes: []const u8) void {
 }
 
 test "terminal: asciicast playback renders into the terminal (M2.4)" {
-    var cfg = testCfg(&.{"/bin/sh"});
+    var cfg = testCfg(&.{test_env.shell()});
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1551,7 +1544,7 @@ test "terminal: asciicast playback renders into the terminal (M2.4)" {
 test "terminal: DA and size reports reply through write_pty" {
     // The replies go to the child's input; the default tty ECHOCTL echoes
     // them back to the master as "^["-prefixed text, which the vt renders.
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033[c\\033[18t'" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '\\033[c\\033[18t'" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1566,7 +1559,7 @@ test "terminal: OSC52 clipboard set/get/clear in-process" {
     // Set "hello" (base64 aGVsbG8=) and read it back (reply echoed); the
     // clear is delayed with the bash builtin read -t so the set state is
     // observable before it arrives (no external sleep in the minimal PATH).
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033]52;c;aGVsbG8=\\007\\033]52;c;?\\007'; read -t 0.3 x; printf '\\033]52;c;\\007'" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '\\033]52;c;aGVsbG8=\\007\\033]52;c;?\\007'; read -t 0.3 x; printf '\\033]52;c;\\007'" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1586,7 +1579,7 @@ test "terminal: OSC52 clipboard set/get/clear in-process" {
 }
 
 test "terminal: private OSC setBackground/setForeground hooks, no reply" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033]setBackground\\a\\033]setForeground\\033\\\\\\033]setBackground;\\a\\033]setbackground\\a'" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '\\033]setBackground\\a\\033]setForeground\\033\\\\\\033]setBackground;\\a\\033]setbackground\\a'" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1612,7 +1605,7 @@ test "terminal: private OSC setBackground/setForeground hooks, no reply" {
 }
 
 test "terminal: oneshot stops the session when the child exits" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "exit 3" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "exit 3" });
     cfg.oneshot = true;
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
@@ -1633,7 +1626,7 @@ test "terminal: oneshot stops the session when the child exits" {
 
 test "terminal: reset-env clears the parent environment" {
     try testing.expectEqual(@as(c_int, 0), setenv("KMSHAUNT_ENV_PROBE", "parent", 1));
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '[%s] %s:%s' \"${KMSHAUNT_ENV_PROBE:-UNSET}\" \"$XDG_SEAT\" \"$XDG_VTNR\"" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '[%s] %s:%s' \"${KMSHAUNT_ENV_PROBE:-UNSET}\" \"$XDG_SEAT\" \"$XDG_VTNR\"" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1648,7 +1641,7 @@ test "terminal: reset-env clears the parent environment" {
 
 test "terminal: no-reset-env inherits the parent environment" {
     try testing.expectEqual(@as(c_int, 0), setenv("KMSHAUNT_ENV_PROBE", "parent", 1));
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '[%s]' \"${KMSHAUNT_ENV_PROBE:-UNSET}\"" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '[%s]' \"${KMSHAUNT_ENV_PROBE:-UNSET}\"" });
     cfg.reset_env = false;
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
@@ -1660,7 +1653,7 @@ test "terminal: no-reset-env inherits the parent environment" {
 }
 
 test "terminal: title, pwd, bell hook and RIS clear" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033]0;My Title\\a\\033]7;file://h/tmp\\a\\a\\033c'" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '\\033]0;My Title\\a\\033]7;file://h/tmp\\a\\a\\033c'" });
     cfg.bell = true;
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
@@ -1685,7 +1678,7 @@ test "terminal: title, pwd, bell hook and RIS clear" {
 }
 
 test "terminal: bell gated off by cfg.bell" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'x\\ay'" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf 'x\\ay'" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1699,7 +1692,7 @@ test "terminal: bell gated off by cfg.bell" {
 }
 
 test "terminal: grab events reach the hook" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "exit 0" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "exit 0" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1757,7 +1750,7 @@ const MockRenderer = struct {
 };
 
 test "terminal: render delegates to the injected renderer with damage" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'x'" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf 'x'" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1805,7 +1798,7 @@ test "terminal: render delegates to the injected renderer with damage" {
 }
 
 test "terminal: render without a renderer is an error" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "exit 0" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "exit 0" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1830,7 +1823,7 @@ test "terminal: render without a renderer is an error" {
 test "terminal: mouse reporting routes button events to the encoder" {
     // bash builtin read -N 6 consumes exactly one X10 press report
     // (ESC [ M b x y); the trailing Enter completes the canonical line.
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033[?1000h'; read -r -N 6 x; printf 'MOUSE_OK'" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '\\033[?1000h'; read -r -N 6 x; printf 'MOUSE_OK'" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1916,7 +1909,7 @@ fn sendAxis(s: sess.Session, dy: f64) !void {
 }
 
 test "terminal: drag selection installs, copies on release, right-click clears" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'hello world'" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf 'hello world'" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1949,7 +1942,7 @@ test "terminal: drag selection installs, copies on release, right-click clears" 
 }
 
 test "terminal: double-click selects word, triple-click selects line" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'hello world'" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf 'hello world'" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -1989,7 +1982,7 @@ test "terminal: double-click selects word, triple-click selects line" {
 test "terminal: middle-click pastes clipboard, bracketed under mode 2004" {
     // First paste is plain (5 bytes "hello"); the child then enables
     // bracketed paste and the second paste arrives framed (6+5+6 bytes).
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'hello world'; read -r -N 5 a; printf 'P1'; printf '\\033[?2004h'; read -r -N 17 b; printf 'P2'" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf 'hello world'; read -r -N 5 a; printf 'P1'; printf '\\033[?2004h'; read -r -N 17 b; printf 'P2'" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -2021,7 +2014,7 @@ test "terminal: middle-click pastes clipboard, bracketed under mode 2004" {
 }
 
 test "terminal: wheel scrolls the viewport when not tracking" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "i=0; while [ $i -lt 60 ]; do printf 'line %s\\n' \"$i\"; i=$((i+1)); done" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "i=0; while [ $i -lt 60 ]; do printf 'line %s\\n' \"$i\"; i=$((i+1)); done" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -2044,7 +2037,7 @@ test "terminal: wheel scrolls the viewport when not tracking" {
 }
 
 test "terminal: enabling mouse tracking drops the selection" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'hello world'" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf 'hello world'" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -2066,7 +2059,7 @@ test "terminal: enabling mouse tracking drops the selection" {
 }
 
 test "terminal: key events clear the selection" {
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf 'hello world'; read x" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf 'hello world'; read x" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -2090,7 +2083,7 @@ test "terminal: mouse reporting SGR format, motion filtered in normal mode" {
     // first 9 bytes the child reads are the press report ESC[<0;1;1M.
     // The case statement matches the raw bytes (the vt would swallow the
     // CSI if it were printed back).
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033[?1000h\\033[?1006h'; read -r -N 9 x; case \"$x\" in *'0;1;1M') printf SGR_OK;; *) printf SGR_BAD;; esac" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '\\033[?1000h\\033[?1006h'; read -r -N 9 x; case \"$x\" in *'0;1;1M') printf SGR_OK;; *) printf SGR_BAD;; esac" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -2112,7 +2105,7 @@ test "terminal: mouse reporting SGR format, motion filtered in normal mode" {
 test "terminal: side buttons report as extended buttons, not the wheel" {
     // BTN_SIDE -> ghostty .eight -> xterm extended code 128 (NOT wheel
     // 64/65). SGR press report is ESC[<128;1;1M = 11 bytes.
-    var cfg = testCfg(&.{ "/bin/sh", "-c", "printf '\\033[?1000h\\033[?1006h'; read -r -N 11 x; case \"$x\" in *'128;1;1M') printf SIDE_OK;; *) printf SIDE_BAD;; esac" });
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '\\033[?1000h\\033[?1006h'; read -r -N 11 x; case \"$x\" in *'128;1;1M') printf SIDE_OK;; *) printf SIDE_BAD;; esac" });
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -2131,7 +2124,7 @@ test "terminal: side buttons report as extended buttons, not the wheel" {
 }
 
 test "terminal: init applies the configured preset palette (M2.4)" {
-    var cfg = testCfg(&.{"/bin/sh"});
+    var cfg = testCfg(&.{test_env.shell()});
     defer cfg.deinit();
     cfg.palette = .solarized;
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
@@ -2172,7 +2165,7 @@ test "terminal: init applies the configured preset palette (M2.4)" {
 }
 
 test "terminal: custom palette overrides reach the terminal (M2.4)" {
-    var cfg = testCfg(&.{"/bin/sh"});
+    var cfg = testCfg(&.{test_env.shell()});
     defer cfg.deinit();
     cfg.palette = .custom;
     cfg.custom_palette[1] = .{ .r = 10, .g = 20, .b = 30 };
@@ -2197,7 +2190,7 @@ test "terminal: custom palette overrides reach the terminal (M2.4)" {
 }
 
 test "terminal: unset palette falls back to legacy (M2.4)" {
-    var cfg = testCfg(&.{"/bin/sh"});
+    var cfg = testCfg(&.{test_env.shell()});
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
@@ -2215,7 +2208,7 @@ test "terminal: unset palette falls back to legacy (M2.4)" {
 }
 
 test "terminal: render passes the blink phase for cursor and text blink (M2.4)" {
-    var cfg = testCfg(&.{"/bin/sh"});
+    var cfg = testCfg(&.{test_env.shell()});
     defer cfg.deinit();
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();

@@ -55,8 +55,8 @@ const ghostty = @import("sprite_ghostty.zig");
 // ---------------------------------------------------------------------------
 
 /// True if `cp` is drawn by this module instead of a font face. The ranges
-/// match ghostty v1.4.0's sprite Face (draw/*.zig), plus U+E0A0..U+E0A3
-/// which kmshaunt code-draws although ghostty takes them from the font.
+/// match ghostty v1.4.0's sprite Face (draw/*.zig); U+E0A0..U+E0A3 are font
+/// glyphs there too, so this module leaves them to the font as well.
 pub fn isSprite(cp: u21) bool {
     return switch (cp) {
         0x2500...0x257F => true, // Box Drawing
@@ -131,7 +131,7 @@ fn activeCols(buf: []const u8, w: u32, h: u32, y: u32) [64]bool {
 test "isSprite covers exactly the sprite ranges" {
     const yes = [_]u21{
         0x2500, 0x257F, 0x2580, 0x259F, 0x2800, 0x28FF,
-        0xE0A0, 0xE0A3, 0xE0B0, 0xE0B7, 0xE0B8, 0xE0BF,
+        0xE0B0, 0xE0B7, 0xE0B8, 0xE0BF,
         0x1FB00, 0x1FB3B, 0x1FB3C, 0x1FB6F, 0x1FB70, 0x1FB8B,
         0x1FB8C, 0x1FB9F, 0x1FBA0, 0x1FBAE, 0x1FBAF,
         0x1FBBD, 0x1FBBE, 0x1FBBF, 0x1FBCE, 0x1FBCF,
@@ -140,7 +140,8 @@ test "isSprite covers exactly the sprite ranges" {
     };
     for (yes) |cp| try testing.expect(isSprite(cp));
     const no = [_]u21{
-        'A', 0x24FF, 0x25A0, 0x27FF, 0x2900, 0xE0A4, 0xE0C0,
+        'A', 0x24FF, 0x25A0, 0x27FF, 0x2900,
+        0xE0A0, 0xE0A3, 0xE0A4, 0xE0C0,
         0x1FAFF, 0x1FB93 + 0x100, 0x1CDE6, 0x1CCFF, 0x1FBFF,
         // Holes ghostty leaves to the font:
         0x1FBB0, 0x1FBBC, 0x1FBC0, 0x1FBCD, 0x1FBF0, 0x1FBF9,
@@ -663,8 +664,6 @@ test "every sprite renders without panic at several cell sizes" {
         while (cp <= 0x259F) : (cp += 1) try testing.expect(renderSprite(cp, w, h, slice));
         cp = 0x2800;
         while (cp <= 0x28FF) : (cp += 1) try testing.expect(renderSprite(cp, w, h, slice));
-        cp = 0xE0A0;
-        while (cp <= 0xE0A3) : (cp += 1) try testing.expect(renderSprite(cp, w, h, slice));
         cp = 0xE0B0;
         while (cp <= 0xE0BF) : (cp += 1) try testing.expect(renderSprite(cp, w, h, slice));
         cp = 0x1FB00;
