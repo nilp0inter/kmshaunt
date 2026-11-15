@@ -1506,8 +1506,13 @@ pub const CpuRenderer = struct {
                 else => return err,
             };
         };
-        self.blitEntry(f, x_px, y_px, entry, fg);
-        self.markInked(x_px, y_px, cw, ch);
+        // ghostty anchors the grid 2px below kmshaunt's canvas origin (its
+        // window-padding-y). Text already carries this offset in the calibrated
+        // baseline (discovery.cellMetricsGhostty); sprites need the same shift
+        // so they land on ghostty's cells. See parity grid-anchor calibration.
+        const sy = y_px + 2;
+        self.blitEntry(f, x_px, sy, entry, fg);
+        self.markInked(x_px, sy, cw, ch);
     }
 
     /// The uniform background word under a native-size glyph when the
