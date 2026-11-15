@@ -3299,7 +3299,18 @@ test "cpu: blitRotated matches layout.physicalToLogical for all rotations (M5.4)
 /// lands in its final location (the pointer must not dangle across the
 /// return-by-value move).
 fn kittyEnv(a: std.mem.Allocator, cols: u16, rows: u16) !Env {
-    var env = try Env.init(a, cols, rows);
+    return kittyEnvFont(a, cols, rows, null);
+}
+
+/// `kittyEnv` with an explicit font family. Cell geometry decides where
+/// glyph ink and image rects land, so tests that assert on neighbouring
+/// cells pass a real monospace family: fontconfig's generic "monospace"
+/// alias is not guaranteed to resolve to one (the Nix sandbox's pinned
+/// font config picks DejaVu Math TeX Gyre, a proportional face whose
+/// glyphs overflow their cells). Callers treat NoFontMatch/BadFontName
+/// as a skip, like every other explicitly-named face in these tests.
+fn kittyEnvFont(a: std.mem.Allocator, cols: u16, rows: u16, font_name: ?[]const u8) !Env {
+    var env = try Env.initWithFont(a, cols, rows, font_name, &.{});
     errdefer env.deinit(a);
     try env.t.resize(cols, rows, env.cpu.metrics.cell_w, env.cpu.metrics.cell_h);
     env.f.fill(env.palette[17]);
@@ -3415,7 +3426,14 @@ test "cpu: kitty image composites at cell geometry, caches, deletes (M4)" {
 
 test "cpu: kitty layers interleave with backgrounds and text (M4)" {
     const a = testing.allocator;
-    var env = try kittyEnv(a, 20, 6);
+    // A real monospace face: the glyph edge has to stay inside its cell,
+    // or ink from 'CD' lands on the empty cells 4..5 that this test reads
+    // back. Fontconfig's generic "monospace" default is not a monospace
+    // guarantee (see kittyEnvFont).
+    var env = kittyEnvFont(a, 20, 6, "DejaVu Sans Mono") catch |err| switch (err) {
+        error.NoFontMatch, error.BadFontName => return error.SkipZigTest, // no DejaVu installed
+        else => return err,
+    };
     defer env.deinit(a);
     env.cpu.vt = &env.t;
     const cw = env.cpu.metrics.cell_w;
