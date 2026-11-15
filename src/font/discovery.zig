@@ -132,6 +132,13 @@ pub const CellMetrics = struct {
     face_y: f64 = 0,
 };
 
+/// Vertical grid-anchor calibration (px): ghostty anchors its grid at the
+/// window padding (window-padding-y, 2px at content scale 1), which sits 2px
+/// below kmshaunt's canvas origin. Text carries this offset in the calibrated
+/// baseline below; cell-top-anchored content (sprites, cursor, overline) adds
+/// it explicitly so everything lands on ghostty's cells.
+pub const grid_calibration_y: i32 = 2;
+
 /// Handle to one loaded FreeType face. Copyable; valid until the owning
 /// `Discovery.deinit`. See the module comment for shared-state rules.
 pub const Face = struct {
@@ -660,8 +667,9 @@ pub fn cellMetricsGhostty(face: Face, px_f64: f64, aw: i32, ah: i32, ab: i32) !C
     face_y += diff_bottom; // ghostty Metrics.zig:395
     cb = @round(cb * (100.0 + @as(f64, @floatFromInt(ab))) / 100.0);
 
-    // ghostty Metrics.zig:293: top_to_baseline = cell_height - cell_baseline.
-    const baseline_top = ch - cb + 2; // empirically calibrated to ghostty capture
+    // ghostty Metrics.zig:293: top_to_baseline = cell_height - cell_baseline,
+    // plus the grid-anchor calibration (ghostty's window-padding-y offset).
+    const baseline_top = ch - cb + @as(f64, @floatFromInt(grid_calibration_y));
     return .{
         .cell_w = @intCast(@as(i32, @intFromFloat(cw))),
         .cell_h = @intCast(@as(i32, @intFromFloat(ch))),

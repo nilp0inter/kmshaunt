@@ -576,11 +576,11 @@ pub const CpuRenderer = struct {
                 var x1 = x + 1;
                 while (x1 < n and row_cells[x1].bg == bg) : (x1 += 1) {}
                 const run_w: u16 = @intCast((x1 - x) * @as(usize, cw));
-                fillCell(f, @as(i32, @intCast(x)) * cw, y_px, run_w, ch, bg);
+                fillCell(f, @as(i32, @intCast(x)) * cw, y_px + discovery.grid_calibration_y, run_w, ch, bg);
                 for (row_cells[x..x1], x..) |*rc, cx| {
                     if (rc.is_cursor and cursor.style == .block) {
                         const x_px: i32 = @as(i32, @intCast(cx)) * cw;
-                        deco.drawCursor(f.*, x_px, y_px, cw, ch, .block, cursor.color, true);
+                        deco.drawCursor(f.*, x_px, y_px + discovery.grid_calibration_y, cw, ch, .block, cursor.color, true);
                         // The overlay replaces the collected background.
                         self.cell_inked[base + cx] = true;
                     }
@@ -614,7 +614,7 @@ pub const CpuRenderer = struct {
                 if (!rc.invisible)
                     self.drawDecorations(f, x_px, y_px, rc.style, rc.fg, opts);
                 if (rc.is_cursor and cursor.style != .block)
-                    deco.drawCursor(f.*, x_px, y_px, cw, ch, cursorStyle(cursor.style), cursor.color, true);
+                    deco.drawCursor(f.*, x_px, y_px + discovery.grid_calibration_y, cw, ch, cursorStyle(cursor.style), cursor.color, true);
             }
         }
     }
@@ -1506,11 +1506,9 @@ pub const CpuRenderer = struct {
                 else => return err,
             };
         };
-        // ghostty anchors the grid 2px below kmshaunt's canvas origin (its
-        // window-padding-y). Text already carries this offset in the calibrated
-        // baseline (discovery.cellMetricsGhostty); sprites need the same shift
-        // so they land on ghostty's cells. See parity grid-anchor calibration.
-        const sy = y_px + 2;
+        // Cell-top-anchored content carries the grid-anchor calibration that
+        // text already applies in its baseline (discovery.grid_calibration_y).
+        const sy = y_px + discovery.grid_calibration_y;
         self.blitEntry(f, x_px, sy, entry, fg);
         self.markInked(x_px, sy, cw, ch);
     }
@@ -1693,7 +1691,7 @@ pub const CpuRenderer = struct {
             deco.drawStrikethrough(f.*, x_px, y_px, cw, ch, fg, pos, 1);
         }
         if (flags.overline) {
-            deco.drawOverline(f.*, x_px, y_px, cw, ch, fg, 1);
+            deco.drawOverline(f.*, x_px, y_px + discovery.grid_calibration_y, cw, ch, fg, 1);
         }
     }
 
