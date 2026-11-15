@@ -94,6 +94,15 @@ const Fake = struct {
     context_fails: bool = false,
     seat_fails: bool = false,
     dispatch_fails: bool = false,
+    suspend_calls: usize = 0,
+    resume_calls: usize = 0,
+    resume_fails: bool = false,
+    suspended: bool = false,
+    /// Devices currently open (added, not removed). Models libinput's
+    /// device list so suspend can remove them and resume re-add them.
+    open_devices: std.ArrayListUnmanaged(*FakeDevice) = .empty,
+    /// Devices closed by suspend; re-added by resume.
+    suspended_devices: std.ArrayListUnmanaged(*FakeDevice) = .empty,
 
     fn init(allocator: std.mem.Allocator) Fake {
         return .{ .allocator = allocator };
@@ -102,6 +111,8 @@ const Fake = struct {
     fn deinit(self: *Fake) void {
         for (self.queue.items) |p| self.allocator.destroy(p);
         self.queue.deinit(self.allocator);
+        self.open_devices.deinit(self.allocator);
+        self.suspended_devices.deinit(self.allocator);
     }
 
     fn push(self: *Fake, e: FakeEvent) void {
@@ -140,6 +151,16 @@ const Fake = struct {
 
     fn pushDevice(self: *Fake, kind: c_int, dev: *FakeDevice) void {
         self.push(.{ .type = kind, .device = @ptrCast(dev) });
+        if (kind == libinput.event.device_added) {
+            self.open_devices.append(self.allocator, dev) catch @panic("fake: oom");
+        } else if (kind == libinput.event.device_removed) {
+            for (self.open_devices.items, 0..) |d, i| {
+                if (d == dev) {
+                    _ = self.open_devices.orderedRemove(i);
+                    break;
+                }
+            }
+        }
     }
 
     fn seatName(self: *const Fake) []const u8 {
@@ -154,6 +175,8 @@ const Fake = struct {
             .udev_create_context = fakeUdevCreateContext,
             .udev_assign_seat = fakeAssignSeat,
             .unref = fakeUnref,
+            .suspend_ = fakeSuspend,
+            .resume_ = fakeResume,
             .get_fd = fakeGetFd,
             .dispatch = fakeDispatch,
             .get_event = fakeGetEvent,
@@ -231,6 +254,32 @@ fn fakeUnref(li: *libinput.Libinput) callconv(.c) ?*libinput.Libinput {
         f.device_fd = -1;
     }
     return null;
+}
+
+fn fakeSuspend(li: *libinput.Libinput) callconv(.c) void {
+    const f = fromLi(li);
+    f.suspend_calls += 1;
+    f.suspended = true;
+    // libinput closes every device and queues a DEVICE_REMOVED for each.
+    for (f.open_devices.items) |dev| {
+        f.push(.{ .type = libinput.event.device_removed, .device = @ptrCast(dev) });
+        f.suspended_devices.append(f.allocator, dev) catch @panic("fake: oom");
+    }
+    f.open_devices.clearRetainingCapacity();
+}
+
+fn fakeResume(li: *libinput.Libinput) callconv(.c) c_int {
+    const f = fromLi(li);
+    f.resume_calls += 1;
+    if (f.resume_fails) return -1;
+    f.suspended = false;
+    // libinput re-opens the devices and queues a DEVICE_ADDED for each.
+    for (f.suspended_devices.items) |dev| {
+        f.push(.{ .type = libinput.event.device_added, .device = @ptrCast(dev) });
+        f.open_devices.append(f.allocator, dev) catch @panic("fake: oom");
+    }
+    f.suspended_devices.clearRetainingCapacity();
+    return 0;
 }
 
 fn fakeGetFd(li: *libinput.Libinput) callconv(.c) c_int {
@@ -884,6 +933,145 @@ test "repeat: without a timer seam presses do not repeat" {
     try testing.expectEqual(@as(usize, 1), h.rec.entries.items.len);
 }
 
+// ---------------------------------------------------------------------------
+// Seat lifecycle: suspend/resume tie input delivery to seat ownership
+// ---------------------------------------------------------------------------
+
+test "suspend: no events delivered while the seat is inactive" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+
+    // Events queued before the switch are dropped by suspend, not delivered.
+    h.fake.pushKey(kt.key_code.key_a, true);
+    try h.input.suspend_();
+    try testing.expectEqual(@as(usize, 0), h.rec.entries.items.len);
+
+    // Even with events queued, dispatch is a no-op while suspended: nothing
+    // reaches the sink while another session owns the seat.
+    h.fake.pushKey(kt.key_code.key_b, true);
+    h.fake.pushMotion(1.0, 2.0);
+    h.fake.pushButton(0x110, true);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 0), h.rec.entries.items.len);
+    try testing.expectEqual(@as(usize, 1), h.fake.suspend_calls);
+}
+
+test "suspend/resume: disarms repeat, stops delivery, resume restarts it" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    var timer = FakeTimer{};
+    defer timer.deinit();
+    h.input.attachRepeatTimer(timer.ops());
+
+    // A repeatable press arms the timer and delivers the press.
+    h.fake.pushKey(kt.key_code.key_a, true);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 1), h.rec.entries.items.len);
+    try testing.expectEqual(@as(usize, 1), timer.arms.items.len);
+
+    // Suspend disarms repeat: a held key stops repeating into the session.
+    try h.input.suspend_();
+    try testing.expectEqual(@as(usize, 1), timer.disarms);
+    h.input.repeatExpired(3);
+    try testing.expectEqual(@as(usize, 1), h.rec.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), h.rec.countAction(2));
+
+    // Resume: the disarmed repeat stays gone, and delivery restarts.
+    try h.input.resume_();
+    try testing.expectEqual(@as(usize, 1), h.fake.resume_calls);
+    h.input.repeatExpired(2);
+    try testing.expectEqual(@as(usize, 0), h.rec.countAction(2));
+    h.fake.pushKey(kt.key_code.key_c, true);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 2), h.rec.entries.items.len);
+    try expectKey(h.rec.last(), .c, 1, "c");
+}
+
+test "suspend/resume: devices removed on suspend, re-added on resume" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    var kbd = FakeDevice{ .name = "testkbd", .caps = 1 };
+    h.fake.pushDevice(libinput.event.device_added, &kbd);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 1), h.input.deviceList().len);
+    try testing.expectEqual(@as(usize, 1), kbd.refs);
+
+    // Suspend drains the DEVICE_REMOVED: device untracked, ref released.
+    try h.input.suspend_();
+    try testing.expectEqual(@as(usize, 0), h.input.deviceList().len);
+    try testing.expectEqual(@as(usize, 0), kbd.refs);
+
+    // Resume drains the DEVICE_ADDED: device re-tracked, ref re-taken.
+    try h.input.resume_();
+    try testing.expectEqual(@as(usize, 1), h.input.deviceList().len);
+    try testing.expectEqualStrings("testkbd", h.input.deviceList()[0].name);
+    try testing.expectEqual(@as(usize, 1), kbd.refs);
+}
+
+test "resume: failure keeps the input suspended (no delivery)" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    try h.input.suspend_();
+    h.fake.resume_fails = true;
+    try testing.expectError(error.ResumeFailed, h.input.resume_());
+
+    // Still suspended: dispatch delivers nothing.
+    h.fake.pushKey(kt.key_code.key_a, true);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 0), h.rec.entries.items.len);
+}
+
+test "suspend/resume: idempotent; resume without suspend is a no-op" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    // Resume before any suspend does nothing (input already active).
+    try h.input.resume_();
+    try testing.expectEqual(@as(usize, 0), h.fake.resume_calls);
+    h.fake.pushKey(kt.key_code.key_a, true);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 1), h.rec.entries.items.len);
+
+    // Double suspend only suspends once; double resume only resumes once.
+    try h.input.suspend_();
+    try h.input.suspend_();
+    try testing.expectEqual(@as(usize, 1), h.fake.suspend_calls);
+    try h.input.resume_();
+    try h.input.resume_();
+    try testing.expectEqual(@as(usize, 1), h.fake.resume_calls);
+}
+
+test "suspend/resume: dropped VT-switch modifier releases are cleared on resume" {
+    // Regression (nix/tests/vt-input-leak.nix "input still works after
+    // returning"): the VT-switch chord's Ctrl/Alt releases arrive after the
+    // seat deactivates, so suspend_ never reads them and the xkb state keeps
+    // Ctrl+Alt depressed. resume_ must clear the stale modifiers, or every
+    // key typed after the switch is encoded with Ctrl+Alt and never reaches
+    // the shell as text.
+    const h = try Harness.init(.{});
+    defer h.deinit();
+
+    // The chord: Ctrl and Alt go down and are processed, so the xkb state
+    // holds them depressed. (The Fn press that triggers the switch is not a
+    // modifier and is omitted.)
+    h.fake.pushKey(kt.key_code.key_leftctrl, true);
+    h.fake.pushKey(kt.key_code.key_leftalt, true);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 2), h.rec.entries.items.len);
+
+    // The seat deactivates before the chord's releases arrive; libinput closes
+    // the evdev fds, so those releases are never read (never pushed here).
+    try h.input.suspend_();
+    try h.input.resume_();
+
+    // The first key typed after the switch must be a plain 'a', not Ctrl+Alt+a.
+    h.fake.pushKey(kt.key_code.key_a, true);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(usize, 3), h.rec.entries.items.len);
+    const e = h.rec.last();
+    try expectKey(e, .a, 1, "a");
+    try testing.expect(e.key.mods == 0);
+}
+
 test "pointer: relative motion accumulates; absolute reports device position" {
     const h = try Harness.init(.{});
     defer h.deinit();
@@ -1116,6 +1304,8 @@ test "LibinputOps.real binds the translate-c surface (analyzed, never called)" {
     try testing.expect(@intFromPtr(ops.udev_create_context) != 0);
     try testing.expect(@intFromPtr(ops.udev_assign_seat) != 0);
     try testing.expect(@intFromPtr(ops.unref) != 0);
+    try testing.expect(@intFromPtr(ops.suspend_) != 0);
+    try testing.expect(@intFromPtr(ops.resume_) != 0);
     try testing.expect(@intFromPtr(ops.get_fd) != 0);
     try testing.expect(@intFromPtr(ops.dispatch) != 0);
     try testing.expect(@intFromPtr(ops.get_event) != 0);

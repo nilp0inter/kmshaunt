@@ -175,6 +175,23 @@
 //! synchronously). The sink returns void: session error policy belongs
 //! to the caller wiring it (loop handlers cannot propagate).
 //!
+//! # Seat lifecycle (suspend/resume)
+//!
+//! Input is tied to seat ownership. When the seat deactivates (VT switch
+//! away, libseat disable_seat) main.zig calls `Input.suspend_`: libinput
+//! closes every evdev fd so no key/pointer event is read while another
+//! session owns the console, key repeat is disarmed, and events queued
+//! before the switch are dropped. `Input.resume_` (on activation) re-opens
+//! the devices and drains the DEVICE_ADDED queue. `dispatch` is a no-op
+//! while suspended. Because the dropped events include the VT-switch
+//! chord's modifier releases, `resume_` also clears the stale xkb modifier
+//! state (keeping the active layout) and any in-progress Compose sequence,
+//! so keys typed after the switch are not stuck with the old Ctrl+Alt.
+//! The sink owner additionally gates on seat ownership
+//! (Console.onInput drops events while the seat is inactive) so the
+//! no-input-while-inactive invariant holds even if a backend cannot
+//! suspend.
+//!
 //! # Config flags
 //!
 //! `mouse=false` drops all pointer events (motion/button/axis); keyboard
@@ -307,6 +324,13 @@ pub const LibinputOps = struct {
     udev_create_context: *const fn (interface: *const Interface, user_data: ?*anyopaque, udev: *Udev) callconv(.c) ?*Libinput,
     udev_assign_seat: *const fn (li: *Libinput, seat_id: [*:0]const u8) callconv(.c) c_int,
     unref: *const fn (li: *Libinput) callconv(.c) ?*Libinput,
+    /// Suspend the context: close every device fd and remove the devices
+    /// (the context stays valid for `resume_`). Returns void in libinput
+    /// 1.31.3.
+    suspend_: *const fn (li: *Libinput) callconv(.c) void,
+    /// Resume a suspended context: re-enable device monitoring and re-add
+    /// the devices. Returns 0 on success, -1 on failure.
+    resume_: *const fn (li: *Libinput) callconv(.c) c_int,
     get_fd: *const fn (li: *Libinput) callconv(.c) c_int,
     dispatch: *const fn (li: *Libinput) callconv(.c) c_int,
     get_event: *const fn (li: *Libinput) callconv(.c) ?*Event,
@@ -338,6 +362,8 @@ pub const LibinputOps = struct {
         .udev_create_context = Real.udevCreateContext,
         .udev_assign_seat = Real.udevAssignSeat,
         .unref = Real.unref,
+        .suspend_ = Real.suspend_,
+        .resume_ = Real.resume_,
         .get_fd = Real.getFd,
         .dispatch = Real.dispatch,
         .get_event = Real.getEvent,
@@ -395,6 +421,14 @@ const Real = struct {
 
     fn unref(li: *Libinput) callconv(.c) ?*Libinput {
         return @ptrCast(c.libinput_unref(@ptrCast(li)));
+    }
+
+    fn suspend_(li: *Libinput) callconv(.c) void {
+        c.libinput_suspend(@ptrCast(li));
+    }
+
+    fn resume_(li: *Libinput) callconv(.c) c_int {
+        return c.libinput_resume(@ptrCast(li));
     }
 
     fn getFd(li: *Libinput) callconv(.c) c_int {
@@ -584,6 +618,10 @@ pub const Input = struct {
     repeat_cfg: xkb.RepeatConfig,
     repeat: ?RepeatKey = null,
 
+    /// True between `suspend_` and `resume_` (seat inactive): `dispatch` is a
+    /// no-op so no evdev input reaches the sink while the seat is away.
+    suspended: bool = false,
+
     /// Set by `deinit`; the only field left readable after the undefined
     /// poisoning, so a second deinit is a no-op.
     deinited: bool = false,
@@ -678,9 +716,11 @@ pub const Input = struct {
 
     /// libinput_dispatch + drain the event queue, converting every
     /// event. Call on fd readiness and once after init (initial
-    /// DEVICE_ADDED events). Errors: NoSink when setSink was not called,
-    /// DispatchFailed on libinput_dispatch < 0, plus timer/append errors.
+    /// DEVICE_ADDED events). No-op while suspended (seat inactive).
+    /// Errors: NoSink when setSink was not called, DispatchFailed on
+    /// libinput_dispatch < 0, plus timer/append errors.
     pub fn dispatch(self: *Input) !void {
+        if (self.suspended) return;
         if (self.sink == null) return error.NoSink;
         if (self.ops.dispatch(self.li) < 0) return error.DispatchFailed;
         while (self.ops.get_event(self.li)) |ev| {
@@ -702,6 +742,48 @@ pub const Input = struct {
                 else => {},
             }
         }
+    }
+
+    /// Suspend device monitoring (the seat deactivated): libinput closes
+    /// every evdev fd, so no input is read while the seat is inactive.
+    /// Disarms key repeat and drops events queued before the switch so they
+    /// cannot leak into the session on return; device removals are still
+    /// tracked. Idempotent. The sink owner's seat-ownership gate is the
+    /// backstop if a backend cannot suspend.
+    pub fn suspend_(self: *Input) !void {
+        if (self.suspended) return;
+        self.ops.suspend_(self.li);
+        self.suspended = true;
+        // Drain the queue: keep device tracking in sync (DEVICE_REMOVED)
+        // and discard stale key/pointer events from before the switch.
+        // Only device_removed is processed (it cannot fail), so the queue
+        // is always emptied even if the repeat disarm below errors.
+        while (self.ops.get_event(self.li)) |ev| {
+            defer self.ops.event_destroy(ev);
+            if (self.ops.event_get_type(ev) == event.device_removed) {
+                self.handleDeviceRemoved(ev);
+            }
+        }
+        try self.stopRepeat();
+    }
+
+    /// Resume device monitoring (the seat activated): libinput re-opens the
+    /// devices and queues DEVICE_ADDED. Queued events do not make the poll
+    /// fd readable, so drain once here (like the initial dispatch after
+    /// init). Idempotent; a failed resume keeps the input suspended.
+    pub fn resume_(self: *Input) !void {
+        if (!self.suspended) return;
+        if (self.ops.resume_(self.li) < 0) return error.ResumeFailed;
+        self.suspended = false;
+        // suspend_ dropped the VT-switch chord's modifier releases (Ctrl,
+        // Alt and Fn are released after the seat goes away), so the xkb
+        // state still holds them pressed. Clear the stale modifiers —
+        // keeping the active layout — and any half-finished Compose
+        // sequence before new events are delivered; otherwise every key
+        // typed after the switch would carry the old Ctrl+Alt.
+        self.state.updateMask(0, 0, 0, 0, 0, self.state.activeLayout());
+        if (self.compose) |cp| cp.reset();
+        try self.dispatch();
     }
 
     // -- keyboard ----------------------------------------------------------

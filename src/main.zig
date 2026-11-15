@@ -36,7 +36,7 @@
 //!     plus DRM page-flip completion events; under a sustained output burst
 //!     the frame period stretches so render+present occupies a bounded
 //!     fraction of the loop and the pty keeps draining (M8.1). DPMS +
-//!     cursor-blink + kitty-animation timers.
+//!     cursor-blink + kitty-animation + pointer-autohide timers.
 //! 11. issue text, asciicast playback, locale1 live keymap follow.
 //! 12. `loop.run`; SIGTERM/INT (or oneshot child exit) stops it; everything
 //!     is deinitialised in reverse order.
@@ -62,6 +62,8 @@
 //! image across frames. Each output presents its viewport of the shadow
 //! (crop/scale/rotate per its layout.Plan) into the backend's alternating back
 //! buffer before each flip (the back buffer must hold a complete frame).
+//! The software pointer is composited into the back buffer only (never the
+//! shadow), with both its erase and draw rects damaged every frame.
 
 const std = @import("std");
 const posix = std.posix;
@@ -82,6 +84,7 @@ const fbdev = @import("video/fbdev.zig");
 const render = @import("render.zig");
 const cpu = @import("render/cpu.zig");
 const deco = @import("render/decorations.zig");
+const pointer = @import("render/pointer.zig");
 const discovery = @import("font/discovery.zig");
 const vt = @import("vt.zig");
 const layout = @import("video/layout.zig");
@@ -232,6 +235,10 @@ const kdmktone: u32 = 0x4B30;
 const blink_interval_ns: u64 = 500 * std.time.ns_per_ms;
 /// Throttle before respawning a login child that exited (non-oneshot).
 const respawn_delay_ns: u64 = 500 * std.time.ns_per_ms;
+/// Software-pointer autohide poll cadence: a quarter of the model's idle
+/// timeout. The model owns the exact idle math (tick); the timer only
+/// wakes it, so the hide lands within one poll after the deadline.
+const pointer_poll_ns: u64 = @intCast(@divTrunc(pointer.default_idle_timeout_ns, 4));
 /// M8.1 burst pacing: render+present runs in the single-threaded loop, so
 /// rendering every refresh while output floods in caps pty consumption at
 /// parse_rate * (1 - render_duty). While a burst is active the frame period
@@ -552,6 +559,11 @@ const Console = struct {
     asciicast_timer: loop.Timer = .{},
     /// M8.1 frame pacing: coalesces damage into one render per refresh.
     frame_timer: loop.Timer = .{},
+    /// Software mouse pointer (canvas space); null when init failed —
+    /// the console works without it.
+    pointer: ?pointer.Pointer = null,
+    /// One-shot autohide poll; armed only while the pointer is visible.
+    pointer_timer: loop.Timer = .{},
     /// asciicast playback (M2.4), bound to the terminal it plays into.
     playback: ?*asciicast.Playback = null,
     playback_ts: ?*terminal.TerminalSession = null,
@@ -575,6 +587,10 @@ const Console = struct {
     frame_arm_deadline_ns: i64 = 0,
     /// Last pty pump completion (ns); the burst-activity gate.
     last_pump_ns: i64 = 0,
+    /// Whether the most recent pty pump exhausted its drain budget (more
+    /// pending). Distinguishes a sustained flood from a periodic trickle
+    /// (e.g. btop): only a flood may defer a frame (burst gate).
+    last_pump_more: bool = false,
 
     // -- lifecycle ---------------------------------------------------------
 
@@ -588,6 +604,7 @@ const Console = struct {
             self.loc1 = null;
         }
         self.stopPlayback();
+        self.pointer_timer.deinit();
         self.asciicast_timer.deinit();
         self.frame_timer.deinit();
         self.respawn_timer.deinit();
@@ -631,6 +648,10 @@ const Console = struct {
         if (self.shadow) |*s| {
             s.destroy(self.alloc);
             self.shadow = null;
+        }
+        if (self.pointer) |*p| {
+            p.deinit();
+            self.pointer = null;
         }
         self.damage.deinit(self.alloc);
         self.phys_damage.deinit(self.alloc);
@@ -721,6 +742,7 @@ const Console = struct {
         try self.kitty_timer.init(&self.lp, .{ .callback = onKittyTimer, .userdata = @intFromPtr(self) });
         try self.asciicast_timer.init(&self.lp, .{ .callback = onAsciicastTimer, .userdata = @intFromPtr(self) });
         try self.frame_timer.init(&self.lp, .{ .callback = onFrameTimer, .userdata = @intFromPtr(self) });
+        try self.pointer_timer.init(&self.lp, .{ .callback = onPointerTimer, .userdata = @intFromPtr(self) });
         if (self.cfg.blink) try self.blink_timer.armInterval(blink_interval_ns);
         self.armDpms();
 
@@ -1111,6 +1133,21 @@ const Console = struct {
         } else {
             self.shadow = try video.Framebuffer.create(self.alloc, canvas.width, canvas.height, .xrgb8888, null);
         }
+        // The software pointer is canvas-space: rebuild it when the canvas
+        // size changes (zoom/hotplug); pure rotations keep it. Init failure
+        // is non-fatal — the console works without a pointer. Every caller
+        // sets full_redraw, which erases any sprite left in the back buffers.
+        const ptr_stale = if (self.pointer) |*p|
+            p.canvas_w != canvas.width or p.canvas_h != canvas.height
+        else
+            true;
+        if (ptr_stale) {
+            if (self.pointer) |*p| p.deinit();
+            self.pointer = pointer.Pointer.init(self.alloc, canvas.width, canvas.height, .{}) catch |err| blk: {
+                log.warn("pointer init: {t}", .{err});
+                break :blk null;
+            };
+        }
         try self.renderer.?.resize(self.cols, self.rows, self.cell.cell_w, self.cell.cell_h);
         self.applyDecoConfig();
     }
@@ -1403,7 +1440,7 @@ const Console = struct {
         const now = monotonicNs();
         if (now >= self.frame_due_ns) return false;
         const interval: i64 = @intCast(self.frameIntervalNs());
-        if (now - self.last_pump_ns >= interval) return false;
+        if (!burstPumpActive(now, self.last_pump_ns, interval, self.last_pump_more, self.frame_cost_ns)) return false;
         self.frame_timer.armOneShot(@intCast(self.frame_due_ns - now)) catch |err| {
             log.warn("frame timer: {t}", .{err});
             return false;
@@ -1479,6 +1516,16 @@ const Console = struct {
         // the next one (M4.4); the tick's new pixel generations reach the
         // renderer through the next frame's placement list.
         self.tickKittyAnimations();
+        // Software pointer: inject the erase+draw rects as full-width row
+        // bands (the renderer's damage vocabulary, so blitShadowBands stays
+        // band-limited). Every output's shadow blit then restores the old
+        // sprite position and endFrame's damage covers both rects; the
+        // sprite itself is composited into the back buffers in present().
+        if (self.pointer) |*p| {
+            const pd = p.takeDamage();
+            self.appendPointerBand(pd.old);
+            self.appendPointerBand(pd.new);
+        }
         if (self.fb != null) {
             self.present(self.backend, self.fb_plan, &self.fb_prev_damage);
         } else {
@@ -1486,6 +1533,8 @@ const Console = struct {
                 self.present(DrmFrame{ .drm = o.drm, .ci = o.ci }, o.plan, &o.prev_damage);
             }
         }
+        // Commit the pointer rect only after every output composited it.
+        if (self.pointer) |*p| p.markDrawn();
         const t2 = monotonicNs();
         // Burst pacing: remember the frame cost and set the next frame's
         // earliest due time. The EWMA rises slowly and falls fast (capped
@@ -1531,6 +1580,7 @@ const Console = struct {
                 const bx = dx + shadow.width;
                 if (bx < fb.width) fillBand(fb, bx, dy, fb.width - bx, shadow.height);
                 self.blitShadowBands(fb, shadow, prev_damage, dx, dy);
+                self.compositePointer(fb, plan, @intCast(dx), @intCast(dy), true);
                 if (self.full_redraw) {
                     backend.endFrame(&.{}) catch |err| log.warn("endFrame: {t}", .{err});
                 } else if (dx == 0 and dy == 0) {
@@ -1556,6 +1606,7 @@ const Console = struct {
         // Viewport path: clear the letterbox, paint the rotated/scaled window.
         fb.fill(0);
         render.blitViewport(fb.*, shadow.*, plan);
+        self.compositePointer(fb, plan, 0, 0, false);
         if (self.full_redraw) {
             self.setPrevDamage(prev_damage, &.{.{ .x = 0, .y = 0, .w = shadow.width, .h = shadow.height }});
             backend.endFrame(&.{}) catch |err| log.warn("endFrame: {t}", .{err});
@@ -1580,6 +1631,43 @@ const Console = struct {
         }
         backend.endFrame(self.phys_damage.items) catch |err| log.warn("endFrame: {t}", .{err});
         self.setPrevDamage(prev_damage, self.damage.items);
+    }
+
+    /// Composite the software pointer into one output's BACK buffer after
+    /// the shadow blit — never into the shadow canvas (draw invariant,
+    /// render/pointer.zig). The aligned 1:1 case is an integer letterbox
+    /// offset; scaled/rotated viewports inverse-map through the plan like
+    /// render.blitViewport. renderIfDirty already gates seat_active and
+    /// dpms_off; re-checked here so the draw gate lives at the draw.
+    fn compositePointer(self: *Console, fb: *video.Framebuffer, plan: layout.Plan, dx: i32, dy: i32, aligned: bool) void {
+        const p = &(self.pointer orelse return);
+        if (!p.isVisible() or !self.seat_active or self.dpms_off) return;
+        const pos = p.position();
+        if (aligned) {
+            blitPointer(fb, p.sprite(), pos.x + dx, pos.y + dy);
+        } else {
+            blitPointerViewport(fb, p.sprite(), pos, plan);
+        }
+    }
+
+    /// Add one pointer erase/draw rect to the canvas damage as a full-width
+    /// row band (Damage.fromRows): a small non-full-width rect would force
+    /// blitShadowBands into a full-canvas copy on every pointer frame.
+    /// Empty rects are skipped; on allocation failure force a full redraw
+    /// rather than risk a ghost.
+    fn appendPointerBand(self: *Console, r: video.Damage) void {
+        if (r.isEmpty()) return;
+        self.damage.append(self.alloc, video.Damage.fromRows(r.y, r.y + r.h, self.canvas.width)) catch |err| {
+            log.warn("pointer damage: {t}", .{err});
+            self.full_redraw = true;
+        };
+    }
+
+    /// Arm the one-shot autohide poll. Re-armed on every motion/button
+    /// (like armDpms); tick() owns the exact idle deadline.
+    fn armPointerTimer(self: *Console) void {
+        self.pointer_timer.armOneShot(pointer_poll_ns) catch |err|
+            log.warn("pointer timer: {t}", .{err});
     }
 
     /// Copy only the shadow rows that changed since this back buffer was
@@ -2023,6 +2111,8 @@ const Console = struct {
     fn onSeatActivated(ud: usize) void {
         const self: *Console = @ptrFromInt(ud);
         self.seat_active = true;
+        // Re-open evdev and re-track devices now that we own the seat.
+        if (self.input) |*in| in.resume_() catch |err| log.warn("input resume: {t}", .{err});
         self.videoTakeMaster();
         if (self.reprobe_pending) {
             self.reprobe_pending = false;
@@ -2035,6 +2125,13 @@ const Console = struct {
     fn onSeatDeactivated(ud: usize) void {
         const self: *Console = @ptrFromInt(ud);
         self.seat_active = false;
+        // Stop reading evdev while another session owns the seat (also
+        // disarms key repeat); the onInput gate is the backstop.
+        if (self.input) |*in| in.suspend_() catch |err| log.warn("input suspend: {t}", .{err});
+        // Hide the software pointer; the activation full redraw erases it.
+        if (self.pointer) |*p| p.hide();
+        self.pointer_timer.disarm() catch |err| log.warn("pointer timer: {t}", .{err});
+        self.markDirty();
         self.videoDropMaster();
     }
 
@@ -2125,6 +2222,7 @@ const Console = struct {
             return;
         };
         self.last_pump_ns = monotonicNs();
+        self.last_pump_more = more;
         self.markDirty();
         if (more) {
             // Budget exhausted: re-arm the edge-triggered source. MOD
@@ -2159,6 +2257,20 @@ const Console = struct {
         if (self.dpms_off) return;
         if (!self.setDpmsAll(.off)) return;
         self.dpms_off = true;
+        // Hide the software pointer; the wake full redraw erases it.
+        if (self.pointer) |*p| p.hide();
+        self.pointer_timer.disarm() catch |err| log.warn("pointer timer: {t}", .{err});
+        self.markDirty();
+    }
+
+    fn onPointerTimer(_: *loop.Timer, expirations: u64, ud: usize) void {
+        _ = expirations;
+        const self: *Console = @ptrFromInt(ud);
+        const p = &(self.pointer orelse return);
+        // tick() hides exactly once on the idle transition; the erase rect
+        // reaches the back buffers through the next frame's damage.
+        if (p.tick(monotonicNs())) self.markDirty();
+        if (p.isVisible()) self.armPointerTimer();
     }
 
     fn onBlinkTimer(_: *loop.Timer, expirations: u64, ud: usize) void {
@@ -2203,7 +2315,30 @@ const Console = struct {
 
     fn onInput(ud: usize, event: sess.InputEvent) void {
         const self: *Console = @ptrFromInt(ud);
+        // Seat-ownership gate: while the VT/seat is inactive the kernel
+        // owns the keyboard (it handles Ctrl+Alt+Fn to switch back to us),
+        // so nothing may reach the sessions, wake DPMS or stop playback.
+        // libinput is suspended as well; this holds even if it delivers.
+        if (!self.seat_active) return;
         self.wakeDpms();
+        // Software pointer tracking (additive: the events still reach the
+        // manager below for selection). x/y are canvas pixels from the
+        // input layer, absolute or accumulated.
+        if (self.pointer) |*p| {
+            switch (event) {
+                .pointer_motion => |m| {
+                    p.motion(m.x, m.y, monotonicNs());
+                    self.armPointerTimer();
+                    self.markDirty();
+                },
+                .pointer_button => {
+                    p.button(monotonicNs());
+                    self.armPointerTimer();
+                    self.markDirty();
+                },
+                else => {},
+            }
+        }
         // VT-switch: Ctrl+Alt+F1..F12 produce XF86Switch_VT_1..12. The input
         // event carries the physical key (the keysym is not in InputEvent),
         // so detect the combination that yields those keysyms.
@@ -2282,6 +2417,21 @@ fn burstStretchNs(cost_ns: u64, interval_ns: u64) u64 {
     return @max(interval_ns, scaled);
 }
 
+/// Burst-activity gate: decide whether a frame may be held for the burst
+/// stretch. A budget-exhausted pump (`pump_flood` = true) means more output
+/// is pending, so the deferral is kept while that pump is within the last
+/// display refresh. A pump that drained everything (`pump_flood` = false) is
+/// a trickle — a periodic full-screen refresh such as btop at a fixed update
+/// rate. A trickle of CHEAP frames renders on time (there is no flood to
+/// drain, so the stretch only adds latency); a trickle of EXPENSIVE frames
+/// (stretch would hit the display-rate cap) still coalesces to bound render
+/// duty, which is what keeps output-throughput benchmarks from regressing.
+fn burstPumpActive(now_ns: i64, last_pump_ns: i64, interval_ns: i64, pump_flood: bool, frame_cost_ns: u64) bool {
+    if (now_ns - last_pump_ns >= interval_ns) return false;
+    if (pump_flood) return true;
+    return frame_cost_ns * burst_stretch_factor >= max_burst_frame_period_ns;
+}
+
 /// Non-temporal row copy: 64-byte unrolled movntdq stores with a regular
 /// memcpy tail. `dst` must be 16-byte aligned (movntdq requirement);
 /// `src` may be unaligned. Caller issues one sfence after the last row.
@@ -2334,6 +2484,150 @@ fn monotonicNs() i64 {
 /// loop (docs/reference/ghostty-vt-api.md §9.4).
 fn kittyRedrawDelayNs(now_ms: u64, next_ms: u64) u64 {
     return @max(1, next_ms -| now_ms) * std.time.ns_per_ms;
+}
+
+// ---------------------------------------------------------------------------
+// Software pointer compositing (back buffer only; render/pointer.zig owns
+// position, visibility and damage tracking).
+// ---------------------------------------------------------------------------
+
+/// Source-over blend of one ARGB8888 sprite pixel onto an opaque back
+/// buffer pixel. The result is always opaque (XRGB scanout); rounding is
+/// symmetric (+127 before the /255).
+fn blendPixel(dst: u32, src: u32) u32 {
+    const a: u32 = src >> 24;
+    if (a == 0) return dst;
+    if (a == 255) return src | 0xFF000000;
+    const inv_a = 255 - a;
+    var out: u32 = 0xFF000000;
+    inline for (.{ 0, 8, 16 }) |shift| {
+        const s = (src >> shift) & 0xFF;
+        const d = (dst >> shift) & 0xFF;
+        out |= ((s * a + d * inv_a + 127) / 255) << shift;
+    }
+    return out;
+}
+
+/// Alpha-blit the pointer sprite into a back buffer at (dst_x, dst_y),
+/// clipped to the destination on all four edges (the hotspot may sit at
+/// the canvas edge). Writes only `fb`: the shadow canvas stays
+/// pointer-free.
+fn blitPointer(fb: *video.Framebuffer, sprite: *const video.Framebuffer, dst_x: i32, dst_y: i32) void {
+    const dx0: i64 = dst_x;
+    const dy0: i64 = dst_y;
+    const x0 = @max(dx0, 0);
+    const y0 = @max(dy0, 0);
+    const x1 = @min(dx0 + sprite.width, @as(i64, fb.width));
+    const y1 = @min(dy0 + sprite.height, @as(i64, fb.height));
+    if (x1 <= x0 or y1 <= y0) return;
+    var y: i64 = y0;
+    while (y < y1) : (y += 1) {
+        var x: i64 = x0;
+        while (x < x1) : (x += 1) {
+            const word = sprite.get(@intCast(x - dx0), @intCast(y - dy0));
+            if (word >> 24 == 0) continue;
+            const px: u32 = @intCast(x);
+            const py: u32 = @intCast(y);
+            fb.set(px, py, blendPixel(fb.get(px, py), word));
+        }
+    }
+}
+
+/// Physical bounding rect of a canvas-space rect under a viewport plan
+/// (crop/scale/rotate), or null when it lies outside the viewport or the
+/// plan is inactive. Same transform as Plan.damage / render.blitViewport:
+/// canvas -> content (dst + (p - src) * scale) -> native rotation. The
+/// integer corner enclosure over-covers by < 1 px, never under-covers.
+fn pointerPhysicalRect(plan: layout.Plan, r: layout.Rect) ?video.Damage {
+    if (!plan.active or plan.scale <= 0) return null;
+    const vis = layout.Rect.intersect(r, plan.src) orelse return null;
+    const sx: f64 = @floatFromInt(plan.src.x);
+    const sy: f64 = @floatFromInt(plan.src.y);
+    const c0x = plan.dst.x + (@as(f64, @floatFromInt(vis.x)) - sx) * plan.scale;
+    const c0y = plan.dst.y + (@as(f64, @floatFromInt(vis.y)) - sy) * plan.scale;
+    const c1x = plan.dst.x + (@as(f64, @floatFromInt(vis.endX())) - sx) * plan.scale;
+    const c1y = plan.dst.y + (@as(f64, @floatFromInt(vis.endY())) - sy) * plan.scale;
+    const x0: i32 = @intFromFloat(@floor(c0x));
+    const y0: i32 = @intFromFloat(@floor(c0y));
+    const x1: i32 = @as(i32, @intFromFloat(@ceil(c1x))) - 1;
+    const y1: i32 = @as(i32, @intFromFloat(@ceil(c1y))) - 1;
+    if (x1 < x0 or y1 < y0) return null;
+    const rot = plan.conn.rotation;
+    const pw = plan.conn.width_px;
+    const ph = plan.conn.height_px;
+    const corners = [_]layout.Point{
+        rot.logicalToPhysical(x0, y0, pw, ph),
+        rot.logicalToPhysical(x1, y0, pw, ph),
+        rot.logicalToPhysical(x0, y1, pw, ph),
+        rot.logicalToPhysical(x1, y1, pw, ph),
+    };
+    var lo_x: i32 = corners[0].x;
+    var hi_x: i32 = corners[0].x;
+    var lo_y: i32 = corners[0].y;
+    var hi_y: i32 = corners[0].y;
+    for (corners[1..]) |c| {
+        lo_x = @min(lo_x, c.x);
+        hi_x = @max(hi_x, c.x);
+        lo_y = @min(lo_y, c.y);
+        hi_y = @max(hi_y, c.y);
+    }
+    // Clamp to the native frame; hi is inclusive -> half-open +1.
+    const px0 = @max(lo_x, 0);
+    const py0 = @max(lo_y, 0);
+    const px1 = @min(hi_x + 1, @as(i32, @intCast(pw)));
+    const py1 = @min(hi_y + 1, @as(i32, @intCast(ph)));
+    if (px1 <= px0 or py1 <= py0) return null;
+    return .{
+        .x = @intCast(px0),
+        .y = @intCast(py0),
+        .w = @intCast(px1 - px0),
+        .h = @intCast(py1 - py0),
+    };
+}
+
+/// Alpha-blit the pointer sprite through a scaled/rotated viewport plan
+/// into a back buffer. Inverse-maps each physical pixel of the sprite's
+/// bounding rect to content then canvas space with the same nearest-
+/// neighbour sampling as render.blitViewport (floor(dst) origin, 1/scale
+/// steps), so the pointer lands exactly on the content it points at.
+fn blitPointerViewport(fb: *video.Framebuffer, sprite: *const video.Framebuffer, pos: pointer.Position, plan: layout.Plan) void {
+    const bounds = pointerPhysicalRect(plan, .{
+        .x = pos.x,
+        .y = pos.y,
+        .w = sprite.width,
+        .h = sprite.height,
+    }) orelse return;
+    const phys = bounds.clipTo(fb.width, fb.height) orelse return;
+    const inv = 1.0 / plan.scale;
+    const dx0 = @floor(plan.dst.x);
+    const dy0 = @floor(plan.dst.y);
+    const sx: f64 = @floatFromInt(plan.src.x);
+    const sy: f64 = @floatFromInt(plan.src.y);
+    const rot = plan.conn.rotation;
+    const pw = plan.conn.width_px;
+    const ph = plan.conn.height_px;
+    var py: u32 = phys.y;
+    while (py < phys.y + phys.h) : (py += 1) {
+        var px: u32 = phys.x;
+        while (px < phys.x + phys.w) : (px += 1) {
+            const c = rot.physicalToLogical(@intCast(px), @intCast(py), pw, ph);
+            const fx = sx + (@as(f64, @floatFromInt(c.x)) - dx0) * inv;
+            const fy = sy + (@as(f64, @floatFromInt(c.y)) - dy0) * inv;
+            if (fx < 0 or fy < 0) continue;
+            const cx: u32 = @intFromFloat(@floor(fx));
+            const cy: u32 = @intFromFloat(@floor(fy));
+            // Stay inside the viewport (largest-mode clipping) and the
+            // sprite; the bounding rect may over-cover by a pixel.
+            if (@as(i64, cx) < plan.src.x or @as(i64, cy) < plan.src.y or
+                @as(i64, cx) >= plan.src.endX() or @as(i64, cy) >= plan.src.endY()) continue;
+            const sp_x = @as(i64, cx) - pos.x;
+            const sp_y = @as(i64, cy) - pos.y;
+            if (sp_x < 0 or sp_y < 0 or sp_x >= sprite.width or sp_y >= sprite.height) continue;
+            const word = sprite.get(@intCast(sp_x), @intCast(sp_y));
+            if (word >> 24 == 0) continue;
+            fb.set(px, py, blendPixel(fb.get(px, py), word));
+        }
+    }
 }
 
 /// The active console for the session factory (a plain fn pointer with no
@@ -2924,6 +3218,25 @@ fn testConsole() Console {
     return .{ .alloc = std.testing.allocator, .io = undefined, .cfg = undefined };
 }
 
+test "onInput: seat inactive drops the event (no VT input leak)" {
+    // Regression: typing in another session (e.g. Hyprland) while kmshaunt's
+    // VT is inactive must not leak into kmshaunt. While the seat is inactive
+    // the kernel owns the keyboard, so onInput must drop the event before it
+    // wakes DPMS, stops playback, reaches the manager or marks the console
+    // dirty. (Active-path delivery is covered by the libinput dispatch tests.)
+    var c = testConsole();
+    c.seat_active = false;
+    const ev = sess.InputEvent{ .key = .{
+        .ghostty_key = @intFromEnum(kt.GhosttyKey.a),
+        .mods = 0,
+        .action = @intFromEnum(kt.GhosttyKeyAction.press),
+        .utf8 = "a",
+        .unshifted_codepoint = 'a',
+    } };
+    Console.onInput(@intFromPtr(&c), ev);
+    try std.testing.expect(!c.dirty);
+}
+
 test "uniqueCards: dedupes shared card backends in first-output order" {
     var c = testConsole();
     defer c.outputs.deinit(std.testing.allocator);
@@ -3018,4 +3331,195 @@ test "burstStretchNs: refresh floor, cost scaling, display-rate floor" {
     try std.testing.expectEqual(max_burst_frame_period_ns, burstStretchNs(10 * std.time.ns_per_s, refresh));
     // Zero cost still yields one refresh.
     try std.testing.expectEqual(refresh, burstStretchNs(0, refresh));
+}
+
+test "burstPumpActive: cheap trickle renders on time; flood and costly trickle coalesce" {
+    // Regression: btop at a fixed update rate writes one full-screen refresh
+    // per period and every pump drains the pty (more = false). The old gate
+    // only checked "a pump happened within the last refresh", so it held each
+    // cheap frame for the burst stretch (up to the 100 ms cap) — the periodic
+    // output hitch. A cheap trickle must render on time. Expensive frames and
+    // real floods must still coalesce so render duty stays bounded (removing
+    // that coalescing regressed the notcurses throughput geomean ~19%).
+    const interval: i64 = 4_166_667;
+    const now: i64 = 1_000_000_000;
+    const cheap: u64 = 1_000_000; // 1 ms * 9 = 9 ms, below the 100 ms cap
+    const costly: u64 = 20_000_000; // 20 ms * 9 = 180 ms, hits the cap
+    try std.testing.expect(!burstPumpActive(now, now - 1_000, interval, false, cheap));
+    try std.testing.expect(burstPumpActive(now, now - 1_000, interval, false, costly));
+    try std.testing.expect(burstPumpActive(now, now - 1_000, interval, true, cheap));
+    try std.testing.expect(!burstPumpActive(now, now - interval, interval, true, costly));
+    try std.testing.expect(!burstPumpActive(now, now - interval - 1, interval, false, costly));
+}
+
+// ---------------------------------------------------------------------------
+// Software pointer compositing tests (hermetic: CPU framebuffers only).
+// ---------------------------------------------------------------------------
+
+test "blendPixel: source-over onto opaque dst" {
+    // Transparent keeps the destination.
+    try std.testing.expectEqual(@as(u32, 0xFF123456), blendPixel(0xFF123456, 0x00ABCDEF));
+    // Opaque replaces it (X bits forced opaque).
+    try std.testing.expectEqual(@as(u32, 0xFFABCDEF), blendPixel(0xFF123456, 0xFFABCDEF));
+    // ~50% white over black: (255*128 + 0*127 + 127)/255 = 128 per channel.
+    try std.testing.expectEqual(@as(u32, 0xFF808080), blendPixel(0xFF000000, 0x80FFFFFF));
+    // Per-channel independence: half red over blue (a=128, inv=127).
+    try std.testing.expectEqual(@as(u32, 0xFF80007F), blendPixel(0xFF0000FF, 0x80FF0000));
+}
+
+test "blitPointer: clipped source-over sprite blit" {
+    const a = std.testing.allocator;
+    var fb = try video.Framebuffer.create(a, 8, 8, .xrgb8888, null);
+    defer fb.destroy(a);
+    var sprite = try video.Framebuffer.create(a, 4, 4, .argb8888, null);
+    defer sprite.destroy(a);
+    fb.fill(0xFF000000);
+    sprite.set(0, 0, 0xFFFFFFFF); // opaque white
+    sprite.set(1, 0, 0x00000000); // transparent
+    sprite.set(0, 1, 0x80FF0000); // half red
+
+    // Negative offset clips the top/left: only sprite (1,1)..(3,3) land,
+    // all transparent -> fb unchanged.
+    blitPointer(&fb, &sprite, -1, -1);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), fb.get(0, 0));
+
+    // Bottom-right clip: sprite (0,0) -> fb(6,6), (0,1) -> fb(6,7);
+    // columns/rows past the edge are dropped.
+    blitPointer(&fb, &sprite, 6, 6);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb.get(6, 6));
+    try std.testing.expectEqual(@as(u32, 0xFF800000), fb.get(6, 7));
+    try std.testing.expectEqual(@as(u32, 0xFF000000), fb.get(7, 6)); // transparent sprite (1,0)
+
+    // Fully out of bounds: no-op.
+    blitPointer(&fb, &sprite, 8, 0);
+    blitPointer(&fb, &sprite, 0, -4);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), fb.get(7, 7));
+}
+
+test "pointerPhysicalRect: crop/scale/rotate mapping" {
+    // 1:1 with an integer letterbox offset.
+    const aligned = layout.Plan{
+        .active = true,
+        .conn = .{ .width_px = 100, .height_px = 80 },
+        .src = .{ .x = 0, .y = 0, .w = 60, .h = 40 },
+        .scale = 1,
+        .dst = .{ .x = 20, .y = 20, .w = 60, .h = 40 },
+    };
+    try std.testing.expectEqual(
+        @as(?video.Damage, .{ .x = 25, .y = 25, .w = 12, .h = 19 }),
+        pointerPhysicalRect(aligned, .{ .x = 5, .y = 5, .w = 12, .h = 19 }),
+    );
+    // 2x upscale: the rect doubles in content space.
+    const scaled = layout.Plan{
+        .active = true,
+        .conn = .{ .width_px = 120, .height_px = 80 },
+        .src = .{ .x = 0, .y = 0, .w = 60, .h = 40 },
+        .scale = 2,
+        .dst = .{ .x = 0, .y = 0, .w = 120, .h = 80 },
+    };
+    try std.testing.expectEqual(
+        @as(?video.Damage, .{ .x = 10, .y = 10, .w = 24, .h = 38 }),
+        pointerPhysicalRect(scaled, .{ .x = 5, .y = 5, .w = 12, .h = 19 }),
+    );
+    // Right rotation swaps the extents: content (10,20)-(21,38) maps to
+    // native (pw-1-y, x) with pw=80.
+    const rotated = layout.Plan{
+        .active = true,
+        .conn = .{ .width_px = 80, .height_px = 100, .rotation = .right },
+        .src = .{ .x = 0, .y = 0, .w = 100, .h = 80 },
+        .scale = 1,
+        .dst = .{ .x = 0, .y = 0, .w = 100, .h = 80 },
+    };
+    try std.testing.expectEqual(
+        @as(?video.Damage, .{ .x = 41, .y = 10, .w = 19, .h = 12 }),
+        pointerPhysicalRect(rotated, .{ .x = 10, .y = 20, .w = 12, .h = 19 }),
+    );
+    // Largest-mode clipping: outside the viewport -> null; partial
+    // overlap keeps only the visible part.
+    const clipped = layout.Plan{
+        .active = true,
+        .conn = .{ .width_px = 50, .height_px = 50 },
+        .src = .{ .x = 10, .y = 10, .w = 40, .h = 40 },
+        .scale = 1,
+        .dst = .{ .x = 0, .y = 0, .w = 40, .h = 40 },
+    };
+    try std.testing.expectEqual(@as(?video.Damage, null), pointerPhysicalRect(clipped, .{ .x = 0, .y = 0, .w = 5, .h = 5 }));
+    try std.testing.expectEqual(
+        @as(?video.Damage, .{ .x = 0, .y = 0, .w = 5, .h = 5 }),
+        pointerPhysicalRect(clipped, .{ .x = 5, .y = 5, .w = 10, .h = 10 }),
+    );
+    // Inactive plan -> null.
+    try std.testing.expectEqual(@as(?video.Damage, null), pointerPhysicalRect(.{}, .{ .x = 0, .y = 0, .w = 5, .h = 5 }));
+}
+
+test "blitPointerViewport: scaled and rotated sprite placement" {
+    const a = std.testing.allocator;
+    var sprite = try video.Framebuffer.create(a, 2, 2, .argb8888, null);
+    defer sprite.destroy(a);
+    sprite.set(0, 0, 0xFFFFFFFF);
+    sprite.set(1, 0, 0xFF00FF00);
+    sprite.set(0, 1, 0xFF0000FF);
+    sprite.set(1, 1, 0x00000000);
+    const pos = pointer.Position{ .x = 5, .y = 5 };
+
+    // 2x upscale: each sprite pixel becomes a 2x2 block at (10,10).
+    var fb = try video.Framebuffer.create(a, 120, 80, .xrgb8888, null);
+    defer fb.destroy(a);
+    fb.fill(0xFF000000);
+    const scaled = layout.Plan{
+        .active = true,
+        .conn = .{ .width_px = 120, .height_px = 80 },
+        .src = .{ .x = 0, .y = 0, .w = 60, .h = 40 },
+        .scale = 2,
+        .dst = .{ .x = 0, .y = 0, .w = 120, .h = 80 },
+    };
+    blitPointerViewport(&fb, &sprite, pos, scaled);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb.get(10, 10));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb.get(11, 11));
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), fb.get(12, 10));
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), fb.get(10, 12));
+    try std.testing.expectEqual(@as(u32, 0xFF000000), fb.get(12, 12)); // transparent
+    try std.testing.expectEqual(@as(u32, 0xFF000000), fb.get(9, 9)); // outside
+
+    // Right rotation: sprite (0,0) at content (5,5) -> native (80-1-5,5)
+    // = (74,5); the 2x2 sprite spans content x 5..6, y 5..6 -> native
+    // x 73..74, y 5..6.
+    var rfb = try video.Framebuffer.create(a, 80, 100, .xrgb8888, null);
+    defer rfb.destroy(a);
+    rfb.fill(0xFF000000);
+    const rotated = layout.Plan{
+        .active = true,
+        .conn = .{ .width_px = 80, .height_px = 100, .rotation = .right },
+        .src = .{ .x = 0, .y = 0, .w = 100, .h = 80 },
+        .scale = 1,
+        .dst = .{ .x = 0, .y = 0, .w = 100, .h = 80 },
+    };
+    blitPointerViewport(&rfb, &sprite, pos, rotated);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), rfb.get(74, 5));
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), rfb.get(74, 6));
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), rfb.get(73, 5));
+    try std.testing.expectEqual(@as(u32, 0xFF000000), rfb.get(73, 6)); // transparent
+}
+
+test "onPointerTimer: autohide marks dirty exactly once; null pointer is a no-op" {
+    var c = testConsole();
+    // Null pointer: the callback is a no-op (init-failure path).
+    Console.onPointerTimer(undefined, 0, @intFromPtr(&c));
+    try std.testing.expect(!c.dirty);
+
+    // Visible pointer past its idle deadline: tick hides it and schedules
+    // the erase frame. frame_armed pins scheduleFrame so no real timerfd
+    // is needed.
+    c.frame_armed = true;
+    c.pointer = try pointer.Pointer.init(std.testing.allocator, 64, 64, .{});
+    defer if (c.pointer) |*p| p.deinit();
+    c.pointer.?.motion(10, 10, 0);
+    Console.onPointerTimer(undefined, 0, @intFromPtr(&c));
+    try std.testing.expect(!c.pointer.?.isVisible());
+    try std.testing.expect(c.dirty);
+
+    // Later ticks never re-hide or re-dirty (erase happens exactly once).
+    c.dirty = false;
+    Console.onPointerTimer(undefined, 0, @intFromPtr(&c));
+    try std.testing.expect(!c.dirty);
 }
