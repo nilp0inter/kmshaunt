@@ -23,7 +23,7 @@
 //!   rectangle per drawn row.
 //! * Blinking (M2.4): `RenderOpts.cursor_blink_on` is the session-wide
 //!   blink phase (null = blinking disabled). The renderer tracks it across
-//!   frames: a phase flip repaints the cursor row and every row holding
+//!   frames: a phase flip repaints the cursor's row span and every row holding
 //!   SGR-blink cells even when the render state is clean. SGR-blink glyphs
 //!   hide on the off-phase; only a cursor that requests blinking hides.
 //! * The grid is anchored at the framebuffer's top-left corner; centering
@@ -270,9 +270,16 @@ pub const CpuRenderer = struct {
     /// detect phase flips, which change no terminal data and so leave the
     /// render state clean.
     prev_blink_phase: ?bool = null,
-    /// Viewport row of the cursor drawn in the last successful frame;
-    /// repainted on a blink-phase flip together with the blink rows.
-    prev_cursor_row: ?u16 = null,
+    /// Grid-row span (inclusive) the cursor sprite touched in the last
+    /// successfully rendered frame: its cell band plus any vertical
+    /// overflow into neighboring rows (cursor_height > cell_h re-centers
+    /// the sprite). Repainted when the cursor moves, hides or blinks so
+    /// overflow pixels erase; null = no cursor drawn.
+    prev_cursor_span: ?RowSpan = null,
+    /// Cursor presentation of the last successfully rendered frame.
+    /// Compared against this frame's: a same-row move leaves the row span
+    /// unchanged but still relocates the overflow pixels.
+    prev_cursor: CursorDraw = .{},
 
     const FaceSlot = struct {
         face: discovery.Face,
@@ -455,11 +462,14 @@ pub const CpuRenderer = struct {
         // The blink timer flips the phase without touching terminal data,
         // so a phase change must repaint even a clean state (M2.4).
         const blink_changed = opts.cursor_blink_on != self.prev_blink_phase;
-        if (dirty == .clean and !images_changed and !blink_changed) return;
-
-        self.atlas.beginFrame();
         const colors = try state.colors();
         const cursor = try self.cursorDraw(state, opts, colors);
+        // A pure cursor move (CUP within one row) dirties no row, so the
+        // cursor identity must force a frame on a clean state too.
+        const cursor_changed = !std.meta.eql(cursor, self.prev_cursor);
+        if (dirty == .clean and !images_changed and !blink_changed and !cursor_changed) return;
+
+        self.atlas.beginFrame();
 
         // Redraw set: dirty rows plus every row touched by this frame's
         // or the previous frame's placements. Blending is not idempotent,
@@ -479,16 +489,25 @@ pub const CpuRenderer = struct {
         @memset(self.image_rows, false);
         for (self.placements.items) |p| self.markImageRows(p.dst);
         for (self.prev_placements.items) |p| self.markImageRows(p.dst);
+        const cur_span = self.cursorRowSpan(cursor);
         if (blink_changed) {
-            // Blink rows and the cursor row come from the previous frame:
-            // their contents cannot have changed without a dirty row.
+            // Blink rows come from the previous frame: their contents
+            // cannot have changed without a dirty row.
             for (self.blink_rows, 0..) |has_blink, y| {
                 if (has_blink) self.redraw_rows[y] = true;
             }
-            if (self.prev_cursor_row) |y| {
-                if (y < self.rows) self.redraw_rows[y] = true;
-            }
-            if (cursor.active) self.redraw_rows[cursor.y] = true;
+        }
+        if (blink_changed or cursor_changed or
+            !std.meta.eql(cur_span, self.prev_cursor_span))
+        {
+            // The cursor sprite can overflow its cell band into neighboring
+            // rows (cursor_height > cell_h). Rebuild every row the previous
+            // or current sprite touches: the cursor row's band fill alone
+            // cannot erase overflow pixels, and a blink flip hides/shows
+            // them too. The identity check catches same-row moves, which
+            // leave the row span unchanged. Damage follows the redraw set.
+            if (self.prev_cursor_span) |s| self.markCursorSpan(s);
+            if (cur_span) |s| self.markCursorSpan(s);
         }
 
         // Layer interleaving (ghostty-vt-api.md §9.6): below_background
@@ -524,7 +543,8 @@ pub const CpuRenderer = struct {
         );
         try state.clean();
         self.prev_blink_phase = opts.cursor_blink_on;
-        self.prev_cursor_row = if (cursor.active) cursor.y else null;
+        self.prev_cursor_span = cur_span;
+        self.prev_cursor = cursor;
     }
 
     // ------------------------------------------------------------------
@@ -532,9 +552,12 @@ pub const CpuRenderer = struct {
     // ------------------------------------------------------------------
 
     /// Collect every redraw row into the frame snapshot and paint its
-    /// backgrounds + block cursors. This is the frame's ONLY render-state
-    /// cell walk: the text pass reads the snapshot, halving the per-cell
-    /// C API cost (M8.1). `next` visits clean rows too: rows under kitty
+    /// backgrounds, then the block cursor once after ALL row fills: the
+    /// sprite can overflow into neighboring rows (cursor_height > cell_h),
+    /// and a later row's fill would overpaint the bottom overflow.
+    /// This is the frame's ONLY render-state cell walk: the text pass reads
+    /// the snapshot, halving the per-cell C API cost (M8.1). `next` visits
+    /// clean rows too: rows under kitty
     /// placements repaint even when the terminal state is clean.
     fn collectAndDrawBackgrounds(
         self: *CpuRenderer,
@@ -577,16 +600,17 @@ pub const CpuRenderer = struct {
                 while (x1 < n and row_cells[x1].bg == bg) : (x1 += 1) {}
                 const run_w: u16 = @intCast((x1 - x) * @as(usize, cw));
                 fillCell(f, @as(i32, @intCast(x)) * cw, y_px, run_w, ch, bg);
-                for (row_cells[x..x1], x..) |*rc, cx| {
-                    if (rc.is_cursor and cursor.style == .block) {
-                        const x_px: i32 = @as(i32, @intCast(cx)) * cw;
-                        deco.drawCursor(f.*, x_px, y_px, cw, ch, .block, cursor.color, true);
-                        // The overlay replaces the collected background.
-                        self.cell_inked[base + cx] = true;
-                    }
-                }
                 x = x1;
             }
+        }
+        // Block cursor after every row background: drawing it inside the
+        // walk lets a later row's fill overpaint its bottom overflow.
+        if (cursor.active and cursor.style == .block and self.redraw_rows[cursor.y]) {
+            const x_px: i32 = @as(i32, cursor.x) * cw;
+            const y_px: i32 = @as(i32, cursor.y) * ch;
+            deco.drawCursor(f.*, x_px, y_px, cw, ch, .block, cursor.color, true);
+            // The overlay replaces the collected background.
+            self.cell_inked[@as(usize, cursor.y) * self.cols + cursor.x] = true;
         }
     }
 
@@ -1703,8 +1727,9 @@ pub const CpuRenderer = struct {
     };
 
     /// Resolve this frame's cursor presentation. The cursor is drawn
-    /// inside the row walk; renderFrame repaints the cursor row when the
-    /// blink phase flips, so a clean render state still blinks (M2.4).
+    /// inside the row walk; renderFrame repaints the cursor's row span
+    /// (cell band + overflow) when it moves, hides or the blink phase
+    /// flips, so a clean render state still blinks (M2.4).
     /// Only a cursor that requests blinking hides on the off-phase; a
     /// steady cursor stays visible in both phases.
     fn cursorDraw(
@@ -1727,6 +1752,30 @@ pub const CpuRenderer = struct {
             .style = opts.cursor_style,
             .color = if (colors.cursor) |c| packRgb(c) else opts.default_fg,
         };
+    }
+
+    /// Inclusive grid-row range touched by a cursor sprite.
+    const RowSpan = struct { lo: u16, hi: u16 };
+
+    /// Grid rows the cursor sprite touches: its cell band plus vertical
+    /// overflow into neighboring rows (deco.cursorExtentY mirrors
+    /// drawCursor). Clipped to the grid; null when nothing is drawn.
+    fn cursorRowSpan(self: *const CpuRenderer, cursor: CursorDraw) ?RowSpan {
+        if (!cursor.active) return null;
+        const ch: i32 = self.metrics.cell_h;
+        const ext = deco.cursorExtentY(self.metrics.cell_h, cursorStyle(cursor.style));
+        if (ext.y1 <= ext.y0) return null;
+        const top = @as(i32, cursor.y) * ch + ext.y0;
+        const bot = @as(i32, cursor.y) * ch + ext.y1;
+        const lo = @max(@as(i32, 0), @divFloor(top, ch));
+        const hi = @min(@as(i32, self.rows) - 1, @divFloor(bot - 1, ch));
+        if (hi < lo) return null;
+        return .{ .lo = @intCast(lo), .hi = @intCast(hi) };
+    }
+
+    fn markCursorSpan(self: *CpuRenderer, s: RowSpan) void {
+        var y: u32 = s.lo;
+        while (y <= @as(u32, s.hi)) : (y += 1) self.redraw_rows[@intCast(y)] = true;
     }
 
     // ------------------------------------------------------------------
@@ -2820,6 +2869,88 @@ test "cpu: cursor blink phase repaints the cursor row on a clean state (M2.4)" {
     o.cursor_blink_on = false;
     try env.renderOpts(&damage, o);
     try testing.expectEqual(cursor_color, env.f.get(2 * cw + cw / 2, ch / 2));
+}
+
+test "cpu: cursor taller than the cell erases overflow on move, hide and blink" {
+    const a = testing.allocator;
+    var env = try Env.init(a, 40, 8);
+    defer env.deinit(a);
+    const cw: u32 = env.cpu.metrics.cell_w;
+    const ch: u32 = env.cpu.metrics.cell_h;
+    const bg = env.palette[17];
+    const cursor_color = env.palette[16]; // no explicit cursor color: default fg
+    env.f.fill(bg);
+
+    const saved = deco.cursor_height;
+    defer deco.cursor_height = saved;
+    deco.cursor_height = @intCast(ch + 4); // y_off -2: 2px into each neighbor
+
+    const blink_default = true;
+    try env.t.setOption(.default_cursor_blink, &blink_default);
+    var damage: DamageList = .empty;
+    defer damage.deinit(a);
+    var o = env.opts();
+
+    // Cursor at (2,1): overflow into row 0 (top 2px) and row 2 (bottom 2px).
+    env.t.write("\x1b[2;3H");
+    try env.renderOpts(&damage, o);
+    const cx: u32 = 2 * cw + cw / 2;
+    try testing.expectEqual(cursor_color, env.f.get(cx, ch - 2));
+    try testing.expectEqual(cursor_color, env.f.get(cx, ch - 1));
+    try testing.expectEqual(cursor_color, env.f.get(cx, 2 * ch));
+    try testing.expectEqual(cursor_color, env.f.get(cx, 2 * ch + 1));
+
+    // Typing move: the written cell dirties the row; the band repaints and
+    // the overflow must erase with it (the reported trail).
+    damage.clearRetainingCapacity();
+    env.t.write("x"); // 'x' at (2,1), cursor -> (3,1)
+    try env.renderOpts(&damage, o);
+    const tx: u32 = 3 * cw + cw / 2;
+    try testing.expectEqual(bg, env.f.get(cx, ch - 2));
+    try testing.expectEqual(bg, env.f.get(cx, ch - 1));
+    try testing.expectEqual(bg, env.f.get(cx, 2 * ch));
+    try testing.expectEqual(bg, env.f.get(cx, 2 * ch + 1));
+    try testing.expectEqual(cursor_color, env.f.get(tx, ch - 2));
+    try testing.expectEqual(cursor_color, env.f.get(tx, 2 * ch + 1));
+    // Damage covers the overflow rows, not only the cursor row.
+    var saw_row0 = false;
+    var saw_row2 = false;
+    for (damage.items) |d| {
+        if (d.y == 0 and d.h == ch) saw_row0 = true;
+        if (d.y == 2 * ch and d.h == ch) saw_row2 = true;
+    }
+    try testing.expect(saw_row0);
+    try testing.expect(saw_row2);
+
+    // Pure CUP move within the row: no cell change, so the render state is
+    // clean; the cursor identity change alone must drive the repaint.
+    damage.clearRetainingCapacity();
+    env.t.write("\x1b[2;6H"); // cursor (5,1)
+    try env.renderOpts(&damage, o);
+    const nx: u32 = 5 * cw + cw / 2;
+    try testing.expectEqual(bg, env.f.get(tx, ch - 2));
+    try testing.expectEqual(bg, env.f.get(tx, 2 * ch + 1));
+    try testing.expectEqual(cursor_color, env.f.get(nx, ch - 2));
+    try testing.expectEqual(cursor_color, env.f.get(nx, 2 * ch + 1));
+
+    // Hide: the overflow erases with the cursor.
+    env.t.write("\x1b[?25l");
+    try env.renderOpts(&damage, o);
+    try testing.expectEqual(bg, env.f.get(nx, ch - 2));
+    try testing.expectEqual(bg, env.f.get(nx, 2 * ch + 1));
+
+    // Show, then blink off/on: the overflow follows the phase.
+    env.t.write("\x1b[?25h");
+    try env.renderOpts(&damage, o);
+    try testing.expectEqual(cursor_color, env.f.get(nx, ch - 2));
+    o.cursor_blink_on = false;
+    try env.renderOpts(&damage, o);
+    try testing.expectEqual(bg, env.f.get(nx, ch - 2));
+    try testing.expectEqual(bg, env.f.get(nx, 2 * ch + 1));
+    o.cursor_blink_on = true;
+    try env.renderOpts(&damage, o);
+    try testing.expectEqual(cursor_color, env.f.get(nx, ch - 2));
+    try testing.expectEqual(cursor_color, env.f.get(nx, 2 * ch + 1));
 }
 
 test "cpu: palette indices beyond 16 use the xterm cube" {

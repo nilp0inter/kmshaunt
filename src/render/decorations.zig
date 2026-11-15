@@ -361,6 +361,33 @@ pub fn drawCursor(
     }
 }
 
+/// Vertical pixel extent [y0, y1) of the cursor shape relative to the cell
+/// top, clipped to the extended sprite canvas (quarter-cell padding) exactly
+/// like drawCursor. The renderer sizes its redraw/damage row set from this:
+/// a cursor taller than the cell (cursor_height > cell_h) re-centers into
+/// neighboring rows, and those rows must repaint when the cursor moves.
+pub fn cursorExtentY(cell_h: u16, style: CursorStyle) struct { y0: i32, y1: i32 } {
+    if (cell_h == 0) return .{ .y0 = 0, .y1 = 0 };
+    const h: i32 = cell_h;
+    const ct: i32 = cursor_thickness;
+    const pad_y: i32 = @divTrunc(h, 4);
+    var y0: i32 = 0;
+    var y1: i32 = 0;
+    switch (style) {
+        .block, .hollow, .bar => {
+            const ch_eff: i32 = if (cursor_height) |ch| @as(i32, ch) else h;
+            y0 = @divTrunc(h - ch_eff, 2);
+            y1 = y0 + ch_eff;
+        },
+        .underline => {
+            const pos: i32 = if (cursor_underline_pos) |p| @as(i32, p) else h -| ct;
+            y0 = @min(pos, h + pad_y -| ct);
+            y1 = y0 + ct;
+        },
+    }
+    return .{ .y0 = @max(y0, -pad_y), .y1 = @min(y1, h + pad_y) };
+}
+
 // ---------------------------------------------------------------------------
 // Solid rectangles (canvas.rect port)
 // ---------------------------------------------------------------------------
@@ -2027,6 +2054,58 @@ test "cursor height knob centers block/bar/hollow; underline keeps cell height" 
     drawCursor(f, 2, 2, 8, 10, .underline, 0xFF0000, true);
     try expectRows(f, 2, 10, 11, 0xFF0000);
     try testing.expectEqual(@as(usize, 8), countColor(f, 0xFF0000));
+}
+
+test "cursorExtentY matches the drawn pixels for every style and height" {
+    const a = testing.allocator;
+    var f = try Framebuffer.create(a, 40, 40, .xrgb8888, null);
+    defer f.destroy(a);
+    const saved_h = cursor_height;
+    const saved_pos = cursor_underline_pos;
+    defer cursor_height = saved_h;
+    defer cursor_underline_pos = saved_pos;
+    const color: u32 = 0x00FF00;
+    const cell_x: i32 = 8;
+    const cell_y: i32 = 12;
+    const cw: u16 = 8;
+    const ch: u16 = 10;
+    const styles = [_]CursorStyle{ .block, .hollow, .bar, .underline };
+    const heights = [_]?u16{ null, 6, 10, 14, 30 };
+    for (styles) |style| {
+        for (heights) |mh| {
+            cursor_height = mh;
+            cursor_underline_pos = null;
+            f.fill(0);
+            drawCursor(f, cell_x, cell_y, cw, ch, style, color, true);
+            const ext = cursorExtentY(ch, style);
+            var min_y: ?u32 = null;
+            var max_y: ?u32 = null;
+            for (0..f.height) |y| {
+                for (0..f.width) |x| {
+                    if (f.get(@intCast(x), @intCast(y)) == color) {
+                        if (min_y == null) min_y = @intCast(y);
+                        max_y = @intCast(y);
+                    }
+                }
+            }
+            if (ext.y1 <= ext.y0) {
+                try testing.expect(min_y == null);
+            } else {
+                try testing.expectEqual(@as(u32, @intCast(cell_y + ext.y0)), min_y.?);
+                try testing.expectEqual(@as(u32, @intCast(cell_y + ext.y1 - 1)), max_y.?);
+            }
+        }
+    }
+    // Underline position beyond the cell clamps to the extended canvas.
+    cursor_height = null;
+    cursor_underline_pos = 14; // ch 10 + pad 2 - thickness 1 = 11
+    const ext = cursorExtentY(ch, .underline);
+    try testing.expectEqual(@as(i32, 11), ext.y0);
+    try testing.expectEqual(@as(i32, 12), ext.y1);
+    f.fill(0);
+    drawCursor(f, cell_x, cell_y, cw, ch, .underline, color, true);
+    try testing.expectEqual(color, f.get(@intCast(cell_x), @intCast(cell_y + 11)));
+    try testing.expectEqual(@as(u32, 0), f.get(@intCast(cell_x), @intCast(cell_y + 12)));
 }
 
 test "adjusted underline position overrides the renderer-computed row" {
