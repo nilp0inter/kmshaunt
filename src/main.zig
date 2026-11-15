@@ -582,8 +582,9 @@ const Console = struct {
     frame_cost_ns: u64 = 0,
     /// Monotonic deadline before which a burst frame may be deferred.
     frame_due_ns: i64 = 0,
-    /// When the armed frame timer fires (ns); lets a pending full redraw
-    /// preempt a burst-deferred arm without re-arming on every markDirty.
+    /// When the armed frame timer fires (ns); lets a pending full redraw or
+    /// interactive input preempt a burst-deferred arm without re-arming on
+    /// every markDirty (which would postpone the frame forever).
     frame_arm_deadline_ns: i64 = 0,
     /// Last pty pump completion (ns); the burst-activity gate.
     last_pump_ns: i64 = 0,
@@ -1397,22 +1398,37 @@ const Console = struct {
     /// damage-driven model, M8.1).
     fn markDirty(self: *Console) void {
         self.dirty = true;
-        self.scheduleFrame();
+        self.scheduleFrame(false);
+    }
+
+    /// Interactive damage (input). Drops the burst deferral deadline so the
+    /// echo or pointer motion is not held back, and pulls a burst-deferred
+    /// arm forward to one refresh out. The armed flag is deliberately NOT
+    /// reset: a frame already armed within one refresh expires on time, and
+    /// re-arming on every event would push the deadline back forever while
+    /// events keep arriving (the starvation scheduleFrame guards).
+    fn promptFrame(self: *Console) void {
+        self.frame_due_ns = 0;
+        self.dirty = true;
+        self.scheduleFrame(true);
     }
 
     /// Arm the one-shot frame timer unless a frame is already scheduled.
     /// Re-arming on every markDirty would push the deadline back forever
     /// under continuous output (starvation), so the armed flag pins it.
-    fn scheduleFrame(self: *Console) void {
+    /// `prompt` (full redraw or input) re-arms only when the current arm
+    /// fires later than one refresh from now, so it pulls an early-enough
+    /// arm no further out and repeated calls stay pinned.
+    fn scheduleFrame(self: *Console, prompt: bool) void {
         const interval = self.frameIntervalNs();
         const now = monotonicNs();
         if (self.frame_armed) {
-            // A pending full redraw must not wait out a burst deferral: if
-            // the current arm fires later than one refresh from now, re-arm
-            // promptly. Once re-armed at `interval` the deadline is pinned
-            // again, so repeated markDirty cannot starve it.
-            const prompt = now + @as(i64, @intCast(interval));
-            if (!(self.full_redraw and self.frame_arm_deadline_ns > prompt)) return;
+            // A pending full redraw or interactive input must not wait out a
+            // burst deferral: if the current arm fires later than one refresh
+            // from now, re-arm promptly. Once re-armed at `interval` the
+            // deadline is pinned again, so repeated calls cannot starve it.
+            const soon = now + @as(i64, @intCast(interval));
+            if (!((prompt or self.full_redraw) and self.frame_arm_deadline_ns > soon)) return;
         }
         self.frame_timer.armOneShot(interval) catch |err| {
             log.warn("frame timer: {t}", .{err});
@@ -2436,12 +2452,12 @@ const Console = struct {
         // terminal.c:978); the key itself still reaches the session.
         if (event == .key) self.stopPlayback();
         if (self.mgr) |*m| m.onInput(event) catch |err| log.warn("onInput: {t}", .{err});
-        // Interactive input is never held by the burst stretch: clear the
-        // deferral deadline and re-arm the frame timer at the normal refresh
-        // (a deferred arm would otherwise keep the echo waiting).
-        self.frame_due_ns = 0;
-        self.frame_armed = false;
-        self.markDirty();
+        // Interactive input is never held by the burst stretch: promptFrame
+        // clears the deferral deadline and pulls the arm to one refresh out.
+        // It must not reset the armed flag (as this once did): that restarts
+        // the one-shot timer on every event, so a continuous event stream
+        // postponed the frame forever instead of rendering it.
+        self.promptFrame();
     }
 
     /// Advance the active terminal's kitty animations and arm the redraw
@@ -3310,6 +3326,96 @@ test "onInput: seat inactive drops the event (no VT input leak)" {
     } };
     Console.onInput(@intFromPtr(&c), ev);
     try std.testing.expect(!c.dirty);
+}
+
+/// Counts frame timer expirations for the scheduling tests.
+const FrameProbe = struct {
+    count: u32 = 0,
+
+    fn onExpire(_: *loop.Timer, _: u64, ud: usize) void {
+        const self: *FrameProbe = @ptrFromInt(ud);
+        self.count += 1;
+    }
+};
+
+test "onInput: a stream of input cannot postpone the armed frame" {
+    // Regression: onInput cleared frame_armed on every event, which restarted
+    // the one-shot timer each time. A continuous input stream (mouse motion)
+    // then kept pushing the frame deadline out instead of rendering it, and
+    // the re-arm also erased an already-expired but unread timer notification.
+    // Input may pull a burst-deferred arm forward -- once; later events must
+    // leave the pinned deadline alone.
+    var lp = try loop.Loop.init();
+    defer lp.deinit();
+    var probe = FrameProbe{};
+    var c = testConsole();
+    try c.frame_timer.init(&lp, .{
+        .callback = FrameProbe.onExpire,
+        .userdata = @intFromPtr(&probe),
+    });
+    defer c.frame_timer.deinit();
+    c.seat_active = true; // onInput drops events while the seat is inactive
+    c.full_redraw = false;
+    // onInput wakes DPMS before dispatching; a zero timeout keeps armDpms
+    // from touching the (uninitialized) DPMS timer.
+    var cfg = config.Config.init(std.testing.allocator);
+    defer cfg.deinit();
+    cfg.dpms_timeout = 0;
+    c.cfg = &cfg;
+
+    const interval: i64 = @intCast(c.frameIntervalNs());
+    // Simulate a burst deferral: the timer is armed at frame_due_ns, four
+    // refreshes out.
+    c.frame_due_ns = monotonicNs() + 4 * interval;
+    c.frame_armed = true;
+    c.frame_arm_deadline_ns = c.frame_due_ns;
+
+    const ev = sess.InputEvent{ .pointer_motion = .{
+        .dx = 1,
+        .dy = 1,
+        .absolute = false,
+        .x = 10,
+        .y = 10,
+    } };
+    Console.onInput(@intFromPtr(&c), ev);
+    try std.testing.expectEqual(@as(i64, 0), c.frame_due_ns); // deferral dropped
+    try std.testing.expect(c.frame_arm_deadline_ns <= monotonicNs() + interval);
+    const pinned = c.frame_arm_deadline_ns;
+    for (0..8) |_| Console.onInput(@intFromPtr(&c), ev);
+    try std.testing.expectEqual(pinned, c.frame_arm_deadline_ns);
+    try std.testing.expect(c.frame_armed);
+
+    // The pinned arm still expires: the pending wakeup was not erased.
+    _ = try lp.runOnce(500);
+    try std.testing.expectEqual(@as(u32, 1), probe.count);
+}
+
+test "scheduleFrame: burst arm pinned for output, pulled forward for full redraw" {
+    var lp = try loop.Loop.init();
+    defer lp.deinit();
+    var probe = FrameProbe{};
+    var c = testConsole();
+    try c.frame_timer.init(&lp, .{
+        .callback = FrameProbe.onExpire,
+        .userdata = @intFromPtr(&probe),
+    });
+    defer c.frame_timer.deinit();
+
+    const interval: i64 = @intCast(c.frameIntervalNs());
+    const due = monotonicNs() + 4 * interval;
+    c.frame_due_ns = due;
+    c.frame_armed = true;
+    c.frame_arm_deadline_ns = due;
+
+    // Pty-driven damage keeps the burst deadline: coalescing is the point.
+    c.full_redraw = false;
+    c.markDirty();
+    try std.testing.expectEqual(due, c.frame_arm_deadline_ns);
+
+    // A full redraw must not wait out the deferral.
+    c.full_redraw = true;
+    c.markDirty();
+    try std.testing.expect(c.frame_arm_deadline_ns < due);
 }
 
 test "uniqueCards: dedupes shared card backends in first-output order" {
