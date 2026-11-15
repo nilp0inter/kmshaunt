@@ -1,331 +1,360 @@
-# kmshaunt roadmap
+# kmshaunt roadmap: Tern Surface Protocol (TSP)
 
-A Linux KMS/DRM console written in Zig on top of libghostty-vt. Goal: full feature
-parity with kmscon 10.x, plus two things kmscon lacks:
+A Linux KMS/DRM console written in Zig on top of libghostty-vt. The kmscon
+parity foundation is complete. Its plan is archived at
+[`docs/archive/ROADMAP-kmscon-parity.md`](docs/archive/ROADMAP-kmscon-parity.md)
+(milestones M0–M8, the parity matrix, and the original decisions D1–D7).
 
-- **R1** correct text: grapheme clusters, shaping, font fallback, color emoji,
-  pixel-exact box drawing.
-- **R2** Kitty graphics protocol images.
+This roadmap adds the next capability: **full TSP parity**. TSP lets a program
+in a pane describe its UI as a tree of semantic nodes. The terminal lays the
+tree out, draws it, and animates it natively. The program stops painting cells.
 
-Name: **kmshaunt**. A haunt is the place a ghost lives in, and the VT is the
-place libghostty lives in here. The binary is `kmshaunt`, the config is
-`/etc/kmshaunt/kmshaunt.conf`, the units are `kmshaunt-vt@.service` and
-`kmshaunt.service`, and the NixOS module is `services.kmshaunt`.
+The goal is a console that gives GUI niceties without a graphical system. A
+logged-in user runs a TSP program (the first consumer is omp) and gets native
+surfaces: cards, tables, forms, progress, editors. The pre-login console stays
+a plain, fast, reliable cell grid.
 
-Estimate: about 10 weeks full-time, about 20 weeks part-time.
+**TSP is a compile-time option.** The default build links no web engine and
+stays the lean standalone console it is today. TSP is built only when asked
+for (`-Dtsp=true`). This keeps the engine's footprint and attack surface out
+of every build that does not need it.
+
+Name and units are unchanged: binary `kmshaunt`, config
+`/etc/kmshaunt/kmshaunt.conf`, units `kmshaunt-vt@.service` and
+`kmshaunt.service`, NixOS module `services.kmshaunt`.
+
+Estimate: about 15–22 weeks full-time, for the TSP-enabled build. P2 (the kind
+mapping) dominates. Packaging is de-risked by an existing WPE WebKit flake
+(see §1); the remaining wildcard is the mapping volume.
 
 ## 1. Facts this plan rests on
 
-Checked on 2026-11-13.
+Checked on 2026-11-14.
 
 | Fact | Source |
 |---|---|
-| libghostty-vt 1.0.1 builds only with Zig 0.17 | lib.ghostty.org/vt/installing.html |
-| nixpkgs (26.11, f9a75f4) has `zig` 0.17.1, `zon2nix`, `kmscon` 10.1.0, `harfbuzz` 14.5.1 | `nix eval` |
-| libghostty-vt exposes a C API with an ABI promise. A Zig build links it with `dep.artifact("ghostty-vt")`. The Zig module (`dep.module("ghostty-vt")`) has no such promise | installing.html |
-| It provides render state with dirty rows, key, mouse, focus and paste encoders, selection, search, effects callbacks, Kitty graphics storage and placements | lib.ghostty.org/vt |
-| It ships no PNG decoder. The host installs one with `GHOSTTY_SYS_OPT_DECODE_PNG` | guide-images.html |
-| HarfBuzz `hb-raster` (stable since 13.0) rasterizes outlines and color paint graphs (COLR) to BGRA | harfbuzz.github.io/harfbuzz-hb-raster.html |
-| The nixpkgs harfbuzz build does not ship `libharfbuzz-raster`, so an overlay must enable it | `ls` of the store path |
-| nixpkgs `nixosTests.kmscon` boots kmscon with `hwaccel = true` and checks it with OCR | nixos/tests/kmscon.nix |
-| The kmscon option set is listed in the appendix | kmscon `src/config.c` |
+| TSP travels in-band on the pty as APC strings: `ESC _ tsp;<verb>[;k=v]*;<JSON> ESC \`. Verbs `q/o/f/b/s/x` go program→terminal, `r/e` go terminal→program. | docs.stencil.so/tern/protocol/transport.html |
+| The terminal answers `hello` before the DA1 reply. The reply advertises `kinds` and `features`. A kind not listed falls back to pre-rendered ANSI `rows`. | protocol/handshake.html |
+| A surface occupies exactly one grid row (its anchor) but draws at natural height between grid runs. Modes: `inline`, `screen`, `flow`. Regions: `main`, `dock`, `layer`. Lifecycle binds to the anchor row, OSC 133;A, process exit, and RIS. | protocol/surfaces.html |
+| The document is an id-addressed node tree of ~73 kinds, changed by atomic frames of ops. Flow control: 2 unacknowledged frames, ack per drawn frame. Retention: 64 MiB per pane, settled nodes evicted with `gone`. | protocol/documents.html, protocol/operations.html |
+| Limits: one APC string 262144 bytes, chunk body 65536, joined frame 400 MB, one blob 16 MiB, 200000 nodes per surface, depth 64, 256 KiB CSS per surface. | protocol/operations.html |
+| WPEPlatform is the stable WPE integration API since WPE WebKit 2.54. libwpe and Cog are deprecated. Built-in platforms: Wayland, DRM/KMS, headless. | wpewebkit.org/blog/2026-10-06-wpe-platform.html |
+| The web process renders into DMA-BUF (or SHM) buffers shared with the UI process. A platform captures them by subclassing `WPEView` and implementing `render_buffer`. | wpewebkit.org/reference/2.54.0/wpe-platform-2.0/overview.html |
+| `WPEBufferDMABuf` exposes fd, FourCC format, modifier, stride, offset, plane count, width, height. `WPEBuffer` imports to an EGL image or to CPU pixels, and carries release/rendering fences. | reference/.../class.BufferDMABuf.html |
+| `WPESettings` exposes dark mode, reduced motion, and contrast. These map to TSP `dark` and `reduceMotion`. | reference/.../overview.html |
+| `eval-exec/nix-wpe-webkit` packages `wpewebkit` 2.52.3 with `ENABLE_WPE_PLATFORM=true`, pkg-config `wpe-webkit-2.0`, bubblewrap + libseccomp + xdg-dbus-proxy (sandbox), and libdrm/libgbm/mesa/libepoxy (graphics). It ships a flake overlay and the public `nix-wpe-webkit.cachix.org` cache, where 2.52.3 is prebuilt (narinfo verified). | github.com/eval-exec/nix-wpe-webkit, pkgs/wpewebkit.nix, ci.yml |
+| The pinned nixpkgs (`d4f25a3e5620`) has `libwpe`, `libwpe-fdo`, `webkitgtk_4_1/6_0`, `cog 0.2.4`, but no `wpewebkit`. The flake above supplies it. | `nix eval` on the flake input |
+| The default kmshaunt binary is standalone and statically linked against libghostty-vt, with no shared-lib rpath. TSP must not add a web engine to it. | nix/package.nix header |
+| kmshaunt wraps the ghostty-vt `unknown_sequence` effect (APC+OSC). `setEffects` sets `UNKNOWN_MAX_BYTES` to 2048 (src/vt.zig:1232). `APC_MAX_BYTES` is a separate option. `effUnknown` handles only the kmscon private OSCs today. | src/vt.zig, src/session/terminal.zig |
+| The pty reply path is inline during the drain, so a hello reply written in `effUnknown` precedes the DA1 reply. | src/session/terminal.zig |
+| A session draws into `RenderContext.fb` plus a damage list. The video backend presents through `endFrame`. Sessions never present or flip. | src/session.zig |
+| The terminal session spawns `cfg.login_argv` (`/bin/login -p`) as root and drains the pty. It does not track the uid transition after login. | src/session/terminal.zig |
+| Video backends: drm2d (dumb buffers), drm3d (GBM+EGL+GLES2), fbdev. | src/video/ |
+| The kmscon parity foundation is complete: M8.1 equal-or-better on all vtebench, T4 parity green on both nodes, T2/T3 goldens pixel-exact, plus ghostty pixel-parity and notcurses perf work. | git log, docs/archive/ROADMAP-kmscon-parity.md |
 
-## 2. Decisions (defaults assumed by this plan)
+## 2. Decisions
 
 | ID | Decision | Default | Alternative |
 |---|---|---|---|
-| D1 | libghostty binding | C API through `b.addTranslateC` of `ghostty/vt.h`, wrapped once in `src/vt.zig`, pinned to 1.0.1 in `build.zig.zon` | Zig module. Rejected: no stability promise, so every upgrade risks breakage |
-| D2 | Threading | One thread, one epoll loop, frames paced by DRM page-flip events | Separate IO and render threads (Ghostty's model). Only if M8 numbers require it |
-| D3 | C libraries | System libraries through `b.addTranslateC`: libdrm, gbm, EGL, GLESv2, libinput, libudev, xkbcommon, libseat, libsystemd (sd-login, sd-bus), fontconfig, FreeType, HarfBuzz (+raster) | Pure-Zig rewrites. Rejected: more work for no user-visible gain |
-| D4 | PNG decoder for Kitty images | libspng (small, fuzzed by OSS-Fuzz) | `hb_raster_image_deserialize_from_png_or_fail` (no extra dependency, unknown hardening), wuffs |
-| D5 | Config | Same option names, `no-` boolean prefix and file syntax as kmscon. File at `/etc/kmshaunt/kmshaunt.conf` | New format. Rejected: blocks migration and parity tests |
-| D6 | `TERM` default | `xterm-ghostty`. The NixOS module installs Ghostty's terminfo | `xterm-256color` |
-| D7 | Font rendering | FreeType for outlines and bitmap color glyphs (CBDT/sbix), `hb_raster_paint` for COLRv0/v1, HarfBuzz for shaping | Only HarfBuzz (no hinting) |
+| D1 | Render engine | WPE WebKit (WPEPlatform), packaged via the `eval-exec/nix-wpe-webkit` flake input. Use 2.52.3 from its Cachix (verified cached); no bump. Target the 2.52.3 WPEPlatform API. | WebKitGTK `webkitgtk_6_0`. Packaged in nixpkgs, but pulls GTK4 and gives a less direct offscreen path. Rejected for the helper. |
+| D2 | Scope | TSP is post-login only. The root pre-login console never renders TSP. | TSP everywhere. Rejected: it forces untrusted rendering into the root console. |
+| D3 | Buffer capture | A custom WPEPlatform module subclasses `WPEDisplay`/`WPEView`/`WPEToplevel`. Its `render_buffer` vfunc exports `WPEBufferDMABuf` to the daemon. | The built-in headless platform. Less control over buffer hand-off and input. |
+| D4 | Privilege | The helper runs as the logged-in uid. WebKit spawns its own sandboxed web process. The root daemon parses no untrusted JSON, CSS, or HTML. It does framing only. | Single root process. Rejected: it points a full web engine at untrusted pty output as root. |
+| D5 | Grid renderer | Unchanged. The CPU/GL grid renderer and its byte-exact goldens stay. TSP surfaces composite as separate buffers at their anchors. | Render the whole pane in the engine. Rejected: it throws away the parity renderer and its determinism. |
+| D6 | IPC | Unix socket with `SCM_RIGHTS` DMA-BUF fd passing. A small control + event protocol. | sd-bus. Heavier for a per-session buffer stream. |
+| D7 | TSP test model | DOM/event assertions, tolerant screenshots, and tern-sdk conformance. Separate from the grid goldens. The T4 grid parity suite must stay green. | Byte-exact goldens for surfaces. Rejected: engine rasterization drifts across versions and GPUs. |
+| D8 | TSP is a compile-time option | `zig build -Dtsp=true`, default false. The default build compiles out `src/tsp/` and the helper and links no WPE. A runtime `tsp` config gates TSP within a TSP-enabled build. `TERM_PROGRAM=kmshaunt` (not `tern`). | Runtime-only opt-in. Rejected: it leaves the engine in every binary and breaks the standalone default. |
+| D9 | Privilege-handoff trigger | A PAM session hook (`pam_exec`) notifies the daemon of the uid at session open. Resolve in P1 (Q1). | Detect the uid from the pty slave owner, or watch the child uid transition. |
+| D10 | Build flavors | `kmshaunt` (no TSP, standalone) and `kmshaunt-tsp` (daemon TSP code + the helper). The helper is a separate executable that links WPE. The daemon stays static. The NixOS module selects the flavor. | One binary that always links WPE. Rejected: see D8. |
 
-"Parity" means kmscon's user-visible behavior and options, not its internals.
-`font-engine=pango` is accepted as an alias of `freetype`, because the FreeType
-engine covers everything Pango did in kmscon.
+"Full parity" means the TSP v1 kind vocabulary, features, events, and limits,
+not Tern's own app chrome (media viewer, image zoom viewer, spell checker).
+Kinds the console cannot honor are not advertised in the hello reply.
 
 ## 3. Architecture
 
+The split is by privilege and by test model. The root daemon keeps the grid.
+A per-session user-uid helper renders surfaces with WPE WebKit. They exchange
+buffers and events over a socket.
+
+Everything TSP is gated by the compile-time option. With `-Dtsp=false` (the
+default), `src/tsp/` and the helper are not compiled and no WPE is linked. The
+daemon's TSP code (framing, routing, anchoring, compositing) is pure Zig on top
+of libdrm/gbm/EGL, which the daemon already links. WPE lives only in the helper
+executable, built only with `-Dtsp=true`.
+
 ```mermaid
 flowchart LR
-  cfg[config: CLI + file + locale1] --> seat
-  seat[seat: real VT / libseat / fake VT + sd-login multi-seat] --> video
-  seat --> input
-  video[video: drm2d / drm3d / fbdev, hotplug, layout, rotation, DPMS] --> render
-  input[input: libinput + xkbcommon + compose + grabs] --> sessions
-  sessions[session manager: terminal / dummy sessions] --> term
-  term[terminal session: pty + ghostty-vt Terminal + effects] --> render
-  render[renderer: CPU / GL, damage tracking] --> font[font: fontconfig, FreeType, HarfBuzz, hb-raster, sprites, PSF, bitmap]
-  render --> img[image cache: Kitty placements, scaler, compositor]
+  subgraph root [root daemon: kmshaunt]
+    vt[ghostty-vt + APC framing router]
+    grid[grid renderer: cpu / gl, byte-exact]
+    comp[surface compositor + anchor placement]
+    inroute[input routing]
+  end
+  subgraph helper [user-uid helper: WPE WebKit, sandboxed web process]
+    map[TSP JSON to DOM mapping]
+    engine[layout / draw / animation / editing]
+    plat[custom WPEPlatform: render_buffer]
+    bridge[DOM events to TSP events]
+  end
+  vt -->|raw TSP messages| map
+  map --> engine --> plat
+  plat -->|DMA-BUF fd + control| comp
+  bridge -->|TSP e events| vt
+  inroute -->|pointer / key| engine
+  grid --> comp
+  comp --> out[DRM / fbdev present]
 ```
 
-Source layout:
+Root daemon responsibilities (bounded, no untrusted parsing):
+
+- APC framing and chunk reassembly, with the spec limits enforced.
+- Route raw `tsp;` messages to the helper. Install the OSC 133 and OSC 7501
+  effects for lifecycle.
+- Place surface buffers at their anchors in the grid arithmetic. Composite
+  them with the grid output. Feed content height back.
+- Route pointer and key events. Arbitrate focus between grid and surface.
+
+Helper responsibilities (unprivileged, sandboxed):
+
+- Parse TSP JSON. Map kinds to HTML+CSS, theme tokens to CSS variables, and
+  frames/ops to DOM mutations. The protocol's "what a node becomes" section is
+  the mapping spec.
+- Layout, drawing, animation, native editing, selection, IME, event generation.
+- Render offscreen to DMA-BUF. Export buffers through the custom platform.
+- Bridge DOM events back to TSP `e` events. Decode blobs.
+
+Source layout (new code, all under the `-Dtsp` gate):
 
 ```
-build.zig, build.zig.zon, deps.nix (zon2nix)
-src/main.zig            startup, config, main loop
-src/loop.zig            epoll, timerfd, signalfd
-src/vt.zig              thin Zig wrapper over the libghostty-vt C API (only file that touches it)
-src/config/             CLI + file parser, grabs, palettes
-src/seat/               vt_real, libseat, vt_fake, multiseat (sd-login)
-src/video/              drm (shared modeset, udev hotplug), drm2d, drm3d, fbdev, layout, dpms
-src/input/              libinput, xkb (keymap, compose, repeat), xkb→ghostty key map, grabs
-src/session/            manager, terminal (pty + ghostty-vt + effects), dummy
-src/render/             frame walk + damage, cpu, gl, image
-src/font/               discovery, face, shaper, color, atlas, sprite/, psf, bitmap
-src/misc/               issue, asciicast, locale1, pty
-tools/render_golden.zig headless renderer for tests (not installed)
-nix/                    package.nix, module.nix, overlay.nix, tests/
+build.zig                  -Dtsp option -> build_options.tsp; helper target
+src/tsp/transport.zig      APC framing, chunking, limits (root)
+src/tsp/router.zig         message routing, surface control protocol (root)
+src/tsp/anchor.zig         anchor placement, height feedback, lifecycle (root)
+src/render/composite.zig   DMA-BUF import + blit/texture into fb (root)
+helper/                    WPE UI-process app (user uid), built only with -Dtsp
+  platform/                custom WPEPlatform module (render_buffer export)
+  mapping/                 TSP kinds -> HTML+CSS, theme tokens
+  events/                  DOM -> TSP event bridge, native editing, forms
+  blobs/                   SHA-256 store, disk cache
+  ipc.c                    socket + SCM_RIGHTS buffer passing
+tools/tsp_play.zig         JSONL recording replay harness
+nix/wpewebkit.nix          follows the eval-exec flake input (2.52.3, cached)
 ```
 
 ## 4. Test strategy
 
 | Layer | Tool | Covers |
 |---|---|---|
-| T1 Unit | `zig build test` | config and grab parsing, palettes, issue escapes, xkb→ghostty key table, cell-to-run grouping for shaping, layout math |
-| T2 Headless render goldens | `tools/render_golden`: VT byte fixture + pinned fonts → PNG, compared byte-exact. Runs as a `nix flake check` derivation | R1 and R2 pixel output without a VM |
-| T3 NixOS VM tests | `pkgs.testers.runNixOSTest`, `enableOCR`, `send_key`, `send_chars`, `send_monitor_command` (mouse), `screenshot` + Pillow compare, files written by the shell under test | everything that needs a real kernel: DRM, VT, input, logind, systemd units |
-| T4 Parity tests | Every T3 behavior scenario runs twice: against `services.kmscon` and against `services.kmshaunt` | proof of parity. A scenario that passes on kmscon must pass on kmshaunt |
-| T5 Real hardware | checklist in M8 | what QEMU cannot emulate |
+| T1 Unit | `zig build test` | APC framing, chunk reassembly, limits, op application, anchor arithmetic, IPC framing. Hermetic, no engine. |
+| T2 Surface goldens | headless helper + tolerant screenshot compare | Kind rendering and layout. Tolerant (perceptual diff), not byte-exact. Pinned fonts and engine version. |
+| T3 NixOS VM | `runNixOSTest`, real omp | End-to-end surfaces on a real kernel: login handoff, DRM compositing, input, VT switch, multi-seat. |
+| T4 Grid parity | the archived parity suite | The grid renderer stays byte-exact. Must remain green on every milestone. |
+| Conformance | tern-sdk fixtures + omp recordings | Wire correctness against the four SDKs and a real program. JSONL replay via `tools/tsp_play.zig`. |
+| T5 Real hardware | checklist in P6 | GPU vendors, llvmpipe fallback, hotplug, latency. |
 
-VM setup:
+Both flavors are tested. The default `-Dtsp=false` build is the parity
+baseline: T1 and T4 run against it and must behave exactly as today, with no
+WPE linkage. The `-Dtsp=true` build adds T2, T3, and conformance. CI builds and
+tests both.
 
-- Fixed `virtualisation.resolution`, cursor blink off, pinned fonts. This makes
-  screenshots deterministic, so they can be compared against goldens.
-- drm2d runs on the default std VGA (bochs-drm). drm3d runs on Mesa llvmpipe with
-  `hardware.graphics.enable`, as the nixpkgs kmscon test does.
-- Multi-monitor uses `-device virtio-gpu-pci,max_outputs=2`.
-- Mouse uses the QEMU USB tablet, which sends absolute pointer events. libinput
-  absolute motion must be handled.
-- DPMS state is read from `/sys/class/drm/card*-*/dpms`.
+The recording format is Tern's JSONL (`PI_TUI_TSP_RECORD`), replayed with the
+`surface-play` semantics. Record a real omp session in Tern to seed the
+fixtures. The four client SDKs (Rust, Python, Go, TypeScript in
+`stencil-hq/tern-sdk`) agree byte for byte on the wire and bound the mapping.
 
 ## 5. Milestones
 
-Each milestone ends with green tests. Nothing merges with a red `nix flake check`.
+Each milestone ends with green tests. Nothing merges with a red `nix flake
+check`. The T4 grid parity suite must stay green throughout, on the default
+no-TSP build.
 
 ```mermaid
 flowchart LR
-  M0 --> M1 --> M2 --> M3 --> M4
-  M1 --> M5
-  M3 --> M5
-  M2 --> M6
-  M4 --> M7
-  M5 --> M7
-  M6 --> M7
-  M7 --> M8
+  P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6
 ```
 
-### M0. Foundation (3 days)
+### P0. Build gate, engine bring-up, and buffer pipeline (1–2 weeks)
 
-1. Flake with Zig 0.17.1, dev shell, and the harfbuzz overlay with the raster
-   library enabled. `flake.nix` follows the `just write-flake` convention.
-2. `build.zig` with the `ghostty-vt` dependency pinned to 1.0.1, linked through
-   `dep.artifact("ghostty-vt")`, `ghostty/vt.h` translated with `b.addTranslateC`,
-   plus `deps.nix` generated by `zon2nix` so the Nix build works offline.
-3. `nix/package.nix` and a `nix flake check` that runs T1 and builds the package.
-4. A first VM test that boots and runs `kmshaunt --version`.
+The riskiest milestone. It proves the approach before any mapping work.
 
-Exit: `nix flake check` is green, including the VM test.
+1. Add the compile-time gate. `build.zig` exposes `-Dtsp` (default false) through
+   `build_options.tsp`. Gate `src/tsp/` and the helper target on it. Add the
+   `kmshaunt` and `kmshaunt-tsp` Nix flavors (D10). Prove the default build is
+   unchanged and links no WPE.
+2. Add the WPE WebKit flake input (`eval-exec/nix-wpe-webkit`, overlay) and the
+   `nix-wpe-webkit.cachix.org` substituter. Use the cached 2.52.3 `out` output
+   (no build). Verify the 2.52.3 WPEPlatform headers expose `render_buffer` and
+   `WPEBufferDMABuf`. The 2.54 reference docs are the guide, not the target.
+3. Build the helper skeleton: a WPE UI-process app that creates a headless
+   `WPEDisplay` and a `WebKitWebView`, loads static HTML, and runs the GLib loop.
+4. Write the custom WPEPlatform module. Subclass `WPEDisplay`, `WPEView`, and
+   `WPEToplevel`. Implement `render_buffer` to capture `WPEBufferDMABuf`
+   (fd, format, modifier, stride, offset, width, height).
+5. Prove both import paths: `import_to_egl_image` for drm3d and
+   `import_to_pixels` for drm2d. Handle release fences.
+6. Composite one static surface into kmshaunt's DRM output at a fixed rect.
 
-### M1. First login on drm2d (1 week)
+Exit: the default no-TSP build is byte-for-byte the current console. With
+`-Dtsp=true`, one static surface is visible on both drm2d and drm3d.
+`wpewebkit` 2.52.3 substitutes from the cache. The llvmpipe footprint on drm2d
+is measured and recorded (Q4).
 
-1. Epoll loop with timerfd and signalfd.
-2. Real VT backend: `VT_SETMODE` with `VT_PROCESS`, `KD_GRAPHICS`, drop and take
-   DRM master on switch away and back.
-3. DRM modeset on the first connected connector, double-buffered dumb buffers,
-   page flip.
-4. pty + fork/exec of `/bin/login -p`, `TERM`, `reset-env`.
-5. ghostty-vt `Terminal` + `RenderState`. The CPU renderer draws dirty rows with a
-   single FreeType face, one codepoint per cell for now.
-6. libinput + xkbcommon keyboard → xkb keycode to ghostty key table → key encoder
-   → pty.
-7. `kmshaunt-vt@.service` (Alias `autovt@`, `OnFailure=getty@%i`) and a PAM service.
+### P1. Decoupling contract and privilege handoff (2–3 weeks)
 
-Exit (T3):
+1. Define the daemon↔helper IPC: unix socket, `SCM_RIGHTS` DMA-BUF passing,
+   control messages (surface open/close, anchor, height, damage), event messages
+   (TSP `e` → pty input), and input messages (pointer/key → helper).
+2. Add the root TSP router, gated by `build_options.tsp`. Extend `effUnknown` to
+   route `tsp;` APCs. Raise `UNKNOWN_MAX_BYTES` from 2048 to 262144 and set
+   `APC_MAX_BYTES`. Add chunk reassembly and the spec limits. No JSON/CSS/HTML
+   parsing in root.
+3. Resolve the privilege-handoff trigger (D9, Q1). Spawn the helper as the
+   logged-in uid. WebKit spawns its sandboxed web process. Tear down on session
+   end and VT switch.
+4. Implement anchor placement in the grid arithmetic and height feedback. One
+   helper per session for multi-seat.
 
-- Autologin, then `echo $TERM > /tmp/t` returns `xterm-ghostty`.
-- `ctrl-alt-f2` and back restores the screen.
-- When the unit is killed, `getty@` takes over.
+Exit: the helper runs unprivileged. The daemon routes APCs. Spawn and teardown
+are clean across login, VT switch, and session end. T4 grid parity stays green.
 
-### M2. Terminal behavior completeness (1 week)
+### P2. Transport, handshake, surfaces, and the kind mapping (4–6 weeks)
 
-1. Effects: pty replies (DA, DSR, size reports), bell forwarded to the VT
-   (`bell`), OSC 52 kept in an in-process clipboard, kmscon's private OSC
-   `setBackground` / `setForeground` (release and retake DRM master for GUI
-   launches) through the unknown-sequence effect.
-2. Scrollback (`sb-size`) and the grabs `grab-scroll-*` and `grab-page-*`.
-3. Mouse: libinput pointer, selection through the selection-gesture API,
-   double-click word, copy, middle-click paste, mouse reporting to applications,
-   `natural-scrolling`, software cursor.
-4. `blink`, `backspace-delete`, palettes (all presets + custom), `oneshot`,
-   `login`, `issue` and `issue-path` with agetty escapes, `asciicast` and
-   `asciicast-loop`.
-5. Resize on mode change, with reflow.
+The bulk of the work. Mechanical HTML/CSS authoring against the spec, not
+engine building.
 
-Exit (T3 + T4):
+1. Handshake: answer `hello` before DA1 with `kinds`, `features`, `apc`,
+   `credits`, `cols`, `cell`, `dark`, `reduceMotion`, `hour12`. Answer the
+   `blobs` query. Set `TERM_PROGRAM=kmshaunt`.
+2. Surfaces: `inline`/`screen`/`flow` modes, regions `main`/`dock`/`layer`,
+   open/close/adopt/replace/suspend/resume, `listen:false`, `font` sans/mono.
+3. Document: the full op set (`add/set/text/splice/move/del/settle/focus/
+   reveal/scroll`), atomic frames, per-op error events, UTF-16 splice indices.
+4. The mapping layer: all ~73 kinds to HTML+CSS per "what a node becomes".
+   Theme tokens to CSS variables. Frames to DOM mutations. `WPESettings` for
+   dark and reduce-motion.
+5. Flow control: credits/ack tied to drawn frames.
 
-- Each item has a scenario, for example:
-  - `printf '\e[c'` reply is captured by the shell.
-  - Mouse select then middle-click pastes the text.
-  - Shift+PgUp screenshot shows the earlier output.
-  - `/etc/issue` text is visible by OCR before login.
-- Every behavior scenario is green on both kmscon and kmshaunt.
+Exit: a recorded omp session replays and renders with the full kind set.
+tern-sdk conformance fixtures pass. T2 surface goldens are green for the
+advertised kinds.
 
-### M3. Text rendering, solves R1 (2 weeks)
+### P3. Input and interaction (3–4 weeks)
 
-1. Font discovery with fontconfig: primary face, bold/italic/bold-italic faces,
-   synthetic bold and italic when a face is missing.
-2. Fallback chain: a per-codepoint face cache filled from `FcFontSort`.
-3. Shaping: group cells into runs (same face, same style, no cursor split), shape
-   with HarfBuzz, map clusters back to cells. Optional ligatures through a
-   `font-features` option (default off).
-4. Graphemes: draw the full cluster from `GRAPHEMES_UTF8`. ZWJ sequences, flags,
-   skin tones, VS15 and VS16, and combining marks all come out of shaping. Cell
-   width always comes from libghostty, and the glyph is fitted into 1 or 2 cells.
-5. Color glyphs: CBDT and sbix through FreeType `FT_LOAD_COLOR`, COLRv0 and v1
-   through `hb_raster_paint`.
-6. Sprites drawn in code, so lines join exactly across cells: box drawing, block
-   elements, braille, Powerline, Symbols for Legacy Computing (sextants, octants).
-7. Decorations: underline styles (single, double, curly, dotted, dashed),
-   underline color, strikethrough, overline, faint, inverse, invisible. Cursor
-   styles.
-8. Glyph atlas with LRU eviction. `font-size` auto mode computed from the
-   connector's physical size in mm. `grab-zoom-in` and `grab-zoom-out`.
-9. Other engines for parity: `psf` (console fonts such as Terminus), and the
-   built-in `unifont` and `8x16` bitmap fonts as a last resort when fontconfig
-   finds nothing.
+1. Pointer routing: daemon `InputEvent` → helper `WPEView` events. Hit-testing
+   in the engine.
+2. Actions: click/dblclick/menu, toggle/copy/open/select/activate, context menus.
+3. Focus management. The native-editing bridge (`edit`/`undo`/`send`, UTF-16,
+   selection). Typeahead.
+4. Form values (`el` form subset). Per-kind events (list, table, tabs, select,
+   switch, slider, and the rest).
+5. IME preedit through `WPEInputMethodContext`, within the console's limits.
 
-Exit (T2): goldens for each case with pinned JetBrains Mono, Noto Color Emoji
-(CBDT), a COLRv1 emoji font and Noto Sans CJK:
+Exit: the spec's interactive radio-form demo works end to end with the mouse.
+Native-editing events round-trip. Form `values` match the spec algorithm.
 
-- ZWJ family, flags, skin tones, VS16
-- Combining marks, CJK wide characters
-- Box drawing grid joints
-- Each underline style
-- Bold and italic fallback
+### P4. Persistence, blobs, and retention (2–3 weeks)
 
-Exit (T3): `cat` of the same fixture matches the VM screenshot golden.
+1. Anchor lifecycle: scrollback integration, `gone` on anchor loss, OSC 133;A
+   prompt disposal, process exit, RIS, alternate screen.
+2. Retention budget (64 MiB), settle/eviction order, `gone` events.
+3. Blobs: SHA-256 content-addressed store, disk cache, `blobs` query,
+   `TERN_BLOB_DIR`. Images handed to the engine to decode.
+4. Snapshots: replay hello + surfaces + sheets + a whole-document frame, if
+   session persistence is in scope (Q3).
+5. Scroll anchoring and virtualization for long documents.
 
-### M4. Kitty graphics, solves R2 (1 week)
+Exit: surfaces survive scroll, resize, and VT switch. Images persist across a
+restart. Retention evicts in the spec order.
 
-1. Install the libspng decoder at startup, before any other library use (the
-   setting is process-global).
-2. Image cache keyed by (protocol, image id, generation). Scaled copies cached by
-   destination size.
-3. CPU compositor: read the placement list from the render state, sort by layer
-   (below background, below text, above text) and then by z, clip to the
-   viewport, bilinear-scale the source rectangle, alpha blend.
-4. Animations as libghostty reports frames.
-5. Options: `kitty-image-storage-limit`. Kitty file, temp-file and shared-memory
-   media stay off whenever the process runs as root (see R3).
+### P5. Stylesheets and rich text (2–3 weeks)
 
-Exit:
+1. The `s` verb: scoped CSS. The engine's CSS engine handles most of it. Confine
+   selectors to the surface, drop `url()` and `position: fixed`, ignore
+   `@font-face`, and report parse errors.
+2. Load the sans face and Nerd Font icon glyphs into the engine.
+3. Polish `md`, `code` (highlighting), `diff`, `ansi`, and `math`.
 
-- T2 goldens from raw escape fixtures: placement, cropping, z-order across all
-  three layers, scrolling an image off screen, delete commands.
-- T3: `kitten icat` of a test PNG matches the screenshot golden.
+Exit: program stylesheets apply within scope. Sans surfaces follow the design
+guide. Rich-text kinds render.
 
-### M5. Video parity (1.5 weeks)
+### P6. Hardening, performance, and real hardware (2 weeks)
 
-1. drm3d: GBM + EGL + GLES2 renderer with a glyph atlas texture and image
-   textures. `hwaccel` selects it.
-2. fbdev backend (`no-drm`).
-3. `gpus=all|primary|aux`, `use-original-mode`, `mode=` per GPU and connector.
-4. `multi-monitor=clone|largest|scaled`. `screen=` rotation and disable per
-   connector. `grab-rotate-cw` and `grab-rotate-ccw`.
-5. udev hotplug for connectors and GPUs.
-6. `dpms-timeout`: screen off after inactivity, on with any input.
-7. Hardware cursor plane, with `soft-cursor` to force the software cursor.
+1. Sandbox configuration (WebKit bubblewrap). seccomp/landlock on the daemon
+   framing path.
+2. Fuzz the daemon APC/framing parser. Enforce every spec limit.
+3. Performance: virtualization, damage-only compositing, memory under long
+   transcripts, multi-seat stress.
+4. T5 real-hardware checklist: amdgpu, i915/xe, nouveau, nvidia-drm. llvmpipe
+   fallback. Hotplug. VT switch to and from a Wayland session. Input latency.
+5. Flip the runtime `tsp` default on within the TSP flavor (D8) once the gates
+   pass. The compile-time default stays off.
 
-Exit (T3 + T4):
-
-- The same scenarios pass on drm2d, drm3d (llvmpipe) and fbdev.
-- Two-output clone and scaled goldens.
-- Rotation goldens for all four orientations.
-- The connector's sysfs `dpms` file reads `Off` after the timeout and `On`
-  after a keypress.
-
-### M6. Seats and sessions (1 week)
-
-1. libseat backend (`libseat`).
-2. Multi-seat daemon (`kmshaunt.service`): sd-login seat monitoring, fake VT
-   for seats without VTs.
-3. Session manager: `session-max`, `session-control`, `grab-terminal-new`,
-   `grab-session-next`, `grab-session-prev`, `grab-session-close`, dummy session.
-4. `grab-reboot`, following `/proc/sys/kernel/ctrl-alt-del`.
-5. xkb: `xkb-model`, `xkb-layout`, `xkb-variant`, `xkb-options`, `xkb-keymap`,
-   `xkb-compose-file`, `xkb-repeat-delay`, `xkb-repeat-rate`. org.freedesktop.locale1
-   is read through sd-bus at start and followed live.
-
-Exit (T3 + T4):
-
-- `localectl set-x11-keymap de` swaps the y and z keys without a restart.
-- A compose sequence produces the expected character.
-- Session grabs create, cycle and close sessions.
-- A second seat gets its own console. This depends on Q1.
-
-### M7. Config, CLI, NixOS module (4 days)
-
-1. Full kmscon-compatible CLI and config file, with `--help`, `--version`,
-   `verbose`, `debug`, `silent` and `configdir`.
-2. Man pages for `kmshaunt(1)` and `kmshaunt.conf(5)`.
-3. `services.kmshaunt` module: `enable`, `package`, `config`, `extraOptions`,
-   `useXkbConfig`, fonts. It installs the units, the PAM service and the
-   terminfo, and replaces `autovt@`.
-4. Parity matrix (appendix) fully ticked.
-
-Exit: the T4 suite is green on both implementations for every row of the
-appendix.
-
-### M8. Performance and real hardware (1 week)
-
-1. vtebench throughput compared with kmscon on the same VM. Target: equal or
-   better on every benchmark.
-2. Damage-only presentation: `drmModeDirtyFB` on drm2d, partial redraw on drm3d.
-3. Memory with 10,000 lines of scrollback per session.
-4. T5 real-hardware checklist:
-   - Drivers: amdgpu, i915/xe, nouveau, nvidia-drm.
-   - HiDPI auto font size.
-   - Monitor hotplug.
-   - DPMS really powers the panel off.
-   - VT switch to and from a Wayland session.
-   - Hardware cursor plane.
-   - Input latency compared with kmscon.
-
-Exit: numbers recorded in `docs/perf.md`. Checklist done on at least two GPU
-vendors.
+Exit: security and performance gates pass. The checklist is done on at least
+two GPU vendors. Numbers recorded in `docs/perf.md`.
 
 ## 6. Risks
 
 | ID | Risk | Mitigation |
 |---|---|---|
-| R3 | The VT unit runs as root, so untrusted image data is parsed as root, and Kitty file and shared-memory media could read root-only files | Those media are off whenever euid is 0. libspng is fuzzed. Storage limit enforced. Landlock and seccomp after init are a candidate addition after M8 |
-| R5 | QEMU can't test real GPU drivers, hardware cursor planes, physical DPMS or latency | T5 checklist in M8 |
-| R6 | Font determinism: a FreeType or HarfBuzz update changes pixels and breaks goldens | Versions pinned by `flake.lock`. A `just update-goldens` recipe and a review of the image diff on every lock bump |
-| R7 | nixpkgs harfbuzz lacks the raster library | Overlay in M0. Upstream a nixpkgs PR to enable it |
+| R1 | The cached package is 2.52.3, while the reference docs describe the 2.54 WPEPlatform API. Symbols may differ. | 2.52.3 is prebuilt in `nix-wpe-webkit.cachix.org` (no build). P0 verifies `render_buffer`/`WPEBufferDMABuf` against the 2.52.3 headers. |
+| R2 | DMA-BUF import into drm2d/drm3d, EGL/GBM sharing, fences, two producers into one display. | The P0 spike proves both import paths before any mapping work. |
+| R3 | The mapping volume: ~73 kinds plus CSS plus events. Mechanical but large. | tern-sdk fixtures and omp recordings bound it. The protocol's HTML mapping is the spec. |
+| R4 | WPE version and security churn, GPU/llvmpipe footprint. The WPEPlatform API moved between 2.52 and 2.54. | Pin 2.52.3 (cached) and target its API. Track security advisories. Measure the llvmpipe path in P0. The compile-time gate keeps WPE out of the default build. |
+| R5 | Lifecycle races: the login trigger, VT switch, multi-seat teardown. | The IPC contract covers them. P1 tests exercise each transition. |
+| R6 | Bounded APC parsing still runs in root. | Enforce limits and fuzz the framing path (P6). Root parses no JSON/CSS/HTML. |
+| R7 | Console gaps: no full IME, no desktop browser for `open`/`media`. | Do not advertise kinds the console cannot honor. The hello `kinds` list is the contract. |
 
 ## 7. Open questions
 
-- **Q1.** Can QEMU route a second USB keyboard to seat1 from the test driver? HMP
-  `sendkey` has no device argument, QMP `input-send-event` does. Spike at the
-  start of M6. If it fails, the multi-seat input check moves to T5.
-- **Q2.** Is libspng's API usable with the allocator libghostty passes to the
-  decode callback, or does the output need a copy? Check at the start of M4.
+- **Q1.** Privilege-handoff trigger: a PAM `pam_exec` session hook, or detect
+  the uid from the pty slave owner? Spike at the start of P1. The hook is the
+  robust path. The slave-owner path avoids a PAM change.
+- **Q2. (Resolved)** WPE WebKit version: 2.52.3 is in `nix-wpe-webkit.cachix.org`
+  (narinfo verified), so use 2.52.3 as-is. No bump. Target the 2.52.3 WPEPlatform
+  API and verify its symbols in P0.
+- **Q3.** Are session persistence and snapshots in scope? kmshaunt has no
+  session daemon. Snapshots map to a restore-on-restart feature, not a live
+  daemon. Decide at the start of P4.
+- **Q4.** drm2d has no GPU. WPE still needs a GL context (llvmpipe). Is the
+  footprint acceptable for the target user? Measure in P0.
 
-## Appendix. Parity matrix (kmscon 10.x options)
+## Appendix A. TSP limits (enforced by the daemon and helper)
 
-| Group | kmscon options | Milestone |
-|---|---|---|
-| Global | `help`, `version`, `verbose`, `debug`, `silent`, `configdir` | M7 |
-| Seat | `vt`, `switchvt`, `libseat` | M1, M6 |
-| Session | `session-max`, `session-control` | M6 |
-| Terminal | `issue`, `issue-path`, `asciicast`, `asciicast-loop`, `login`, `oneshot`, `term`, `reset-env`, `backspace-delete`, `sb-size`, `bell`, `blink` | M1, M2 |
-| Input | `xkb-model`, `xkb-layout`, `xkb-variant`, `xkb-options`, `xkb-keymap`, `xkb-compose-file`, `xkb-repeat-delay`, `xkb-repeat-rate`, `mouse`, `natural-scrolling`, `soft-cursor`, `dpms-timeout` | M1, M2, M5, M6 |
-| Grabs | `grab-scroll-up`, `grab-scroll-down`, `grab-page-up`, `grab-page-down`, `grab-zoom-in`, `grab-zoom-out`, `grab-session-next`, `grab-session-prev`, `grab-session-close`, `grab-terminal-new`, `grab-rotate-cw`, `grab-rotate-ccw`, `grab-reboot` | M2, M3, M5, M6 |
-| Video | `drm`, `hwaccel`, `gpus`, `use-original-mode`, `mode`, `multi-monitor`, `screen` | M5 |
-| Font | `font-engine` (`freetype`, `pango` alias, `psf`, `unifont`, `8x16`), `font-size`, `font-name` | M3 |
-| Palette | `palette` (solarized, solarized-black, solarized-white, soft-black, base16-dark, base16-light, vga, legacy, custom), `palette-*` | M2 |
-| Private OSC | `setBackground`, `setForeground` | M2 |
-| System | `kmshaunt-vt@.service` as `autovt@` with getty fallback, multi-seat `kmshaunt.service`, PAM service, locale1 xkb | M1, M6, M7 |
+| Limit | Value |
+|---|---|
+| One APC string | 262144 bytes |
+| Chunk body (`apc`) | 65536 bytes |
+| One chunked frame | 400000000 bytes joined |
+| One other chunked message | 24 MiB joined |
+| Chunk idle timeout | 1 s |
+| One blob | 16 MiB decoded |
+| Blobs per screen | 256 MiB |
+| Blobs on disk | 1 GiB |
+| Nodes per surface | 200000 |
+| Depth | 64 levels |
+| CSS per surface | 256 KiB |
+| Surface state per pane | 64 MiB |
+| Unacknowledged frames (`credits`) | 2 |
+
+## Appendix B. Kind coverage
+
+The hello reply advertises only kinds the helper draws. The full v1 vocabulary
+(grouped), tracked as a checklist during P2–P5:
+
+| Group | Kinds |
+|---|---|
+| Layout | col, row, card, section, rule, spacer, split, scroll, empty |
+| Text and code | text, md, code, diff, ansi, rows, math |
+| Data | kv, stats, table, tree, json, badge, kbd, icon, avatar, avatars, image, media, carousel, attachment |
+| Lists and navigation | list, item, tabs, picker, menu, menubar, nav, breadcrumb, pager |
+| Progress and motion | spinner, shimmer, skeleton, elapsed, rate, progress, meter, chart, effort |
+| Inputs | editor, input, button, buttons, select, switch, slider, otp, calendar, date, field |
+| Chrome | status, seg, toast, overlay |
+| Agent and task | tool, agent, trace, checklist, message, suggestions, questions, stacktrace, block, prefs |
+| HTML | el |
+
+Terminal features advertised as they land: `blobs`, `settle`, `adopt`, `dock`,
+`reduce-motion`, `aside`, `scroll`, `styles`, `flow`, `font`. Kinds that need
+Tern app chrome the console cannot provide (`media` viewer, `image` zoom) are
+drawn inline only or omitted from the reply.
