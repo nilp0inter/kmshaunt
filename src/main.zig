@@ -1115,6 +1115,13 @@ const Console = struct {
         }
         const cell = layout.Cell{ .w = self.cell.cell_w, .h = self.cell.cell_h };
         const canvas = layout.computeLayout(conns[0..n], cell, mmMode(self.cfg.multi_monitor), plans[0..n]);
+        // ghostty anchors the grid at window-padding-y, 2px below the canvas
+        // origin kmshaunt's centered layout produces. Shift the canvas->display
+        // blit down by that offset so every layer (text, sprites, backgrounds,
+        // kitty images) lands on ghostty's grid together.
+        for (plans[0..n]) |*p| {
+            if (p.active) p.dst.y += @floatFromInt(discovery.grid_calibration_y);
+        }
         self.canvas = canvas;
         if (self.input) |*in| in.setScreenSize(canvas.width, canvas.height);
         self.cols = @intCast(@max(1, @min(canvas.cols, std.math.maxInt(u16))));

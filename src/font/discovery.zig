@@ -667,9 +667,10 @@ pub fn cellMetricsGhostty(face: Face, px_f64: f64, aw: i32, ah: i32, ab: i32) !C
     face_y += diff_bottom; // ghostty Metrics.zig:395
     cb = @round(cb * (100.0 + @as(f64, @floatFromInt(ab))) / 100.0);
 
-    // ghostty Metrics.zig:293: top_to_baseline = cell_height - cell_baseline,
-    // plus the grid-anchor calibration (ghostty's window-padding-y offset).
-    const baseline_top = ch - cb + @as(f64, @floatFromInt(grid_calibration_y));
+    // ghostty Metrics.zig:293: top_to_baseline = cell_height - cell_baseline.
+    // The grid-anchor offset (ghostty window-padding-y) is applied once at the
+    // canvas->display blit (main.rebuildLayout), not per glyph.
+    const baseline_top = ch - cb;
     return .{
         .cell_w = @intCast(@as(i32, @intFromFloat(cw))),
         .cell_h = @intCast(@as(i32, @intFromFloat(ch))),
