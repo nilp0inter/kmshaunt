@@ -75,6 +75,27 @@ let
       <cachedir prefix="xdg">fontconfig</cachedir>
     </fontconfig>
   '';
+
+  # Test-data environment for `zig build test` (zigCheckPhase). The xkb
+  # defaults are also baked into nixpkgs' libxkbcommon, and fontconfig has
+  # DejaVu as its built-in default font dir; these make the fixtures
+  # explicit and pin the color-font paths the tests would otherwise look
+  # for on the author's machine.
+  #
+  # Kept out of the derivation proper: every store path interpolated into
+  # any attribute of a derivation becomes a build input, so these would
+  # drag the color-font fixtures (nototools -> afdko -> tqdm -> dask ->
+  # pyarrow -> arrow-cpp, plus imagemagick/librsvg/nodejs) into the runtime
+  # closure of a build that never runs the tests.
+  testEnv = {
+    XKB_CONFIG_ROOT = "${xkeyboard_config}/etc/X11/xkb";
+    XLOCALEDIR = "${libx11}/share/X11/locale";
+    KMSHAUNT_TEST_CBDT_FONT = "${noto-fonts-color-emoji}/share/fonts/noto/NotoColorEmoji.ttf";
+    KMSHAUNT_TEST_COLR_FONT = colrFont;
+    KMSHAUNT_TEST_SBIX_FONT = sbixFont;
+    KMSHAUNT_TEST_TEXT_FONT = "${dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
+    FONTCONFIG_FILE = fontsConf;
+  };
 in
 stdenv.mkDerivation (finalAttrs: {
   pname = "kmshaunt";
@@ -116,19 +137,6 @@ stdenv.mkDerivation (finalAttrs: {
     seatd # libseat
   ];
 
-  # Test-data environment for `zig build test` (zigCheckPhase). The xkb
-  # defaults are also baked into nixpkgs' libxkbcommon, and fontconfig has
-  # DejaVu as its built-in default font dir; these make the fixtures
-  # explicit and pin the color-font paths the tests would otherwise look
-  # for on the author's machine.
-  XKB_CONFIG_ROOT = "${xkeyboard_config}/etc/X11/xkb";
-  XLOCALEDIR = "${libx11}/share/X11/locale";
-  KMSHAUNT_TEST_CBDT_FONT = "${noto-fonts-color-emoji}/share/fonts/noto/NotoColorEmoji.ttf";
-  KMSHAUNT_TEST_COLR_FONT = colrFont;
-  KMSHAUNT_TEST_SBIX_FONT = sbixFont;
-  KMSHAUNT_TEST_TEXT_FONT = "${dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
-  FONTCONFIG_FILE = fontsConf;
-
   postConfigure = ''
     mkdir -p zig-pkg
     cp -r ${finalAttrs.deps}/. zig-pkg/
@@ -141,17 +149,26 @@ stdenv.mkDerivation (finalAttrs: {
     "-Doptimize=ReleaseFast"
   ];
 
-  # `zig build test` spawns hermetic children (src/misc/pty.zig,
-  # src/session/terminal.zig) that assume a host-like environment, which
-  # the standard sandbox does not provide:
-  # - the OSC52 clipboard test uses the bash builtin `read -t 0.3`, but the
-  #   sandbox's /bin/sh is the minimal busybox from the daemon's
-  #   `sandbox-paths` setting, which rejects fractional timeouts;
-  # - the pty resize test runs `stty size`, looked up under
-  #   /run/current-system/sw/bin, /usr/bin or /bin; none carries coreutils
-  #   inside the sandbox.
-  # Nix (2.34) has no per-derivation override for the sandbox shell or
-  # /bin contents, so the package cannot fix this itself. Build with either:
+  # The default build runs no unit tests: it is what `nix flake check` and
+  # downstream users build, so it must succeed in the standard sandbox.
+  # The unit suite is opt-in with `overrideAttrs { doCheck = true; }`,
+  # which also brings the fixture environment defined in `testEnv` above:
+  # the same switch controls both. That env is merged value-wise with
+  # `lib.mapAttrs`, never name-wise: mkDerivation evaluates the attribute
+  # names before finalAttrs exists, so `lib.optionalAttrs finalAttrs.doCheck`
+  # there is an infinite recursion. With doCheck = false the seven
+  # attributes are present but empty, which carries no store context and so
+  # adds no inputs to the closure.
+  #
+  # The suite itself still needs a host-like shell: `zig build test` spawns
+  # hermetic children (src/misc/pty.zig, src/session/terminal.zig) that use
+  # the bash builtins `read -t 0.3` and `read -r -N`, and `stty` from
+  # coreutils. The default sandbox provides neither: /bin/sh is the minimal
+  # busybox from the daemon's `sandbox-paths` setting, which rejects
+  # fractional timeouts, and no coreutils is on PATH. Nix (2.34) has no
+  # per-derivation override for the sandbox shell or /bin contents, so
+  # until the sandbox-safe unit derivation lands the opt-in build needs the
+  # override above plus one of:
   #   nix build --option sandbox false .#kmshaunt
   # or, keeping the sandbox, mount a full bash and stty (stty must be the
   # coreutils multicall binary: the bin/stty symlink loses its target when
@@ -159,7 +176,7 @@ stdenv.mkDerivation (finalAttrs: {
   #   nix build --option sandbox-paths \
   #     "/bin/sh=$(nix eval --raw nixpkgs#bash.outPath)/bin/bash /bin/stty=$(nix eval --raw nixpkgs#coreutils.outPath)/bin/coreutils" \
   #     .#kmshaunt
-  doCheck = true;
+  doCheck = false;
 
   preCheck = ''
     export XDG_CACHE_HOME="$TMPDIR/fontconfig-cache"
@@ -178,4 +195,4 @@ stdenv.mkDerivation (finalAttrs: {
     mainProgram = "kmshaunt";
     platforms = lib.platforms.linux;
   };
-})
+} // lib.mapAttrs (_: v: if finalAttrs.doCheck then v else "") testEnv)
