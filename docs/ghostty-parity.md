@@ -34,7 +34,7 @@ Files:
 | `nix/tests/ghostty-parity-capture.nix` | two-node NixOS test; feeds frames, QMP-captures each |
 | `nix/tests/ghostty-parity-capture-build.nix` | build wrapper (pkgs + comic-code font + frames + kmshaunt module) |
 | `nix/tests/parity-metric.py` | aggregates the pixel diff; emits `METRIC` lines |
-| `autoresearch-parity.sh` | runs the capture then the metric (autoresearch entrypoint) |
+| `autoresearch.sh` | runs the capture then the metric (autoresearch entrypoint) |
 | `fixtures/ghostty-parity/generate_frames.py` | deterministic frame generator (source of truth) |
 | `fixtures/ghostty-parity/frames/*.bin` | 25 frame payloads |
 | `fixtures/ghostty-parity/manifest.md` | per-frame coverage + font requirements |
@@ -45,7 +45,7 @@ Run:
 nix build --impure --accept-flake-config \
   -f nix/tests/ghostty-parity-capture-build.nix --out-link result-parity
 # or, capture + metric:
-bash autoresearch-parity.sh
+bash autoresearch.sh
 ```
 
 Screenshots land in `result-parity/` as `<node>-<frame>.png`. Side-by-side
