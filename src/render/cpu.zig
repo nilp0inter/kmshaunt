@@ -1506,6 +1506,8 @@ pub const CpuRenderer = struct {
                 else => return err,
             };
         };
+        // The grid-anchor offset is applied at the canvas->display blit, so
+        // sprites draw at the cell origin here like ghostty's sprite face.
         self.blitEntry(f, x_px, y_px, entry, fg);
         self.markInked(x_px, y_px, cw, ch);
     }
@@ -1677,7 +1679,7 @@ pub const CpuRenderer = struct {
 
         if (flags.underline != .none) {
             const underline_color = resolveStyleColor(style.underlineColor(), null, opts.palette, fg);
-            const pos = deco.rowFromBaseline(baseline, clampI16(fm.underline_position));
+            const pos = deco.rowFromBaseline(baseline, clampI16(fm.underline_position)) + 1;
             const thickness: u16 = @intCast(@max(1, fm.underline_thickness));
             deco.drawUnderline(f.*, x_px, y_px, cw, ch, underlineStyle(flags.underline), underline_color, pos, thickness);
         }
@@ -3154,13 +3156,13 @@ test "cpu: fallback face for codepoints missing from the primary (M3.2)" {
     }
 }
 
-test "cpu: ligatures off by default, on with +liga (M3.3)" {
+test "cpu: ligatures on by default, off with -liga (M3.3)" {
     const a = testing.allocator;
     // DejaVu Sans carries an 'fi' ligature under the liga feature (the
     // Mono sibling has none; the probe below skips if the match lacks it).
-    var env_off = try Env.initWithFont(a, 80, 24, "DejaVu Sans", &.{});
+    var env_off = try Env.initWithFont(a, 80, 24, "DejaVu Sans", &.{"-liga"});
     defer env_off.deinit(a);
-    var env_on = try Env.initWithFont(a, 80, 24, "DejaVu Sans", &.{"+liga"});
+    var env_on = try Env.initWithFont(a, 80, 24, "DejaVu Sans", &.{});
     defer env_on.deinit(a);
 
     // Skip when the matched face has no fi ligature at all.
@@ -3184,10 +3186,11 @@ test "cpu: ligatures off by default, on with +liga (M3.3)" {
     try env_off.renderNoCursor(&d1);
     try env_on.renderNoCursor(&d2);
 
-    // Default: two glyphs (f + i). +liga: one ligature glyph mapped to the
-    // first cell. Only "fi" was drawn, so the atlas count is the glyph
-    // count. The ligature raster's width is the font's design (DejaVu Sans
-    // is proportional: about one cell), so only cell 0 is guaranteed ink.
+    // -liga: two glyphs (f + i). Default (liga on, ghostty default): one
+    // ligature glyph mapped to the first cell. Only "fi" was drawn, so the
+    // atlas count is the glyph count. The ligature raster's width is the
+    // font's design (DejaVu Sans is proportional: about one cell), so only
+    // cell 0 is guaranteed ink.
     try testing.expectEqual(@as(usize, 2), env_off.cpu.atlas.count());
     try testing.expectEqual(@as(usize, 1), env_on.cpu.atlas.count());
     try testing.expect(env_off.cellHasInk(0, 0));

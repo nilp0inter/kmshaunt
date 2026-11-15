@@ -115,19 +115,22 @@ pub fn shouldDraw(invisible: bool) bool {
     return !invisible;
 }
 
-/// SGR 2 (faint): 50% blend of `color` toward `background`, per channel,
-/// rounding half up (the half-LSB rounding direction is toward the brighter
-/// channel, i.e. toward the background whenever the background is brighter).
-/// Both inputs are packed 0xRRGGBB; the top byte is ignored.
+/// SGR 2 (faint): ghostty applies faint-opacity (default 0.5) as a LINEAR-light
+/// blend of the foreground toward the background (generic.zig sets the glyph
+/// alpha to faint-opacity and the color is linearized before the source-over).
+/// Blending in sRGB space ((c+b)/2) darkens light text too much; ghostty's
+/// linear blend keeps it brighter. Both inputs are packed 0xRRGGBB.
 pub fn applyFaint(color: u32, background: u32) u32 {
-    const r = blendChannel((color >> 16) & 0xff, (background >> 16) & 0xff);
-    const g = blendChannel((color >> 8) & 0xff, (background >> 8) & 0xff);
-    const b = blendChannel(color & 0xff, background & 0xff);
+    const r = faintChannel((color >> 16) & 0xff, (background >> 16) & 0xff);
+    const g = faintChannel((color >> 8) & 0xff, (background >> 8) & 0xff);
+    const b = faintChannel(color & 0xff, background & 0xff);
     return (r << 16) | (g << 8) | b;
 }
 
-fn blendChannel(c: u32, b: u32) u32 {
-    return (c + b + 1) >> 1;
+/// 50% linear-light blend of one channel (ghostty faint-opacity = 0.5).
+fn faintChannel(c: u32, b: u32) u32 {
+    const out = s2l[c] * 0.5 + s2l[b] * 0.5;
+    return l2s[linIdx(out)];
 }
 
 /// SGR 7 (inverse): swap the foreground and background using the cell's
@@ -1880,15 +1883,15 @@ test "strikethrough and overline rows" {
     try expectRows(f, 2, 10, 4, 0);
 }
 
-test "applyFaint: exact 50% blend toward the background" {
-    try testing.expectEqual(@as(u32, 0x808080), applyFaint(0xFFFFFF, 0x000000));
-    try testing.expectEqual(@as(u32, 0x808080), applyFaint(0x000000, 0xFFFFFF));
-    // 0x405060 is R=0x40 G=0x50 B=0x60.
-    try testing.expectEqual(@as(u32, 0x283848), applyFaint(0x102030, 0x405060));
+test "applyFaint: 50% linear-light blend toward the background (ghostty)" {
+    // Linear-light half-blend, not sRGB (c+b)/2: white over black is 0xBC, not 0x80.
+    try testing.expectEqual(@as(u32, 0xBCBCBC), applyFaint(0xFFFFFF, 0x000000));
+    try testing.expectEqual(@as(u32, 0xBCBCBC), applyFaint(0x000000, 0xFFFFFF));
+    try testing.expectEqual(@as(u32, 0x2F3D4D), applyFaint(0x102030, 0x405060));
     try testing.expectEqual(@as(u32, 0x123456), applyFaint(0x123456, 0x123456));
     try testing.expectEqual(@as(u32, 0xFFFFFF), applyFaint(0xFFFFFF, 0xFFFFFF));
     // Alpha bits are ignored, never blended into the channels.
-    try testing.expectEqual(@as(u32, 0x808080), applyFaint(0xFFFFFFFF, 0xFF000000));
+    try testing.expectEqual(@as(u32, 0xBCBCBC), applyFaint(0xFFFFFFFF, 0xFF000000));
 }
 
 test "applyInverse swaps, shouldDraw encodes the invisible policy" {

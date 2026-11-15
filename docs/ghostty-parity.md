@@ -5,12 +5,31 @@ input, font, and user configuration. This document describes the measurement
 harness, the metric, the ported rendering behaviors, and the ghostty-compatible
 configuration knobs.
 
-Status (2026-11-14): aggregate pixel diff reduced **~83%**
-(`total_abs_diff` 871,949,218 → 147,336,579) over the 25 parity frames at
-1280×800 with `ComicCodeLigatures Nerd Font` @ 14pt. The residual is
-anti-aliasing weight (kmshaunt 4×4 sprite supersampling vs ghostty's z2d
-analytic coverage, and FreeType coverage nuance); a z2d analytic-coverage port
-is the remaining follow-up toward 0.
+Status (2026-11-15): aggregate pixel diff reduced **~98.5%**
+(`total_abs_diff` 871,949,218 → 12,936,154; `pixel_diff` 883,715 → 190,630)
+over the 25 parity frames at 1024×768 with `ComicCodeLigatures Nerd Font` @
+14pt. The 2026-11-15 autoresearch segment alone took 147,336,579 → 12,936,154
+(−91.2%) by closing implementation gaps against ghostty v1.4.0:
+
+- Grid-anchor calibration: ghostty anchors the grid at the window padding
+  (`window-padding-y`), 2px below kmshaunt's canvas origin. Text carried this
+  offset in its calibrated baseline; sprites, cell backgrounds, the cursor and
+  overline now carry it too (`discovery.grid_calibration_y`).
+- Faint (SGR 2) blends in **linear light** (ghostty `faint-opacity`
+  premultiply), not sRGB `(c+b)/2`.
+- Emoji constraint uses ghostty's **uncalibrated** `cell_baseline`.
+- Cursor height bases on the **natural** `round(face_height)` (ghostty
+  `cursor_height` is not updated by `adjust-cell-height`).
+- Underline row reconciled to ghostty's rounded final row (+1).
+- Standard ligatures (`liga`) enabled by default (ghostty
+  `shape/feature.zig` `default_features`).
+
+The residual is concentrated in CJK coverage weight (~3.96M), complex
+shaping/bidi mark positioning, Nerd Font icon constraints (ghostty's
+per-codepoint `nerd_font_attributes` table), and sprite anti-aliasing
+(kmshaunt 4×4 supersampling vs ghostty's z2d analytic coverage). DECDWL/DECDHL
+line attributes are not exposed by the libghostty-vt C API. These are the
+remaining follow-ups toward 0.
 
 ## Measurement harness
 
@@ -34,7 +53,7 @@ Files:
 | `nix/tests/ghostty-parity-capture.nix` | two-node NixOS test; feeds frames, QMP-captures each |
 | `nix/tests/ghostty-parity-capture-build.nix` | build wrapper (pkgs + comic-code font + frames + kmshaunt module) |
 | `nix/tests/parity-metric.py` | aggregates the pixel diff; emits `METRIC` lines |
-| `autoresearch-parity.sh` | runs the capture then the metric (autoresearch entrypoint) |
+| `autoresearch.sh` | runs the capture then the metric (autoresearch entrypoint) |
 | `fixtures/ghostty-parity/generate_frames.py` | deterministic frame generator (source of truth) |
 | `fixtures/ghostty-parity/frames/*.bin` | 25 frame payloads |
 | `fixtures/ghostty-parity/manifest.md` | per-frame coverage + font requirements |
@@ -45,7 +64,7 @@ Run:
 nix build --impure --accept-flake-config \
   -f nix/tests/ghostty-parity-capture-build.nix --out-link result-parity
 # or, capture + metric:
-bash autoresearch-parity.sh
+bash autoresearch.sh
 ```
 
 Screenshots land in `result-parity/` as `<node>-<frame>.png`. Side-by-side
