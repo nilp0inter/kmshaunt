@@ -1166,9 +1166,13 @@ const Console = struct {
         // ghostty Metrics.cursor_thickness: modifier on the 1px base,
         // clamped >= 1 (font/Metrics.zig:34, Minimums :65).
         deco.cursor_thickness = @max(1, if (self.cfg.adjust_cursor_thickness) |m| m.apply(@as(u16, 1)) else 1);
-        // ghostty Metrics.cursor_height: modifier on the cell height,
-        // clamped >= 1 (Metrics.zig:320, Minimums :66); null = full cell.
-        deco.cursor_height = if (self.cfg.adjust_cursor_height) |m| @max(1, m.apply(self.cell.cell_h)) else null;
+        // ghostty Metrics.cursor_height: calc sets it to the NATURAL cell
+        // height (round(face_height)); adjust-cell-height does NOT update it
+        // (Metrics.zig:358-401), only adjust-cursor-height does. Base on the
+        // natural height so the block/bar cursor matches ghostty's, which is
+        // taller than the adjusted cell when adjust-cell-height is negative.
+        const natural_h: u16 = @intFromFloat(@max(1, @round(self.cell.face_height)));
+        deco.cursor_height = if (self.cfg.adjust_cursor_height) |m| @max(1, m.apply(natural_h)) else natural_h;
         // ghostty adjust-underline-position: modifier on the u32 underline
         // row (Metrics.apply :408-410, unsigned clamp >= 0). Unset keeps
         // the renderer-computed row and the cursor's bottom-row fallback.
