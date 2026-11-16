@@ -1471,7 +1471,7 @@ const Console = struct {
         const now = monotonicNs();
         if (now >= self.frame_due_ns) return false;
         const interval: i64 = @intCast(self.frameIntervalNs());
-        if (!burstPumpActive(now, self.last_pump_ns, interval, self.last_pump_more, self.frame_cost_ns)) return false;
+        if (!burstPumpActive(now, self.last_pump_ns, interval, self.last_pump_more)) return false;
         self.frame_timer.armOneShot(@intCast(self.frame_due_ns - now)) catch |err| {
             log.warn("frame timer: {t}", .{err});
             return false;
@@ -2512,26 +2512,24 @@ fn burstCostEwma(prev_ns: u64, cost_ns: u64) u64 {
 /// render+present occupies ~1/(1+factor) of the loop, never shorter than one
 /// display refresh and never longer than the display-rate floor
 /// (max_burst_frame_period_ns). Cheap frames thus keep the refresh period;
-/// expensive frames stretch the frame clock only up to the floor, so
-/// animation stays >= ~10 fps instead of collapsing to 1-2 fps.
+/// expensive flood frames stretch the frame clock only up to the floor, so
+/// they stay >= ~10 fps instead of collapsing to 1-2 fps.
 fn burstStretchNs(cost_ns: u64, interval_ns: u64) u64 {
     const scaled = @min(cost_ns * burst_stretch_factor, max_burst_frame_period_ns);
     return @max(interval_ns, scaled);
 }
 
 /// Burst-activity gate: decide whether a frame may be held for the burst
-/// stretch. A budget-exhausted pump (`pump_flood` = true) means more output
-/// is pending, so the deferral is kept while that pump is within the last
-/// display refresh. A pump that drained everything (`pump_flood` = false) is
-/// a trickle — a periodic full-screen refresh such as btop at a fixed update
-/// rate. A trickle of CHEAP frames renders on time (there is no flood to
-/// drain, so the stretch only adds latency); a trickle of EXPENSIVE frames
-/// (stretch would hit the display-rate cap) still coalesces to bound render
-/// duty, which is what keeps output-throughput benchmarks from regressing.
-fn burstPumpActive(now_ns: i64, last_pump_ns: i64, interval_ns: i64, pump_flood: bool, frame_cost_ns: u64) bool {
+/// stretch. Only a budget-exhausted pump (`pump_flood` = true) means more
+/// output is pending, so the deferral is kept while that pump is within the
+/// last display refresh. A pump that drained everything (`pump_flood` =
+/// false) has nothing left to drain: deferring it only adds display latency,
+/// whatever the frame cost, so animation (notcurses-demo, btop) renders on
+/// time. Floods still coalesce to bound render duty, which is what keeps
+/// output-throughput benchmarks from regressing.
+fn burstPumpActive(now_ns: i64, last_pump_ns: i64, interval_ns: i64, pump_flood: bool) bool {
     if (now_ns - last_pump_ns >= interval_ns) return false;
-    if (pump_flood) return true;
-    return frame_cost_ns * burst_stretch_factor >= max_burst_frame_period_ns;
+    return pump_flood;
 }
 
 /// Non-temporal row copy: 64-byte unrolled movntdq stores with a regular
@@ -3517,7 +3515,7 @@ test "burstStretchNs: refresh floor, cost scaling, display-rate floor" {
     // Expensive frame below the floor: cost * factor (8 ms * 9 = 72 ms).
     try std.testing.expectEqual(@as(u64, 72_000_000), burstStretchNs(8_000_000, refresh));
     // Costly frame: 9x cost would be 900 ms, but the display-rate floor caps
-    // the period at 100 ms (>= 10 fps) so animation never collapses to 1-2 fps.
+    // the period at 100 ms (>= 10 fps) so flood frames never collapse to 1-2 fps.
     try std.testing.expectEqual(max_burst_frame_period_ns, burstStretchNs(100_000_000, refresh));
     // Pathological frame: still capped at the floor, not 9x cost.
     try std.testing.expectEqual(max_burst_frame_period_ns, burstStretchNs(10 * std.time.ns_per_s, refresh));
@@ -3525,23 +3523,18 @@ test "burstStretchNs: refresh floor, cost scaling, display-rate floor" {
     try std.testing.expectEqual(refresh, burstStretchNs(0, refresh));
 }
 
-test "burstPumpActive: cheap trickle renders on time; flood and costly trickle coalesce" {
-    // Regression: btop at a fixed update rate writes one full-screen refresh
-    // per period and every pump drains the pty (more = false). The old gate
-    // only checked "a pump happened within the last refresh", so it held each
-    // cheap frame for the burst stretch (up to the 100 ms cap) — the periodic
-    // output hitch. A cheap trickle must render on time. Expensive frames and
-    // real floods must still coalesce so render duty stays bounded (removing
-    // that coalescing regressed the notcurses throughput geomean ~19%).
+test "burstPumpActive: only a pending flood coalesces; drained pumps render on time" {
+    // btop/notcurses-demo write a frame and drain the pty (more = false):
+    // nothing is left to drain, so the stretch only adds display latency —
+    // even for expensive frames. A budget-exhausted pump (more = true) has
+    // output pending and coalesces to bound render duty.
     const interval: i64 = 4_166_667;
     const now: i64 = 1_000_000_000;
-    const cheap: u64 = 1_000_000; // 1 ms * 9 = 9 ms, below the 100 ms cap
-    const costly: u64 = 20_000_000; // 20 ms * 9 = 180 ms, hits the cap
-    try std.testing.expect(!burstPumpActive(now, now - 1_000, interval, false, cheap));
-    try std.testing.expect(burstPumpActive(now, now - 1_000, interval, false, costly));
-    try std.testing.expect(burstPumpActive(now, now - 1_000, interval, true, cheap));
-    try std.testing.expect(!burstPumpActive(now, now - interval, interval, true, costly));
-    try std.testing.expect(!burstPumpActive(now, now - interval - 1, interval, false, costly));
+    try std.testing.expect(!burstPumpActive(now, now - 1_000, interval, false));
+    try std.testing.expect(burstPumpActive(now, now - 1_000, interval, true));
+    // Recency gate: a pump older than one refresh never holds a frame.
+    try std.testing.expect(!burstPumpActive(now, now - interval, interval, true));
+    try std.testing.expect(!burstPumpActive(now, now - interval - 1, interval, false));
 }
 
 // ---------------------------------------------------------------------------
