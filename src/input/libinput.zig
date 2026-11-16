@@ -79,7 +79,7 @@
 //! # Grabs
 //!
 //! Every key press (and every repeat of a held key) is matched against
-//! the 13 `cfg.grab_*` options BEFORE forwarding; a match emits
+//! the 14 `cfg.grab_*` options BEFORE forwarding; a match emits
 //! `InputEvent.grab{id}` instead of the key event. Releases are never
 //! grabbed. Matching uses `config.Grab.matches`: exact equality of the
 //! five kmscon modifier bits (shift, lock/caps, ctrl, alt, logo — side
@@ -101,6 +101,7 @@
 //! | 11 | rotate_cw     | grab_rotate_cw      | Logo+plus / Logo+equal |
 //! | 12 | rotate_ccw    | grab_rotate_ccw     | Logo+minus           |
 //! | 13 | reboot        | grab_reboot         | none (disabled)      |
+//! | 14 | zoom_reset    | grab_zoom_reset     | Ctrl+0               |
 //!
 //! The session manager resolves the id; sessions receive it verbatim
 //! (session.zig InputEvent.Grab). Session-control gating (`session_max`,
@@ -313,6 +314,7 @@ pub const GrabId = enum(u16) {
     rotate_cw = 11,
     rotate_ccw = 12,
     reboot = 13,
+    zoom_reset = 14,
 };
 
 // ---------------------------------------------------------------------------
@@ -868,7 +870,7 @@ pub const Input = struct {
 
     // -- grabs ---------------------------------------------------------------
 
-    /// The 13 grabs in config order; first match wins.
+    /// The 14 grabs in config order; first match wins.
     const grab_table = [_]struct { field: []const u8, id: GrabId }{
         .{ .field = "grab_scroll_up", .id = .scroll_up },
         .{ .field = "grab_scroll_down", .id = .scroll_down },
@@ -876,6 +878,7 @@ pub const Input = struct {
         .{ .field = "grab_page_down", .id = .page_down },
         .{ .field = "grab_zoom_in", .id = .zoom_in },
         .{ .field = "grab_zoom_out", .id = .zoom_out },
+        .{ .field = "grab_zoom_reset", .id = .zoom_reset },
         .{ .field = "grab_session_next", .id = .session_next },
         .{ .field = "grab_session_prev", .id = .session_prev },
         .{ .field = "grab_session_close", .id = .session_close },

@@ -167,6 +167,7 @@ pub const defaults = struct {
     const plus = keysyms.fromName("plus").?;
     const equal = keysyms.fromName("equal").?;
     const minus = keysyms.fromName("minus").?;
+    const zero = keysyms.fromName("0").?;
     const right = keysyms.fromName("Right").?;
     const left = keysyms.fromName("Left").?;
     const backspace = keysyms.fromName("BackSpace").?;
@@ -182,6 +183,9 @@ pub const defaults = struct {
         .{ .mods = control, .keysyms = &.{equal} },
     } };
     pub const zoom_out: Grab = .{ .shortcuts = &.{.{ .mods = control, .keysyms = &.{minus} }} };
+    /// Ctrl+0: restore the configured font size (ghostty reset_font_size;
+    /// kmscon has no reset grab, this is a ghostty-parity extension).
+    pub const zoom_reset: Grab = .{ .shortcuts = &.{.{ .mods = control, .keysyms = &.{zero} }} };
     pub const session_next: Grab = .{ .shortcuts = &.{.{ .mods = control | logo, .keysyms = &.{right} }} };
     pub const session_prev: Grab = .{ .shortcuts = &.{.{ .mods = control | logo, .keysyms = &.{left} }} };
     pub const session_close: Grab = .{ .shortcuts = &.{.{ .mods = control | logo, .keysyms = &.{backspace} }} };
@@ -244,6 +248,14 @@ test "dual-keysym defaults: zoom-in and rotate-cw match plus AND equal" {
     try testing.expect(defaults.rotate_cw.matches(logo, &.{equal}));
     try testing.expect(!defaults.rotate_cw.matches(logo | alt, &.{equal}));
     try testing.expect(!defaults.rotate_cw.matches(control, &.{plus}));
+}
+
+test "zoom-reset default: Ctrl+0 (ghostty reset_font_size)" {
+    try testing.expectEqual(@as(usize, 1), defaults.zoom_reset.shortcuts.len);
+    try testing.expectEqual(control, defaults.zoom_reset.shortcuts[0].mods);
+    try testing.expectEqualSlices(u32, &.{0x30}, defaults.zoom_reset.shortcuts[0].keysyms);
+    try testing.expect(defaults.zoom_reset.matches(control, &.{0x30}));
+    try testing.expect(!defaults.zoom_reset.matches(control | shift, &.{0x30}));
 }
 
 test "grab grammar: modifiers and keysym" {

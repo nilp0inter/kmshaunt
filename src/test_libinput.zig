@@ -862,6 +862,13 @@ test "grabs: defaults, exact modifier equality, dual keysyms, locks" {
     try testing.expectEqual(@as(u16, @intFromEnum(libinput.GrabId.zoom_in)), h.rec.last().grab.id);
     h.fake.pushKey(kt.key_code.key_equal, false);
 
+    // Ctrl+0 matches zoom-reset (ghostty reset_font_size extension).
+    h.fake.pushKey(kt.key_code.key_0, true);
+    try h.input.dispatch();
+    try testing.expect(h.rec.last() == .grab);
+    try testing.expectEqual(@as(u16, @intFromEnum(libinput.GrabId.zoom_reset)), h.rec.last().grab.id);
+    h.fake.pushKey(kt.key_code.key_0, false);
+
     // ...but an extra Shift breaks the exact-equality match (keysym plus,
     // mods ctrl|shift), so the key event goes through.
     h.fake.pushKey(kt.key_code.key_leftshift, true);

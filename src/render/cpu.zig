@@ -166,10 +166,13 @@ pub const CpuRenderer = struct {
     /// selects the legacy integer pixel path.
     size_points: u32 = 0,
     size_dpi: u32 = 96,
-    /// The init configuration, kept so setFontSize can re-initialize at a
-    /// new pixel size. `font_features` borrows the caller's strings (they
-    /// must outlive the renderer, like `discovery`).
+    /// The current configuration; setFontSize re-initializes from a mutated
+    /// copy. `font_features` borrows the caller's strings (they must outlive
+    /// the renderer, like `discovery`).
     opts: Options,
+    /// The ORIGINAL init configuration, never mutated by zoom: resetFontSize
+    /// restores it exactly (fractional point sizes included).
+    base_opts: Options,
     /// Cell geometry from discovery.cellMetrics; resize updates the cell
     /// size, the baseline stays the face's ascender.
     metrics: discovery.CellMetrics,
@@ -319,6 +322,7 @@ pub const CpuRenderer = struct {
             .size_points = opts.size_points,
             .size_dpi = opts.size_dpi,
             .opts = opts,
+            .base_opts = opts,
             .metrics = metrics,
             .atlas = try atlas.GlyphAtlas.init(allocator, opts.atlas_width, opts.atlas_height),
             .image_cache = image.ImageCache.init(allocator, image_cache_limit_bytes),
@@ -429,10 +433,27 @@ pub const CpuRenderer = struct {
             const dpi: f32 = @floatFromInt(opts.size_dpi);
             opts.size_points = @intFromFloat(@round(px * 72.0 / dpi));
         }
+        return self.reinitWith(opts);
+    }
+
+    /// Restore the ORIGINAL init font size (grab-zoom-reset, ghostty
+    /// reset_font_size). Unlike setFontSize(base_px) this recovers fractional
+    /// point sizes exactly: zoom's px->points rounding is not inverted.
+    /// Same in-place rebuild contract as setFontSize.
+    pub fn resetFontSize(self: *CpuRenderer) !discovery.CellMetrics {
+        if (self.size_px == self.base_opts.size_px and
+            self.size_points == self.base_opts.size_points) return self.metrics;
+        return self.reinitWith(self.base_opts);
+    }
+
+    /// Re-initialize in place at `opts`, preserving the grid, the borrowed
+    /// terminal and the original base_opts. Returns the new cell metrics.
+    fn reinitWith(self: *CpuRenderer, opts: Options) !discovery.CellMetrics {
         var fresh = try init(self.allocator, self.discovery, &self.face, opts);
         errdefer fresh.deinit();
         try fresh.resize(self.cols, self.rows, fresh.metrics.cell_w, fresh.metrics.cell_h);
         fresh.vt = self.vt;
+        fresh.base_opts = self.base_opts;
         const metrics = fresh.metrics;
         self.deinit();
         self.* = fresh;
@@ -3393,6 +3414,34 @@ test "cpu: setFontSize re-initializes at the new pixel size (M3.8)" {
     // No-op when the size is unchanged.
     const same = try cpu.setFontSize(16);
     try testing.expectEqual(m16b.cell_w, same.cell_w);
+}
+
+test "cpu: resetFontSize restores the init size exactly (grab-zoom-reset)" {
+    const a = testing.allocator;
+    var d = try discovery.Discovery.init(a);
+    defer d.deinit();
+    var face = try d.primaryFace(null, 16);
+    // Fractional char size: 13pt@96dpi = 17.33px. Zoom's px->points rounding
+    // must not leak into the reset size.
+    var cpu = try CpuRenderer.init(a, &d, &face, .{ .size_px = 17, .size_points = 13 });
+    defer cpu.deinit();
+    try cpu.resize(20, 5, cpu.metrics.cell_w, cpu.metrics.cell_h);
+    const m0 = cpu.metrics;
+
+    const m20 = try cpu.setFontSize(20);
+    try testing.expectEqual(@as(u16, 20), cpu.size_px);
+    try testing.expect(m20.cell_h != m0.cell_h);
+
+    const mr = try cpu.resetFontSize();
+    try testing.expectEqual(@as(u16, 17), cpu.size_px);
+    try testing.expectEqual(@as(u32, 13), cpu.size_points);
+    try testing.expectEqual(m0.cell_w, mr.cell_w);
+    try testing.expectEqual(m0.cell_h, mr.cell_h);
+    try testing.expectEqual(m0.baseline, mr.baseline);
+
+    // No-op when already at the init size.
+    const same = try cpu.resetFontSize();
+    try testing.expectEqual(mr.cell_w, same.cell_w);
 }
 
 test "cpu: blitRotated matches layout.physicalToLogical for all rotations (M5.4)" {

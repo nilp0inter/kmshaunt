@@ -46,6 +46,7 @@ port + config knobs): see [docs/ghostty-parity.md](ghostty-parity.md).
 | Feature | Status | Evidence / gap |
 |---|---|---|
 | scroll/page/zoom/session/terminal-new | ✅ | M2.2, M3.8, M6.3 |
+| grab-zoom-reset (ghostty extension) | ✅ | Ctrl+0 restores the configured size exactly (renderer base_opts); zoom keeps ghostty cell metrics via shared refreshCellMetrics |
 | grab-rotate-cw/ccw | ✅ | rotation helper wired; grab-rotate verified |
 | grab-reboot | ✅ | reads `/proc/sys/kernel/ctrl-alt-del`: 0 = soft reboot, 1 = hard reboot + sync |
 

@@ -1062,22 +1062,27 @@ const Console = struct {
 
         self.disc = try discovery.Discovery.init(self.alloc);
         self.face = try self.disc.?.primaryFace(self.cfg.font_name, self.size_px);
-        if (self.cfg.font_size != 0) try self.face.setCharSize(self.cfg.font_size, 96);
+        self.renderer = try cpu.CpuRenderer.init(self.alloc, &self.disc.?, &self.face, .{
+            .size_px = self.size_px,
+            .size_points = self.cfg.font_size, // fractional char-size (ghostty); baseline calibrated +2
+        });
+        try self.refreshCellMetrics();
+        try self.rebuildLayout();
+    }
+
+    /// Recompute the ghostty-compatible cell metrics from the face's CURRENT
+    /// size and push them into the renderer: baseline AND the face box the
+    /// emoji constraint needs (face_width/face_height/face_y). The renderer's
+    /// own init metrics are the legacy model; setupFont and every zoom share
+    /// this overlay so the grid never switches models mid-session.
+    fn refreshCellMetrics(self: *Console) !void {
         // ghostty's px_per_em is the INTEGER y_ppem of the current size
         // (face/freetype.zig:840), not points*dpi/72. On the auto-size path
         // y_ppem == size_px, so one expression covers both.
         const px_f64 = @as(f64, @floatFromInt(self.face.ft_face.*.size.*.metrics.y_ppem));
         self.cell = try discovery.cellMetricsGhostty(self.face, px_f64, self.cfg.adjust_cell_width, self.cfg.adjust_cell_height, self.cfg.adjust_font_baseline);
         if (self.cell.cell_w == 0 or self.cell.cell_h == 0) return error.InvalidCellMetrics;
-
-        self.renderer = try cpu.CpuRenderer.init(self.alloc, &self.disc.?, &self.face, .{
-            .size_px = self.size_px,
-            .size_points = self.cfg.font_size, // fractional char-size (ghostty); baseline calibrated +2
-        });
-        // Use the ghostty-compatible grid: baseline AND the face box the
-        // emoji constraint needs (face_width/face_height/face_y).
         self.renderer.?.metrics = self.cell;
-        try self.rebuildLayout();
     }
 
 
@@ -1956,7 +1961,7 @@ const Console = struct {
             },
             13 => self.handleReboot(), // reboot (disabled by default)
             1, 2, 3, 4 => self.handleScroll(id), // scroll/page (M2.2)
-            5, 6 => self.handleZoom(id), // zoom in/out (M3.8)
+            5, 6, 14 => self.handleZoom(id), // zoom in/out/reset (M3.8)
             11, 12 => self.handleRotate(id), // rotate cw/ccw (M5.4)
             else => log.debug("grab {d}: unknown action", .{id}),
         }
@@ -2007,24 +2012,36 @@ const Console = struct {
         }
     }
 
-    /// grab-zoom-in/out: step the font size, then reconfigure the grid and
-    /// every session (M3.8).
+    /// grab-zoom-in/out/reset: step or restore the font size, then
+    /// reconfigure the grid and every session (M3.8). Reset restores the
+    /// ORIGINAL configured size (ghostty reset_font_size), not a px step.
     fn handleZoom(self: *Console, id: u16) void {
-        const steps: i32 = if (id == 5) 1 else -1;
-        const next = atlas.applyZoom(
-            @floatFromInt(self.size_px),
-            steps,
-            @floatFromInt(min_font_px),
-            @floatFromInt(max_font_px),
-        );
-        const new_px: u16 = @intFromFloat(next);
-        if (new_px == self.size_px) return;
-        const metrics = self.renderer.?.setFontSize(new_px) catch |err| {
-            log.warn("zoom: {t}", .{err});
+        const r = &self.renderer.?;
+        if (id == 14) {
+            _ = r.resetFontSize() catch |err| {
+                log.warn("zoom reset: {t}", .{err});
+                return;
+            };
+        } else {
+            const steps: i32 = if (id == 5) 1 else -1;
+            const next = atlas.applyZoom(
+                @floatFromInt(self.size_px),
+                steps,
+                @floatFromInt(min_font_px),
+                @floatFromInt(max_font_px),
+            );
+            const new_px: u16 = @intFromFloat(next);
+            if (new_px == self.size_px) return;
+            _ = r.setFontSize(new_px) catch |err| {
+                log.warn("zoom: {t}", .{err});
+                return;
+            };
+        }
+        self.size_px = r.size_px;
+        self.refreshCellMetrics() catch |err| {
+            log.warn("zoom metrics: {t}", .{err});
             return;
         };
-        self.size_px = new_px;
-        self.cell = metrics;
         self.reconfigureGrid() catch |err| log.warn("zoom regrid: {t}", .{err});
         self.full_redraw = true;
     }
@@ -3397,6 +3414,55 @@ test "onInput: a stream of input cannot postpone the armed frame" {
     // The pinned arm still expires: the pending wakeup was not erased.
     _ = try lp.runOnce(500);
     try std.testing.expectEqual(@as(u32, 1), probe.count);
+}
+
+test "zoom keeps ghostty cell metrics and full-height cursor (grab-zoom)" {
+    // Regression: the zoom path took the renderer's LEGACY re-init metrics
+    // (face box zeroed), so applyDecoConfig collapsed deco.cursor_height to
+    // 1px and the block/bar cursor became a sliver floating mid-cell. Zoom
+    // must re-apply the ghostty metrics overlay (refreshCellMetrics).
+    const a = std.testing.allocator;
+    var c = testConsole();
+    c.cfg = config.Config.init(a);
+    defer c.cfg.deinit();
+    c.disc = try discovery.Discovery.init(a);
+    defer c.disc.?.deinit();
+    c.face = try c.disc.?.primaryFace(null, 16);
+    c.size_px = 16;
+    c.renderer = try cpu.CpuRenderer.init(a, &c.disc.?, &c.face, .{ .size_px = 16 });
+    defer c.renderer.?.deinit();
+    try c.refreshCellMetrics();
+    c.applyDecoConfig();
+    const cell0 = c.cell;
+    const cursor_h0 = deco.cursor_height;
+    defer {
+        deco.cursor_height = null;
+        deco.cursor_thickness = 1;
+        deco.adjusted_underline_pos = null;
+        deco.cursor_underline_pos = null;
+    }
+
+    // Zoom in: the handleZoom sequence minus the layout rebuild.
+    _ = try c.renderer.?.setFontSize(24);
+    c.size_px = c.renderer.?.size_px;
+    try c.refreshCellMetrics();
+    c.applyDecoConfig();
+    try std.testing.expect(c.cell.face_height > 0);
+    try std.testing.expectEqual(c.cell.face_height, c.renderer.?.metrics.face_height);
+    try std.testing.expect(deco.cursor_height.? > 1);
+    try std.testing.expectEqual(
+        @as(u16, @intFromFloat(@round(c.cell.face_height))),
+        deco.cursor_height.?,
+    );
+    try std.testing.expect(c.cell.cell_h != cell0.cell_h or c.cell.cell_w != cell0.cell_w);
+
+    // Reset restores the original metrics and cursor height exactly.
+    _ = try c.renderer.?.resetFontSize();
+    c.size_px = c.renderer.?.size_px;
+    try c.refreshCellMetrics();
+    c.applyDecoConfig();
+    try std.testing.expectEqual(cell0, c.cell);
+    try std.testing.expectEqual(cursor_h0, deco.cursor_height);
 }
 
 test "scheduleFrame: burst arm pinned for output, pulled forward for full redraw" {

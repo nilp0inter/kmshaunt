@@ -273,6 +273,7 @@ pub const Option = enum {
     grab_page_down,
     grab_zoom_in,
     grab_zoom_out,
+    grab_zoom_reset,
     grab_session_next,
     grab_session_prev,
     grab_session_close,
@@ -409,6 +410,7 @@ const specs = [_]Spec{
     .{ .opt = .grab_page_down, .name = "grab-page-down", .kind = .grab },
     .{ .opt = .grab_zoom_in, .name = "grab-zoom-in", .kind = .grab },
     .{ .opt = .grab_zoom_out, .name = "grab-zoom-out", .kind = .grab },
+    .{ .opt = .grab_zoom_reset, .name = "grab-zoom-reset", .kind = .grab },
     .{ .opt = .grab_session_next, .name = "grab-session-next", .kind = .grab },
     .{ .opt = .grab_session_prev, .name = "grab-session-prev", .kind = .grab },
     .{ .opt = .grab_session_close, .name = "grab-session-close", .kind = .grab },
@@ -544,6 +546,7 @@ pub const Config = struct {
     grab_page_down: Grab = grab.defaults.page_down,
     grab_zoom_in: Grab = grab.defaults.zoom_in,
     grab_zoom_out: Grab = grab.defaults.zoom_out,
+    grab_zoom_reset: Grab = grab.defaults.zoom_reset,
     grab_session_next: Grab = grab.defaults.session_next,
     grab_session_prev: Grab = grab.defaults.session_prev,
     grab_session_close: Grab = grab.defaults.session_close,
@@ -1050,9 +1053,9 @@ pub const Config = struct {
         const grab_fields = .{
             "grab_scroll_up",   "grab_scroll_down",  "grab_page_up",
             "grab_page_down",   "grab_zoom_in",      "grab_zoom_out",
-            "grab_session_next", "grab_session_prev", "grab_session_close",
-            "grab_terminal_new", "grab_rotate_cw",   "grab_rotate_ccw",
-            "grab_reboot",
+            "grab_zoom_reset",  "grab_session_next", "grab_session_prev",
+            "grab_session_close", "grab_terminal_new", "grab_rotate_cw",
+            "grab_rotate_ccw",  "grab_reboot",
         };
         inline for (grab_fields) |f| @field(self, f) = try copyGrab(alloc, @field(src, f));
 
@@ -1348,6 +1351,8 @@ const help_raw =
     \\\t                                  Shortcut to increase font size
     \\\t    --grab-zoom-out <grab>      [<Ctrl>minus]
     \\\t                                  Shortcut to decrease font size
+    \\\t    --grab-zoom-reset <grab>    [<Ctrl>0]
+    \\\t                                  Shortcut to reset font size
     \\\t    --grab-session-next <grab>  [<Ctrl><Logo>Right]
     \\\t                                  Switch to the next session
     \\\t    --grab-session-prev <grab>  [<Ctrl><Logo>Left]
