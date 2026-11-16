@@ -3423,8 +3423,9 @@ test "zoom keeps ghostty cell metrics and full-height cursor (grab-zoom)" {
     // must re-apply the ghostty metrics overlay (refreshCellMetrics).
     const a = std.testing.allocator;
     var c = testConsole();
-    c.cfg = config.Config.init(a);
-    defer c.cfg.deinit();
+    var cfg = config.Config.init(a);
+    defer cfg.deinit();
+    c.cfg = &cfg;
     c.disc = try discovery.Discovery.init(a);
     defer c.disc.?.deinit();
     c.face = try c.disc.?.primaryFace(null, 16);
