@@ -60,7 +60,7 @@ let
   loginCmd =
     enableAutologin:
     "${gettyCfg.loginProgram} ${baseLoginOptions}${
-      lib.optionalString enableAutologin " -f -- ${gettyCfg.autologinUser}"
+      lib.optionalString enableAutologin " -f -- ${lib.escapeShellArg gettyCfg.autologinUser}"
     }";
 
   loginScript = pkgs.writers.writeBash "kmshaunt-login" (
