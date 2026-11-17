@@ -964,6 +964,16 @@ pub const Input = struct {
         return @max(0.0, @min(v, max));
     }
 
+    /// Clamp one scroll axis value: a hostile evdev device can report
+    /// arbitrary deltas, and the terminal session converts the
+    /// accumulated scroll into an integer line count, so unbounded
+    /// input is a crash vector. NaN parks at zero like the pointer
+    /// clamp; 1000 is far above any real detent (wheel reports +/-15).
+    fn clampAxis(v: f64) f64 {
+        if (std.math.isNan(v)) return 0;
+        return std.math.clamp(v, -1000.0, 1000.0);
+    }
+
     /// Set the output size in pixels: absolute (tablet) coordinates are
     /// transformed to framebuffer pixels (M5.7 absolute-pointer transform),
     /// and relative motion is clamped to it so the accumulator cannot drift
@@ -1002,8 +1012,8 @@ pub const Input = struct {
 
     fn handleAxis(self: *Input, ev: *Event) void {
         if (!self.cfg.mouse) return;
-        var dx = self.ops.pointer_get_axis_value(ev, axis.horizontal);
-        var dy = self.ops.pointer_get_axis_value(ev, axis.vertical);
+        var dx = clampAxis(self.ops.pointer_get_axis_value(ev, axis.horizontal));
+        var dy = clampAxis(self.ops.pointer_get_axis_value(ev, axis.vertical));
         if (self.cfg.natural_scrolling) {
             dx = -dx;
             dy = -dy;

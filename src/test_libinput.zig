@@ -1708,6 +1708,25 @@ test "pointer: axis sources, natural scrolling, legacy axis and stops ignored" {
     try testing.expectEqual(@as(usize, 4), h.rec.count(.pointer_axis));
 }
 
+test "pointer: hostile axis values are clamped, NaN parks at zero" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+
+    // A malicious evdev device can report arbitrary deltas; the session
+    // converts accumulated scroll into an integer line count, so the
+    // input layer must bound them (crash vector otherwise).
+    h.fake.pushScroll(libinput.event.pointer_scroll_wheel, 1e300, -1e300);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(f64, 1000.0), h.rec.last().pointer_axis.dy);
+    try testing.expectEqual(@as(f64, -1000.0), h.rec.last().pointer_axis.dx);
+
+    // NaN on one axis parks at zero; the other axis still reports.
+    h.fake.pushScroll(libinput.event.pointer_scroll_finger, std.math.nan(f64), 5.0);
+    try h.input.dispatch();
+    try testing.expectEqual(@as(f64, 0.0), h.rec.last().pointer_axis.dy);
+    try testing.expectEqual(@as(f64, 5.0), h.rec.last().pointer_axis.dx);
+}
+
 test "mouse=false drops pointer events; keyboard is unaffected" {
     const h = try Harness.init(.{});
     defer h.deinit();
