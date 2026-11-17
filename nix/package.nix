@@ -144,9 +144,13 @@ stdenv.mkDerivation (finalAttrs: {
   '';
 
   dontSetZigDefaultFlags = true;
+  # ReleaseSafe, not ReleaseFast: this binary runs as root and parses
+  # untrusted PTY output (libghostty-vt is built with the same mode).
+  # Bounds/overflow checks turn a clipping miss into a panic instead of
+  # root memory corruption; the renderer hot paths stay allocation-free.
   zigBuildFlags = [
     "-Dcpu=baseline"
-    "-Doptimize=ReleaseFast"
+    "-Doptimize=ReleaseSafe"
   ];
 
   # The default build runs no unit tests: it is what `nix flake check` and
