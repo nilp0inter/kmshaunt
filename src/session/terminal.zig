@@ -79,7 +79,8 @@
 //!                       cfg.clipboard_read. Replies before return.
 //!   unknown_sequence -> exact, case-sensitive "setBackground" /
 //!                       "setForeground" (kmscon-private-osc.md §1.4) fire
-//!                       the hooks; NO reply. Everything else is ignored.
+//!                       the hooks when cfg.gui_osc; NO reply. Everything
+//!                       else is ignored.
 //!   size             -> current grid + cell pixels (XTWINOPS, mode 2048).
 //!   color_scheme     -> dark (the console default).
 //!   device_attributes-> VT220 conformance 62, features 22 (ANSI color) +
@@ -1021,6 +1022,9 @@ pub const TerminalSession = struct {
     fn effUnknown(userdata: ?*anyopaque, seq: vt.UnknownSequence) void {
         const self = fromUserdata(userdata);
         if (seq.tag != .osc or seq.truncated) return;
+        // Default-deny: any output source could otherwise drop or steal
+        // DRM master (cfg.gui_osc opts in for GUI-launch handoff).
+        if (!self.cfg.gui_osc) return;
         // Exact, case-sensitive match on the bare identifier; both BEL and
         // ST terminators arrive here; NO reply (kmscon-private-osc.md
         // §1.4, §3.5).
@@ -1712,6 +1716,7 @@ test "terminal: middle-click paste refuses unsafe text unless bracketed" {
 test "terminal: private OSC setBackground/setForeground hooks, no reply" {
     var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '\\033]setBackground\\a\\033]setForeground\\033\\\\\\033]setBackground;\\a\\033]setbackground\\a'" });
     defer cfg.deinit();
+    cfg.gui_osc = true;
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
     var log = HookLog{};
@@ -1733,6 +1738,24 @@ test "terminal: private OSC setBackground/setForeground hooks, no reply" {
     var buf: [8192]u8 = undefined;
     const text = try screenText(&ts, &buf);
     try testing.expectEqual(@as(usize, 0), std.mem.trim(u8, text, "\n").len);
+}
+
+test "terminal: private OSC hooks denied by default" {
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '\\033]setBackground\\a\\033]setForeground\\a'" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var hook_log = HookLog{};
+    ts.hooks = hook_log.hooks();
+    const s = ts.session();
+    try s.start();
+    try pumpUntil(&ts, &hook_log, struct {
+        fn p(l: *HookLog, _: *TerminalSession) bool {
+            return l.exits > 0;
+        }
+    }.p, 5000);
+    try testing.expectEqual(@as(u32, 0), hook_log.backgrounds);
+    try testing.expectEqual(@as(u32, 0), hook_log.foregrounds);
 }
 
 test "terminal: oneshot stops the session when the child exits" {

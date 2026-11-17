@@ -3,7 +3,7 @@
 //! against kmscon 10.1.0 `src/config.c` and `src/misc/conf.c`.
 //!
 //! Layout:
-//!   * `Config` — one typed field per option (all 91), exact kmscon
+//!   * `Config` — one typed field per option (all 92), exact kmscon
 //!     defaults except the two deliberate kmshaunt deviations:
 //!     `configdir = /etc/kmshaunt` and `term = xterm-ghostty` (ROADMAP D6).
 //!   * `parseCli` — `--name value`, `--name=value`, `--no-name` negation,
@@ -255,6 +255,7 @@ pub const Option = enum {
     kitty_image_storage_limit,
     clipboard_read,
     clipboard_write,
+    gui_osc,
     // Input
     xkb_model,
     xkb_layout,
@@ -395,6 +396,7 @@ const specs = [_]Spec{
     .{ .opt = .kitty_image_storage_limit, .name = "kitty-image-storage-limit", .kind = .uint },
     .{ .opt = .clipboard_read, .name = "clipboard-read", .kind = .bool },
     .{ .opt = .clipboard_write, .name = "clipboard-write", .kind = .bool },
+    .{ .opt = .gui_osc, .name = "gui-osc", .kind = .bool },
     .{ .opt = .xkb_model, .name = "xkb-model", .kind = .string },
     .{ .opt = .xkb_layout, .name = "xkb-layout", .kind = .string },
     .{ .opt = .xkb_variant, .name = "xkb-variant", .kind = .string },
@@ -535,6 +537,10 @@ pub const Config = struct {
     /// poisoning feeding the paste path). Opt in for remote set-clipboard
     /// workflows; pastes stay safety-checked regardless.
     clipboard_write: bool = false,
+    /// kmscon private setBackground/setForeground OSCs (GUI launch
+    /// handoff): denied by default. Any output source could otherwise
+    /// drop or steal DRM master. Opt in for kmscon-launch-gui workflows.
+    gui_osc: bool = false,
 
     // Input Options
     xkb_model: ?[]const u8 = null,
@@ -1035,7 +1041,7 @@ pub const Config = struct {
             "mouse",             "natural_scrolling", "soft_cursor",    "dpms_timeout",
             "drm",               "hwaccel",           "gpus",           "use_original_mode",
             "multi_monitor",     "font_size",         "font_engine",    "palette",
-            "kitty_image_storage_limit", "clipboard_read", "clipboard_write",
+            "kitty_image_storage_limit", "clipboard_read", "clipboard_write", "gui_osc",
             "adjust_cell_width",  "adjust_cell_height",  "adjust_font_baseline",
             "alpha_blending",     "freetype_load_flags", "font_thicken",
             "font_thicken_strength", "adjust_cursor_thickness", "adjust_cursor_height",
@@ -1331,6 +1337,9 @@ const help_raw =
     \\\t    --clipboard-write       [off]
     \\\t                              Allow programs to set the console
     \\\t                              clipboard (OSC 52); denied by default
+    \\\t    --gui-osc               [off]
+    \\\t                              Honor kmscon private setBackground /
+    \\\t                              setForeground OSCs (GUI launch handoff)
     \\
     \\Input Options:
     \\\t    --xkb-model <model>        [-]  Set XkbModel for input devices
@@ -1592,6 +1601,7 @@ test "defaults: every option at its documented kmscon default" {
     try testing.expectEqual(@as(u32, 10485760), cfg.kitty_image_storage_limit);
     try testing.expect(!cfg.clipboard_read);
     try testing.expect(!cfg.clipboard_write);
+    try testing.expect(!cfg.gui_osc);
     // Input
     try testing.expectEqual(@as(?[]const u8, null), cfg.xkb_model);
     try testing.expectEqual(@as(?[]const u8, null), cfg.xkb_layout);
@@ -1646,9 +1656,9 @@ test "defaults: every option at its documented kmscon default" {
     for (std.meta.tags(Option)) |o| try testing.expect(!cfg.locked.get(o));
 }
 
-test "registry: all 91 options, unique names, documented short forms" {
-    try testing.expectEqual(@as(usize, 91), specs.len);
-    try testing.expectEqual(@as(usize, 91), std.meta.tags(Option).len);
+test "registry: all 92 options, unique names, documented short forms" {
+    try testing.expectEqual(@as(usize, 92), specs.len);
+    try testing.expectEqual(@as(usize, 92), std.meta.tags(Option).len);
     for (specs, 0..) |s, i| {
         try testing.expectEqual(@as(Option, @enumFromInt(i)), s.opt);
         try testing.expectEqual(@as(?usize, i), name_map.get(s.name));
@@ -2227,6 +2237,18 @@ test "clipboard-read/write: default off, CLI and file parse" {
     try fileOk(&file_cfg, "clipboard-read\nno-clipboard-write\n");
     try testing.expect(file_cfg.clipboard_read);
     try testing.expect(!file_cfg.clipboard_write);
+}
+
+test "gui-osc: default off, CLI and file parse" {
+    var cfg = Config.init(testing.allocator);
+    defer cfg.deinit();
+    try testing.expect(!cfg.gui_osc);
+    try cliOk(&cfg, &.{"--gui-osc"});
+    try testing.expect(cfg.gui_osc);
+    var file_cfg = Config.init(testing.allocator);
+    defer file_cfg.deinit();
+    try fileOk(&file_cfg, "gui-osc\n");
+    try testing.expect(file_cfg.gui_osc);
 }
 
 test "vt: numeric, name, path and base-0 quirks" {

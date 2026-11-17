@@ -255,6 +255,14 @@ otherwise exfiltrate copied text.
 Allow programs to set the console clipboard via OSC 52 (boolean, default
 off). Denied by default against clipboard poisoning; pastes are
 safety-checked regardless.
+.It Cm gui-osc
+Honor kmscon's private
+.Cm setBackground
+/
+.Cm setForeground
+OSCs, which drop and retake DRM master for a GUI launch handoff (boolean,
+default off). Denied by default: any output source could otherwise freeze
+the display or steal DRM master from a running GUI.
 .El
 .Ss Input Options
 .Bl -tag -width "-palette-light-magenta=r,g,b"
