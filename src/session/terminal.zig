@@ -1607,7 +1607,7 @@ test "terminal: effect replies drop on a full master instead of stalling" {
         .{ .ACCMODE = .RDWR, .NOCTTY = true },
         0,
     );
-    defer std.posix.close(slave);
+    defer _ = std.os.linux.close(slave);
     ts.pty = p;
     ts.active = true;
     p.master_fd = -1; // ownership moved to ts (deinit closes it)
