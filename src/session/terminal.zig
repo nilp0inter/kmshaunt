@@ -136,7 +136,7 @@ const render = @import("../render.zig");
 const config = @import("../config/config.zig");
 const pty_mod = @import("../misc/pty.zig");
 const palette = @import("../misc/palette.zig");
-const log = std.log.scoped(.terminal);
+const logger = std.log.scoped(.terminal);
 const asciicast = @import("../misc/asciicast.zig");
 
 pub const Pty = pty_mod.Pty;
@@ -785,7 +785,7 @@ pub const TerminalSession = struct {
         if (text.len == 0) return;
         _ = self.vt.paste(text, .{ .location = .primary, .allow_unsafe = false }) catch |err| switch (err) {
             error.Rejected => {
-                log.warn("paste refused: clipboard text is unsafe to paste", .{});
+                logger.warn("paste refused: clipboard text is unsafe to paste", .{});
                 return;
             },
             else => return err,
@@ -979,7 +979,7 @@ pub const TerminalSession = struct {
         // Default-deny: any output source could otherwise exfiltrate the
         // clipboard (cfg.clipboard_read opts in).
         if (!self.cfg.clipboard_read) {
-            req.reply(.denied, false);
+            req.reply(.denied, &.{}, &.{}, false);
             return;
         }
         const buf = &self.clipboard[@intFromEnum(req.location)];
