@@ -73,9 +73,10 @@
 //!   bell             -> hooks.bell when cfg.bell.
 //!   title/pwd        -> stored in-process (title()/pwd()); RIS clears them.
 //!   clipboard_write  -> in-process buffer per location (OSC 52 stays
-//!                       in-process per ROADMAP); replies before return.
-//!   clipboard_read   -> serves the buffer as text/plain; replies before
-//!                       return.
+//!                       in-process per ROADMAP); denied unless
+//!                       cfg.clipboard_write. Replies before return.
+//!   clipboard_read   -> serves the buffer as text/plain; denied unless
+//!                       cfg.clipboard_read. Replies before return.
 //!   unknown_sequence -> exact, case-sensitive "setBackground" /
 //!                       "setForeground" (kmscon-private-osc.md §1.4) fire
 //!                       the hooks; NO reply. Everything else is ignored.
@@ -109,7 +110,7 @@
 //!   vt.selectedText (Ghostty's PLAIN+UNWRAP+TRIM) lands in the
 //!   in-process clipboard, primary AND standard (kmscon keeps a single
 //!   copy buffer). Middle press pastes it through vt.paste (bracketed
-//!   per mode 2004, allow_unsafe: kmscon has no confirmation prompt)
+//!   per mode 2004; unsafe text is refused, no confirmation prompt UI)
 //!   and clears the selection; right press and any key event clear the
 //!   selection too (kmscon terminal.c parity). Wheel events scroll the
 //!   viewport 3 lines per detent (libinput reports +/-15 per wheel
@@ -134,6 +135,7 @@ const render = @import("../render.zig");
 const config = @import("../config/config.zig");
 const pty_mod = @import("../misc/pty.zig");
 const palette = @import("../misc/palette.zig");
+const log = std.log.scoped(.terminal);
 const asciicast = @import("../misc/asciicast.zig");
 
 pub const Pty = pty_mod.Pty;
@@ -769,16 +771,24 @@ pub const TerminalSession = struct {
 
     /// Middle-click paste: primary first, standard as the fallback.
     /// vt.paste frames per mode 2004 (bracketed) or streams plain text
-    /// through write_pty. allow_unsafe: kmscon pastes without a
-    /// confirmation prompt; programs that enable bracketed paste stay
-    /// protected.
+    /// through write_pty. Unsafe text (line terminators without bracketed
+    /// paste, or the bracket terminator itself) is refused: the clipboard
+    /// is program-writable when clipboard-write is on, so pasting it raw
+    /// would be a command-injection vector. There is no confirmation
+    /// prompt UI; refusal is silent apart from a log line.
     fn pasteClipboard(self: *TerminalSession) !void {
         const text = if (self.clipboardText(.primary).len > 0)
             self.clipboardText(.primary)
         else
             self.clipboardText(.standard);
         if (text.len == 0) return;
-        _ = try self.vt.paste(text, .{ .location = .primary, .allow_unsafe = true });
+        _ = self.vt.paste(text, .{ .location = .primary, .allow_unsafe = false }) catch |err| switch (err) {
+            error.Rejected => {
+                log.warn("paste refused: clipboard text is unsafe to paste", .{});
+                return;
+            },
+            else => return err,
+        };
     }
 
     /// Write to the pty master, retrying a full non-blocking master with
@@ -938,6 +948,12 @@ pub const TerminalSession = struct {
 
     fn effClipboardWrite(userdata: ?*anyopaque, req: *const vt.ClipboardWriteRequest) void {
         const self = fromUserdata(userdata);
+        // Default-deny: any output source could otherwise poison the
+        // clipboard the user pastes from (cfg.clipboard_write opts in).
+        if (!self.cfg.clipboard_write) {
+            req.reply(.denied, false);
+            return;
+        }
         const buf = &self.clipboard[@intFromEnum(req.location)];
         buf.clearRetainingCapacity();
         if (req.contents.len > 0) {
@@ -959,6 +975,12 @@ pub const TerminalSession = struct {
 
     fn effClipboardRead(userdata: ?*anyopaque, req: *const vt.ClipboardReadRequest) void {
         const self = fromUserdata(userdata);
+        // Default-deny: any output source could otherwise exfiltrate the
+        // clipboard (cfg.clipboard_read opts in).
+        if (!self.cfg.clipboard_read) {
+            req.reply(.denied, false);
+            return;
+        }
         const buf = &self.clipboard[@intFromEnum(req.location)];
         // Only text/plain is stored. A list-only request (no mimes) is
         // served without a prompt.
@@ -1612,6 +1634,8 @@ test "terminal: OSC52 clipboard set/get/clear in-process" {
     // observable before it arrives (no external sleep in the minimal PATH).
     var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '\\033]52;c;aGVsbG8=\\007\\033]52;c;?\\007'; read -t 0.3 x; printf '\\033]52;c;\\007'" });
     defer cfg.deinit();
+    cfg.clipboard_read = true;
+    cfg.clipboard_write = true;
     var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
     defer ts.deinit();
     const s = ts.session();
@@ -1627,6 +1651,62 @@ test "terminal: OSC52 clipboard set/get/clear in-process" {
             return t.clipboardText(.standard).len == 0;
         }
     }.p, 5000);
+}
+
+test "terminal: OSC52 write denied by default" {
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf '\\033]52;c;aGVsbG8=\\007'" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var hook_log = HookLog{};
+    ts.hooks = hook_log.hooks();
+    const s = ts.session();
+    try s.start();
+    try pumpUntil(&ts, &hook_log, struct {
+        fn p(l: *HookLog, _: *TerminalSession) bool {
+            return l.exits > 0;
+        }
+    }.p, 5000);
+    try testing.expectEqual(@as(usize, 0), ts.clipboardText(.standard).len);
+}
+
+test "terminal: middle-click paste refuses unsafe text unless bracketed" {
+    // Without mode 2004 the two-line clipboard must not reach the child;
+    // with mode 2004 the same text pastes bracketed; the bracket
+    // terminator itself is refused even then.
+    var cfg = testCfg(&.{ test_env.shell(), "-c", "printf 'READY'; read -t 0.5 -N 3 x; printf 'GOT:%s' \"$x\"; printf '\\033[?2004h'; read -r -N 15 y; printf 'BRLEN:%s' \"${#y}\"; read -t 0.5 -N 1 z; printf 'END:%s' \"$z\"" });
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    var mock = MockRenderer{ .allocator = testing.allocator };
+    const s = ts.session();
+    try s.start();
+    try renderGeometry(&ts, s, &mock);
+    _ = try pumpUntilText(&ts, "READY", 5000);
+
+    const primary = &ts.clipboard[@intFromEnum(vt.ClipboardLocation.primary)];
+    try primary.appendSlice(testing.allocator, "a\nb");
+
+    // Unbracketed: refused, the child's read times out empty.
+    try sendButton(s, 0x112, true, 4, 8, 1);
+    const text = try pumpUntilText(&ts, "GOT:", 5000);
+    try testing.expect(std.mem.indexOf(u8, text, "GOT:a") == null);
+
+    // Bracketed: the same two lines arrive framed (6 + 3 + 6 bytes).
+    try pumpUntil(&ts, {}, struct {
+        fn p(_: void, t: *TerminalSession) bool {
+            return t.vt.getMode(vt.mode(2004, false)) catch false;
+        }
+    }.p, 5000);
+    try sendButton(s, 0x112, true, 4, 8, 1);
+    _ = try pumpUntilText(&ts, "BRLEN:15", 5000);
+
+    // The bracket terminator escapes the framing: refused even bracketed.
+    primary.clearRetainingCapacity();
+    try primary.appendSlice(testing.allocator, "a\x1b[201~b");
+    try sendButton(s, 0x112, true, 4, 8, 1);
+    const end = try pumpUntilText(&ts, "END:", 5000);
+    try testing.expect(std.mem.indexOf(u8, end, "END:a") == null);
 }
 
 test "terminal: private OSC setBackground/setForeground hooks, no reply" {

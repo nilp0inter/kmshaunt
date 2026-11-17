@@ -247,6 +247,14 @@ Scrollback buffer size in lines (unsigned integer, default 1000).
 Forward the terminal bell to the VT (boolean, default off).
 .It Cm blink
 Enable cursor and text blinking (boolean, default on).
+.It Cm clipboard-read
+Allow programs to read the console clipboard via OSC 52 (boolean, default
+off). Denied by default: any program able to write terminal output could
+otherwise exfiltrate copied text.
+.It Cm clipboard-write
+Allow programs to set the console clipboard via OSC 52 (boolean, default
+off). Denied by default against clipboard poisoning; pastes are
+safety-checked regardless.
 .El
 .Ss Input Options
 .Bl -tag -width "-palette-light-magenta=r,g,b"
