@@ -67,8 +67,9 @@
 //! Effects routing (M2.1)
 //! ----------------------
 //!   write_pty        -> pty.write (every library reply: DA, DSR, size,
-//!                       OSC 52 read replies, paste, ...). Bounded
-//!                       poll-backed retry on a full non-blocking master.
+//!                       OSC 52 read replies, paste, ...). Single
+//!                       non-blocking attempt: a full master drops the
+//!                       reply rather than stalling the loop thread.
 //!   bell             -> hooks.bell when cfg.bell.
 //!   title/pwd        -> stored in-process (title()/pwd()); RIS clears them.
 //!   clipboard_write  -> in-process buffer per location (OSC 52 stays
@@ -873,9 +874,13 @@ pub const TerminalSession = struct {
 
     fn effWritePty(userdata: ?*anyopaque, data: []const u8) void {
         const self = fromUserdata(userdata);
-        // Best-effort: a dead or persistently full master drops the reply
-        // (the callback cannot return an error). Input writes propagate.
-        self.writeToPty(data) catch {};
+        // Best-effort and NON-BLOCKING: this fires inside vt.write on the
+        // loop thread. A child that stops reading stdin while flooding
+        // queries fills the master input queue; polling here (writeToPty)
+        // would stall input, rendering and VT switches ~1 s per reply.
+        // Drop the reply instead; input writes keep the bounded retry.
+        if (!self.active or self.pty.master_fd < 0) return;
+        _ = self.pty.write(data) catch {};
     }
 
     fn effBell(userdata: ?*anyopaque) void {
@@ -1554,6 +1559,51 @@ test "terminal: DA and size reports reply through write_pty" {
 
     const text = try pumpUntilText(&ts, "?62;22;52c", 5000);
     try testing.expect(std.mem.indexOf(u8, text, "8;24;80t") != null);
+}
+
+test "terminal: effect replies drop on a full master instead of stalling" {
+    // A child that never reads stdin fills the pty input queue; library
+    // replies (DA1 here) must then be dropped, not polled: effWritePty
+    // fires inside vt.write on the loop thread, so a bounded retry stalls
+    // the whole console ~1 s per reply.
+    var cfg = testCfg(&.{test_env.shell()});
+    defer cfg.deinit();
+    var ts = try TerminalSession.init(testing.allocator, &cfg, 80, 24);
+    defer ts.deinit();
+    try ts.ensureBound();
+
+    var p = try Pty.open(80, 24);
+    errdefer p.deinit();
+    try p.setNonBlocking(true);
+    const slave = try std.posix.openatZ(
+        std.posix.AT.FDCWD,
+        &p.slave_path,
+        .{ .ACCMODE = .RDWR, .NOCTTY = true },
+        0,
+    );
+    defer std.posix.close(slave);
+    ts.pty = p;
+    ts.active = true;
+    p.master_fd = -1; // ownership moved to ts (deinit closes it)
+
+    // Fill the slave input queue: nobody reads it.
+    const fill = [_]u8{'x'} ** 4096;
+    var full = false;
+    for (0..64) |_| {
+        _ = ts.pty.write(&fill) catch |err| switch (err) {
+            error.WouldBlock => {
+                full = true;
+                break;
+            },
+            else => return err,
+        };
+    }
+    try testing.expect(full);
+
+    const start = monotonicNs();
+    ts.vt.write("\x1b[c"); // DA1: the reply goes through effWritePty
+    const elapsed = monotonicNs() - start;
+    try testing.expect(elapsed < 500 * std.time.ns_per_ms);
 }
 
 test "terminal: OSC52 clipboard set/get/clear in-process" {
