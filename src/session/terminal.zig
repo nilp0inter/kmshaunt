@@ -1587,7 +1587,7 @@ test "terminal: effect replies drop on a full master instead of stalling" {
     p.master_fd = -1; // ownership moved to ts (deinit closes it)
 
     // Fill the slave input queue: nobody reads it.
-    const fill = [_]u8{'x'} ** 4096;
+    const fill: [4096]u8 = @splat('x');
     var full = false;
     for (0..64) |_| {
         _ = ts.pty.write(&fill) catch |err| switch (err) {
