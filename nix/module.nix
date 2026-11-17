@@ -230,6 +230,13 @@ in
         Before = [ "getty.target" ];
       };
 
+      # Deliberately no systemd sandboxing (PrivateTmp, ProtectSystem,
+      # SystemCallFilter, RestrictAddressFamilies, ...): this unit spawns
+      # the user's login session as a child, and every restriction would
+      # confine that session too (sudo, networking, /tmp, module loading).
+      # Like getty@, the console unit stays unconfined; blast-radius
+      # reduction lives in the daemon itself (ReleaseSafe build,
+      # default-deny clipboard and private-OSC policy).
       serviceConfig = {
         # libseat needs a logind session with a seat, so in that mode the unit
         # goes through the PAM stack defined below. Without libseat kmshaunt
